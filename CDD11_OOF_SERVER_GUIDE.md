@@ -46,7 +46,27 @@ python train_cdd11_oof.py \
 
 该命令会自动完成：数据校验与首次划分、5 个 DACG fold 的训练及 OOF 推理、11715 条 Difix 三元组合并、DACG-final 训练、Validation coarse 生成。中断后重新执行完全相同的命令即可：已有最佳 checkpoint 的阶段会跳过，只有 `last.ckpt` 的训练会自动恢复。
 
-多卡只改为 `--num-gpus 4`。显存不足时增加 `--batch-size 4 --tile-size 512`。默认模型为 `DACG_IR`、120 epochs、patch 128、BF16。脚本不会自动运行 Official Test。
+多卡只改为 `--num-gpus 4`。默认模型为 `DACG_IR`、120 epochs、patch 128、BF16。脚本不会自动运行 Official Test。
+
+训练的全局有效 batch 为：
+
+```text
+batch-size（每卡） × num-gpus × accumulate-grad-batches
+```
+
+单卡默认是 `8 × 1 × 1 = 8`。若显存不足，可保持有效 batch=8：
+
+```bash
+python train_cdd11_oof.py \
+  --data-root /path/to/CDD11 \
+  --output-root /path/to/outputs/CDD11_5fold_oof_bs8 \
+  --num-gpus 1 \
+  --batch-size 2 \
+  --accumulate-grad-batches 4 \
+  --tile-size 512
+```
+
+四卡保持有效 batch=8 时使用 `--num-gpus 4 --batch-size 2`。`--tile-size` 只影响 coarse 推理，不改变训练。五折和 final 必须使用相同的 batch/GPU/累积配置；一键脚本会自动保证这一点。
 
 下面是各阶段的等价手动命令，仅用于排错或单独重跑。
 

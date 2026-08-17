@@ -51,6 +51,7 @@ def train_role(args: argparse.Namespace, role: str) -> Path:
         "--model", args.model,
         "--epochs", args.epochs,
         "--batch-size", args.batch_size,
+        "--accumulate-grad-batches", args.accumulate_grad_batches,
         "--patch-size", args.patch_size,
         "--lr", args.lr,
         "--num-workers", args.num_workers,
@@ -101,6 +102,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", choices=["DACG_IR", "DACG_IR_S"], default="DACG_IR")
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--batch-size", type=int, default=8, help="Per-GPU batch size")
+    parser.add_argument(
+        "--accumulate-grad-batches", type=int, default=1,
+        help="Global effective batch = batch-size * num-gpus * this value",
+    )
     parser.add_argument("--patch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--num-workers", type=int, default=8)
@@ -115,6 +120,8 @@ def parse_args() -> argparse.Namespace:
     args.data_root = args.data_root.resolve()
     args.output_root = args.output_root.resolve()
     args.split_dir = (args.split_dir or args.output_root / "splits").resolve()
+    if args.batch_size < 1 or args.accumulate_grad_batches < 1 or args.num_gpus < 1:
+        parser.error("batch size, gradient accumulation, and GPU count must all be positive")
     return args
 
 
@@ -127,6 +134,8 @@ def main() -> None:
         "model": args.model,
         "epochs": args.epochs,
         "batch_size_per_gpu": args.batch_size,
+        "accumulate_grad_batches": args.accumulate_grad_batches,
+        "global_effective_batch_size": args.batch_size * args.num_gpus * args.accumulate_grad_batches,
         "patch_size": args.patch_size,
         "learning_rate": args.lr,
         "num_gpus": args.num_gpus,

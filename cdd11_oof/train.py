@@ -29,6 +29,7 @@ def main() -> None:
     parser.add_argument("--model", choices=sorted(MODEL_CONFIGS), default="DACG_IR")
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--batch-size", type=int, default=8, help="Per-device batch size")
+    parser.add_argument("--accumulate-grad-batches", type=int, default=1)
     parser.add_argument("--patch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--num-workers", type=int, default=8)
@@ -41,6 +42,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.seed != SEED:
         parser.error(f"The frozen protocol requires --seed {SEED}")
+    if args.batch_size < 1 or args.accumulate_grad_batches < 1:
+        parser.error("--batch-size and --accumulate-grad-batches must both be positive")
     if args.output_dir.exists() and any(args.output_dir.iterdir()) and args.resume is None:
         raise FileExistsError(f"Refusing to mix a new run with existing files: {args.output_dir}")
     split_dir = args.split_dir or args.data_root / "splits"
@@ -75,8 +78,13 @@ def main() -> None:
         accelerator="gpu", devices=args.num_gpus, strategy="auto" if args.num_gpus == 1 else "ddp",
         max_epochs=args.epochs, precision=args.precision, deterministic=True, logger=logger,
         callbacks=[checkpoint], check_val_every_n_epoch=args.val_every, log_every_n_steps=10,
+        accumulate_grad_batches=args.accumulate_grad_batches,
     )
-    print(f"{args.role}: training {len(train_ids)} scenes / {len(train_set)} pairs; validation is isolated ({len(splits['val'])} scenes)")
+    effective_batch = args.batch_size * args.num_gpus * args.accumulate_grad_batches
+    print(
+        f"{args.role}: training {len(train_ids)} scenes / {len(train_set)} pairs; "
+        f"validation is isolated ({len(splits['val'])} scenes); global effective batch={effective_batch}"
+    )
     trainer.fit(model, train_loader, val_loader, ckpt_path=str(args.resume) if args.resume else None)
     print(f"Best checkpoint: {checkpoint.best_model_path}")
 
