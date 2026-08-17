@@ -4,6 +4,8 @@ results
 train_ckpt
 visuals
 tests
+!tests/
+!tests/*.py
 checkpoints/
 
 

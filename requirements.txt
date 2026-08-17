@@ -5,7 +5,7 @@ scikit-learn
 einops
 opencv-python
 matplotlib
-wandb
+wandb==0.25.1
 scipy
 tqdm 
 torchmetrics

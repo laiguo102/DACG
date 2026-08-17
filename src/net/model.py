@@ -3,16 +3,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numbers
-from einops import rearrange
-from fvcore.nn import FlopCountAnalysis, flop_count_table
 
 
 def to_3d(x):
-    return rearrange(x, 'b c h w -> b (h w) c')
+    b, c, h, w = x.shape
+    return x.permute(0, 2, 3, 1).reshape(b, h * w, c)
 
 
 def to_4d(x, h, w):
-    return rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
+    b, _, c = x.shape
+    return x.reshape(b, h, w, c).permute(0, 3, 1, 2).contiguous()
 
 
 class BiasFree_LayerNorm(nn.Module):
@@ -320,9 +320,9 @@ class Context_Adaptive_Gated_Attention(nn.Module):
         qkv = self.qkv_dwconv(self.qkv(x))
         q, k, v = qkv.chunk(3, dim=1)
 
-        q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
-        k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
-        v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        q = q.reshape(b, self.num_heads, self.head_dim, h * w)
+        k = k.reshape(b, self.num_heads, self.head_dim, h * w)
+        v = v.reshape(b, self.num_heads, self.head_dim, h * w)
 
         q = F.normalize(q, dim=-1)
         k = F.normalize(k, dim=-1)
@@ -335,7 +335,7 @@ class Context_Adaptive_Gated_Attention(nn.Module):
 
         out = out * gate_score
 
-        out = rearrange(out, 'b head c (h w) -> b (head c) h w', h=h, w=w)
+        out = out.reshape(b, c, h, w)
         out = self.project_out(out)
 
         return out
@@ -500,14 +500,19 @@ class DACG_IR(nn.Module):
 
         out = self.output(out_dec_level1) + inp_img
 
-        return out
+        # The network operates on a padded tensor internally, but restoration
+        # runners require the prediction to preserve the caller's exact shape.
+        # Cropping is deliberately done without clamping: AIO3 computes its L1
+        # loss on the raw prediction and clamps only for metrics/visualization.
+        return out[..., :H, :W]
 
     def check_image_size(self, x):
         _, _, h, w = x.size()
         mod_pad_h = (self.padder_size - h % self.padder_size) % self.padder_size
         mod_pad_w = (self.padder_size - w % self.padder_size) % self.padder_size
         # 需要填充的高度和宽度，以确保图像的高度和宽度是 self.padder_size 的倍数。
-        x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), mode='reflect')
+        mode = 'reflect' if h > mod_pad_h and w > mod_pad_w and h > 1 and w > 1 else 'replicate'
+        x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), mode=mode)
         return x
 
 
@@ -516,6 +521,7 @@ class DACG_IR(nn.Module):
 ##########################################################################
 if __name__ == "__main__":
     import warnings
+    from fvcore.nn import FlopCountAnalysis, flop_count_table
 
     warnings.filterwarnings('ignore')
 

@@ -191,6 +191,70 @@ Train from scratch on the [CDD11](https://github.com/gy65896/OneRestore) dataset
 python src/train.py --model model_s --batch_size 8 --de_type denoise_15 denoise_25 denoise_50 dehaze derain --trainset CDD11_all --num_gpus 4 --data_file_dir data_file_dir
 ```
 
+## AIO3-v1 frozen-manifest input and formal output
+
+The original `src/train.py` and `src/test.py` reproduce the repository's legacy
+experiments. Protocol-comparable AIO3-v1 experiments use the separate
+`aio3_runner` package so the legacy data and metric behavior cannot be selected
+accidentally.
+
+The complete no-environment-variable server workflow is documented in
+[`AIO3_SERVER_GUIDE.md`](AIO3_SERVER_GUIDE.md).
+
+Verify the shared manifests before a run:
+
+```bash
+python -m aio3_runner.verify_data --manifest-dir /path/to/outputs/AIO3/aio3-v1/manifests
+```
+
+Use `aio3_runner.data.make_training_loader` (or `AIO3ManifestDataset` together
+with `BalancedTaskBatchSampler`) for training.
+It reads JSONL records directly, creates deterministic 128 x 128 synchronized
+patches, generates Gaussian denoising inputs online, and emits every optimizer
+batch as exactly `4 denoise + 4 derain + 4 dehaze`. Recreate the sampler with
+`start_step=<checkpoint global_step>` to reproduce the next batch after resume.
+
+The DACG-IR AIO3 adapter is `aio3_runner.adapter.build_model`. It preserves the
+input's exact spatial dimensions and returns an unclamped raw restoration.
+
+The protocol runner is launched with `python -m aio3_runner.train`. It owns the
+fixed L1/AdamW/warmup-cosine training loop, validation selection, atomic
+checkpoints, exact resume state, W&B logging, and local JSONL records. Supported
+run kinds are `smoke`, `pilot`, and `formal`; their lengths and intervals are
+frozen by AIO3-v1 rather than exposed as tunable arguments.
+
+After a completed formal run, evaluate only its selected validation checkpoint:
+
+```bash
+python -m aio3_runner.evaluate \
+  --checkpoint /path/to/run/checkpoints/best_macro_psnr.pth \
+  --data-root /path/to/data/AIO3 \
+  --num-workers 4
+```
+
+The evaluator validates the frozen manifest hashes and formal run state, performs
+native-resolution batch-size-1 inference, uses the protocol RGB PSNR/SSIM, and
+creates `test/state.json`, both summary tables, per-image metrics, 804 uniquely
+named predictions, and the deterministic 14-sample/70-image gallery. It refuses
+to overwrite an existing `test` directory.
+
+## CDD-11 scene-disjoint 5-fold OOF for DACG → Difix
+
+For leakage-safe two-stage training on the standard `CDD11/train/{clear,low,...}`
+and `CDD11/test/{clear,low,...}` layout, use the separate `cdd11_oof` package.
+It generates the frozen seed-42 scene split, trains five fold-specific DACG
+models, checks that each checkpoint predicts only its held-out scenes, and emits
+a verified 11715-row `(degraded, coarse, gt)` JSONL manifest for Difix.
+
+See [`CDD11_OOF_SERVER_GUIDE.md`](CDD11_OOF_SERVER_GUIDE.md) for complete server
+commands, including DACG-final validation and official-test inference.
+
+The complete DACG-side OOF workflow can be launched with one resumable command:
+
+```bash
+python train_cdd11_oof.py --data-root /path/to/CDD11 --output-root /path/to/output
+```
+
 # 📋Acknowledgements
 
 This code is built upon:
