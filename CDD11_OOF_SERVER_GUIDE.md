@@ -35,13 +35,29 @@ bash install.sh
 
 ## 一条命令完成 DACG 的全部训练与 OOF 生成（推荐）
 
-配置好 Conda 环境并切换到代码目录后，只需启动：
+W&B 固定使用：
+
+```text
+project: cdd11-restoration
+group: cdd11-dacg-difix-5fold-oof-v1
+```
+
+在线监控前登录一次，并确认安装的是协议固定版本：
+
+```bash
+wandb login
+python -c 'import wandb; assert wandb.__version__ == "0.25.1"; print(wandb.__version__)'
+```
+
+配置好 Conda 环境并切换到代码目录后，只需启动（把 entity 换成自己的 W&B 用户名或团队名）：
 
 ```bash
 python train_cdd11_oof.py \
   --data-root /path/to/CDD11 \
   --output-root /path/to/outputs/CDD11_5fold_oof \
-  --num-gpus 1
+  --num-gpus 1 \
+  --wandb-mode online \
+  --wandb-entity YOUR_ENTITY
 ```
 
 该命令会自动完成：数据校验与首次划分、5 个 DACG fold 的训练及 OOF 推理、11715 条 Difix 三元组合并、DACG-final 训练、Validation coarse 生成。中断后重新执行完全相同的命令即可：已有最佳 checkpoint 的阶段会跳过，只有 `last.ckpt` 的训练会自动恢复。
@@ -63,7 +79,9 @@ python train_cdd11_oof.py \
   --num-gpus 1 \
   --batch-size 2 \
   --accumulate-grad-batches 4 \
-  --tile-size 512
+  --tile-size 512 \
+  --wandb-mode online \
+  --wandb-entity YOUR_ENTITY
 ```
 
 四卡保持有效 batch=8 时使用 `--num-gpus 4 --batch-size 2`。`--tile-size` 只影响 coarse 推理，不改变训练。五折和 final 必须使用相同的 batch/GPU/累积配置；一键脚本会自动保证这一点。
@@ -94,7 +112,9 @@ for FOLD in 1 2 3 4 5; do
     --batch-size 8 \
     --patch-size 128 \
     --num-workers 8 \
-    --num-gpus 1
+    --num-gpus 1 \
+    --wandb-mode online \
+    --wandb-entity YOUR_ENTITY
 
   python -m cdd11_oof.infer \
     --checkpoint "$OUT/dacg_fold${FOLD}/checkpoints/best_macro_psnr.ckpt" \
@@ -116,6 +136,8 @@ python -m cdd11_oof.train \
   --data-root "$DATA" \
   --output-dir "$OUT/dacg_fold1" \
   --role fold1 \
+  --wandb-mode online \
+  --wandb-entity YOUR_ENTITY \
   --resume "$OUT/dacg_fold1/checkpoints/last.ckpt"
 ```
 
@@ -150,8 +172,24 @@ python -m cdd11_oof.train \
   --batch-size 8 \
   --patch-size 128 \
   --num-workers 8 \
-  --num-gpus 1
+  --num-gpus 1 \
+  --wandb-mode online \
+  --wandb-entity YOUR_ENTITY
 ```
+
+每个 `fold1...fold5` 和 `final` 都是独立 W&B run。训练会记录 L1/FFT/总 loss、学习率、裁剪前梯度范数、显存、signed residual 分布、prediction 越界比例、11 类退化的 Validation PSNR/SSIM、macro PSNR/SSIM，以及固定验证样本表。所有曲线显式绑定 `global_step`。W&B run ID 写入每个训练目录的 `wandb_run_id.txt`，断点恢复会以 `resume=must` 接回同一个 run。
+
+同时保留本地事实源：
+
+```text
+<run>/train_metrics.jsonl
+<run>/wandb_state.json
+<run>/wandb_run_id.txt
+<run>/logs/wandb_errors.jsonl
+<run>/wandb/
+```
+
+无网络时可以把所有命令的 `--wandb-mode online --wandb-entity ...` 改为 `--wandb-mode offline`。恢复时不能在同一输出目录切换 online/offline；网络恢复后使用 `wandb sync <run>/wandb/<offline-run-directory>`。
 
 ## 5. 为 Validation 生成 coarse
 

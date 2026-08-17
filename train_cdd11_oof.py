@@ -58,9 +58,11 @@ def train_role(args: argparse.Namespace, role: str) -> Path:
         "--num-gpus", args.num_gpus,
         "--val-every", args.val_every,
         "--precision", args.precision,
+        "--wandb-mode", args.wandb_mode,
+        "--wandb-media-every", args.wandb_media_every,
     ]
-    if args.wandb_project:
-        command += ["--wandb-project", args.wandb_project]
+    if args.wandb_entity:
+        command += ["--wandb-entity", args.wandb_entity]
     if last.is_file():
         print(f"[resume] {role} from {last}", flush=True)
         command += ["--resume", last]
@@ -115,13 +117,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--precision", choices=["32-true", "16-mixed", "bf16-mixed"], default="bf16-mixed")
     parser.add_argument("--tile-size", type=int, default=0, help="Use 512 if whole-image inference runs out of memory")
     parser.add_argument("--tile-overlap", type=int, default=32)
-    parser.add_argument("--wandb-project")
+    parser.add_argument("--wandb-mode", choices=["online", "offline"], default="online")
+    parser.add_argument("--wandb-entity", help="Required in online mode; your W&B user or team")
+    parser.add_argument("--wandb-media-every", type=int, default=40, help="Validation media interval in epochs")
     args = parser.parse_args()
     args.data_root = args.data_root.resolve()
     args.output_root = args.output_root.resolve()
     args.split_dir = (args.split_dir or args.output_root / "splits").resolve()
-    if args.batch_size < 1 or args.accumulate_grad_batches < 1 or args.num_gpus < 1:
+    if args.batch_size < 1 or args.accumulate_grad_batches < 1 or args.num_gpus < 1 or args.wandb_media_every < 1:
         parser.error("batch size, gradient accumulation, and GPU count must all be positive")
+    if args.wandb_mode == "online" and not args.wandb_entity:
+        parser.error("online monitoring requires --wandb-entity")
     return args
 
 
@@ -141,6 +147,11 @@ def main() -> None:
         "num_gpus": args.num_gpus,
         "validation_interval_epochs": args.val_every,
         "precision": args.precision,
+        "wandb_mode": args.wandb_mode,
+        "wandb_entity": args.wandb_entity,
+        "wandb_project": "cdd11-restoration",
+        "wandb_group": "cdd11-dacg-difix-5fold-oof-v1",
+        "wandb_media_interval_epochs": args.wandb_media_every,
         "seed": 42,
     }
     config_path = args.output_root / "pipeline_config.json"

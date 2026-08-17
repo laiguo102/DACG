@@ -7,12 +7,12 @@ from pathlib import Path
 
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint
-from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 from torch.utils.data import DataLoader
 
 from .data import CDD11SceneDataset, validate_partition
 from .model import DACGLitModel, MODEL_CONFIGS
-from .protocol import NUM_TRAIN_SCENES, SEED, assert_frozen_split, load_splits, split_fingerprint
+from .protocol import DEGRADATIONS, NUM_TRAIN_SCENES, PROTOCOL_NAME, SEED, assert_frozen_split, load_splits, split_fingerprint
+from .tracking import CDD11ArtifactCallback, CDD11WandbLogger, PerformanceCallback, WANDB_GROUP, WANDB_PROJECT
 
 
 def training_ids(splits: dict[str, list[str]], role: str) -> list[str]:
@@ -37,13 +37,15 @@ def main() -> None:
     parser.add_argument("--val-every", type=int, default=5)
     parser.add_argument("--precision", default="bf16-mixed", choices=["32-true", "16-mixed", "bf16-mixed"])
     parser.add_argument("--resume", type=Path)
-    parser.add_argument("--wandb-project")
+    parser.add_argument("--wandb-mode", choices=["online", "offline"], default="online")
+    parser.add_argument("--wandb-entity")
+    parser.add_argument("--wandb-media-every", type=int, default=40, help="Validation media interval in epochs")
     parser.add_argument("--seed", type=int, default=SEED)
     args = parser.parse_args()
     if args.seed != SEED:
         parser.error(f"The frozen protocol requires --seed {SEED}")
-    if args.batch_size < 1 or args.accumulate_grad_batches < 1:
-        parser.error("--batch-size and --accumulate-grad-batches must both be positive")
+    if args.batch_size < 1 or args.accumulate_grad_batches < 1 or args.wandb_media_every < 1:
+        parser.error("batch size, accumulation, and W&B media interval must all be positive")
     if args.output_dir.exists() and any(args.output_dir.iterdir()) and args.resume is None:
         raise FileExistsError(f"Refusing to mix a new run with existing files: {args.output_dir}")
     split_dir = args.split_dir or args.data_root / "splits"
@@ -66,19 +68,53 @@ def main() -> None:
         dirpath=args.output_dir / "checkpoints", monitor="val_macro_psnr", mode="max",
         filename="best_macro_psnr", auto_insert_metric_name=False, save_last=True, save_top_k=1,
     )
-    if args.wandb_project:
-        logger = WandbLogger(project=args.wandb_project, name=f"dacg-cdd11-{args.role}", save_dir=str(args.output_dir))
-    else:
-        logger = TensorBoardLogger(save_dir=str(args.output_dir), name="logs")
+    monitoring_config = {
+        "protocol": PROTOCOL_NAME,
+        "model": args.model,
+        "role": args.role,
+        "seed": SEED,
+        "degradations": list(DEGRADATIONS),
+        "split_fingerprint": split_fingerprint(splits),
+        "train_scenes": len(train_ids),
+        "validation_scenes": len(splits["val"]),
+        "epochs": args.epochs,
+        "batch_size_per_gpu": args.batch_size,
+        "num_gpus": args.num_gpus,
+        "accumulate_grad_batches": args.accumulate_grad_batches,
+        "global_effective_batch_size": args.batch_size * args.num_gpus * args.accumulate_grad_batches,
+        "patch_size": args.patch_size,
+        "learning_rate": args.lr,
+        "precision": args.precision,
+        "num_workers": args.num_workers,
+        "validation_interval_epochs": args.val_every,
+        "wandb_media_interval_epochs": args.wandb_media_every,
+        "monitoring": {"provider": "wandb", "project": WANDB_PROJECT, "group": WANDB_GROUP, "mode": args.wandb_mode, "entity": args.wandb_entity},
+    }
+    logger = CDD11WandbLogger(
+        run_dir=args.output_dir, role=args.role, model_name=args.model,
+        entity=args.wandb_entity, mode=args.wandb_mode,
+        config=monitoring_config, resume=args.resume is not None,
+    )
     model = DACGLitModel(
         model_name=args.model, lr=args.lr, epochs=args.epochs, role=args.role,
         split_dir=str(split_dir.resolve()), split_fingerprint=split_fingerprint(splits),
+        wandb_media_every=args.wandb_media_every,
+    )
+    artifact_callback = CDD11ArtifactCallback(
+        split_dir=split_dir, checkpoint_callback=checkpoint, role=args.role,
+        model_name=args.model, split_fingerprint=split_fingerprint(splits),
+    )
+    performance_callback = PerformanceCallback(
+        interval_steps=50,
+        effective_batch_size=args.batch_size * args.num_gpus * args.accumulate_grad_batches,
     )
     trainer = pl.Trainer(
         accelerator="gpu", devices=args.num_gpus, strategy="auto" if args.num_gpus == 1 else "ddp",
         max_epochs=args.epochs, precision=args.precision, deterministic=True, logger=logger,
-        callbacks=[checkpoint], check_val_every_n_epoch=args.val_every, log_every_n_steps=10,
+        callbacks=[checkpoint, artifact_callback, performance_callback], check_val_every_n_epoch=args.val_every,
+        log_every_n_steps=50 * args.accumulate_grad_batches,
         accumulate_grad_batches=args.accumulate_grad_batches,
+        gradient_clip_val=1.0,
     )
     effective_batch = args.batch_size * args.num_gpus * args.accumulate_grad_batches
     print(

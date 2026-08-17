@@ -248,11 +248,18 @@ a verified 11715-row `(degraded, coarse, gt)` JSONL manifest for Difix.
 
 See [`CDD11_OOF_SERVER_GUIDE.md`](CDD11_OOF_SERVER_GUIDE.md) for complete server
 commands, including DACG-final validation and official-test inference.
+The consolidated repository structure, environment, one-command launch, W&B,
+resume, memory tuning, outputs, and Difix handoff are documented in
+[`PROJECT_USAGE_GUIDE.md`](PROJECT_USAGE_GUIDE.md).
 
 The complete DACG-side OOF workflow can be launched with one resumable command:
 
 ```bash
-python train_cdd11_oof.py --data-root /path/to/CDD11 --output-root /path/to/output
+python train_cdd11_oof.py \
+  --data-root /path/to/CDD11 \
+  --output-root /path/to/output \
+  --wandb-mode online \
+  --wandb-entity YOUR_ENTITY
 ```
 
 # 📋Acknowledgements
