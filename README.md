@@ -238,24 +238,29 @@ creates `test/state.json`, both summary tables, per-image metrics, 804 uniquely
 named predictions, and the deterministic 14-sample/70-image gallery. It refuses
 to overwrite an existing `test` directory.
 
-## Full official CDD-11 training and test
+## CDD-11-v1 DACG training and test
 
-The `cdd11_full` runner trains the original `DACG_IR` architecture on all 1183
-official training scenes and all 11 degradation folders. It does not create
-folds or a validation holdout. Consequently, the final completed checkpoint is
-the only selected checkpoint and the official 200-scene test partition is read
-only by the separate evaluator after training.
+The CDD-11 runner trains the original full `DACG_IR` network under the same
+frozen data split, one-per-degradation batch sampler, optimizer, schedule,
+validation, checkpoint, native-resolution inference, and W&B conventions used
+for the UNet/Uformer comparison. It reuses the existing cdd11-v1 manifests:
+1083 train scenes, 100 validation scenes, and the untouched 200-scene official
+test split. OOF training is not part of this workflow.
 
-This protocol is not directly comparable to experiments that reserve 100 of the
-1183 training scenes for validation. See [`CDD11_FULL_SERVER_GUIDE.md`](CDD11_FULL_SERVER_GUIDE.md)
-for the complete environment, audit, launch, resume, W&B, and test commands.
+The deliberate protocol exception is the objective: DACG retains its paper
+RGB L1 + 0.1 Fourier L1 loss. Every config and result records the objective as
+`dacg-paper-rgb-fourier-l1`; therefore comparisons with RGB-L1-only models must
+be described as architecture-plus-native-objective comparisons. See
+[`CDD11_DACG_SERVER_GUIDE.md`](CDD11_DACG_SERVER_GUIDE.md) for audited commands.
 
 ```bash
-python -m cdd11_full.verify --data-root /path/to/CDD11
+python verify_cdd11.py --manifest-dir /path/to/cdd11-v1-manifests
 
-python train_cdd11_full.py \
-  --data-root /path/to/CDD11 \
-  --output-dir /path/to/output/dacg-full-seed3407 \
+python train_cdd11.py \
+  --manifest-dir /path/to/cdd11-v1-manifests \
+  --output-root /path/to/experiments/cdd11-v1-runs \
+  --run-kind formal \
+  --run-name dacg-formal-native-seed3407-v1 \
   --wandb-mode online \
   --wandb-entity YOUR_ENTITY
 ```

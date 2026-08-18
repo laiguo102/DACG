@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 
 import torch
 import torch.nn.functional as F
+
+from .protocol import ARITY_GROUPS
 
 
 def _image(tensor: torch.Tensor) -> torch.Tensor:
@@ -39,3 +42,27 @@ def rgb_ssim(prediction: torch.Tensor, target: torch.Tensor) -> float:
         (mu_x.square() + mu_y.square() + c1) * (sigma_x + sigma_y + c2)
     )
     return float(score.mean().item())
+
+
+def summarize(rows, degradations):
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[row["degradation"]].append(row)
+    missing = [value for value in degradations if not grouped[value]]
+    if missing:
+        raise ValueError(f"Missing metric categories: {missing}")
+    result = {"images": float(len(rows))}
+    for degradation in degradations:
+        values = grouped[degradation]
+        result[f"{degradation}/images"] = float(len(values))
+        for metric in ("psnr", "ssim"):
+            result[f"{degradation}/{metric}"] = math.fsum(row[metric] for row in values) / len(values)
+    for group, categories in ARITY_GROUPS.items():
+        for metric in ("psnr", "ssim"):
+            result[f"{group}/{metric}"] = math.fsum(
+                result[f"{value}/{metric}"] for value in categories) / len(categories)
+        result[f"{group}/categories"] = float(len(categories))
+    for metric in ("psnr", "ssim"):
+        result[f"macro/{metric}"] = math.fsum(
+            result[f"{value}/{metric}"] for value in degradations) / len(degradations)
+    return result

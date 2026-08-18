@@ -6,6 +6,7 @@ einops
 opencv-python
 matplotlib
 wandb==0.25.1
+PyYAML==6.0.2
 scipy
 tqdm 
 torchmetrics

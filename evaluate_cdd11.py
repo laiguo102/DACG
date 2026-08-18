@@ -1,4 +1,4 @@
-"""Convenience entry point for official CDD-11 DACG evaluation."""
+"""CDD-11-v1 DACG formal test entry point."""
 
 from cdd11_full.evaluate import main
 

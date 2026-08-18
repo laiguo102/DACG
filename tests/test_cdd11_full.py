@@ -1,56 +1,60 @@
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
-from cdd11_full.data import validate_partition
-from cdd11_full.protocol import DEGRADATIONS, PROTOCOL_NAME, protocol_metadata, sha256_payload
+from cdd11_full.protocol import DEGRADATIONS, OBJECTIVE_VARIANT, PROTOCOL_NAME, RUN_PROFILES
 
 
-class TestCDD11FullProtocol(unittest.TestCase):
-    def test_protocol_uses_every_official_train_scene_without_holdout(self):
-        metadata = protocol_metadata()
-        self.assertEqual(PROTOCOL_NAME, "cdd11-dacg-full-v1")
-        self.assertEqual(metadata["training_scenes"], 1183)
-        self.assertEqual(metadata["training_pairs"], 1183 * 11)
-        self.assertIsNone(metadata["validation_partition"])
-        self.assertEqual(metadata["checkpoint_selection"], "final_completed_training_checkpoint")
-        self.assertFalse(metadata["oof"])
+class TestProtocol(unittest.TestCase):
+    def test_frozen_comparison_protocol_and_declared_loss_exception(self):
+        self.assertEqual(PROTOCOL_NAME, "cdd11-v1")
+        self.assertEqual(OBJECTIVE_VARIANT, "dacg-paper-rgb-fourier-l1")
         self.assertEqual(len(DEGRADATIONS), 11)
-        self.assertEqual(sha256_payload(metadata), sha256_payload(dict(reversed(list(metadata.items())))))
-
-    def test_partition_pairing(self):
-        paired = {"00001": Path("00001.png"), "00002": Path("00002.png")}
-        with patch("cdd11_full.data.index_images", return_value=paired):
-            self.assertEqual(validate_partition(Path("CDD11"), "train", expected_scenes=2), ["00001", "00002"])
-        incomplete = dict(paired)
-        incomplete.pop("00002")
-        calls = [paired] + [incomplete] + [paired] * (len(DEGRADATIONS) - 1)
-        with patch("cdd11_full.data.index_images", side_effect=calls):
-            with self.assertRaises(ValueError):
-                validate_partition(Path("CDD11"), "train", expected_scenes=2)
+        self.assertEqual(RUN_PROFILES["smoke"]["max_steps"], 100)
+        self.assertEqual(RUN_PROFILES["pilot"]["max_steps"], 5000)
+        self.assertEqual(RUN_PROFILES["formal"]["max_steps"], 200000)
+        self.assertEqual(RUN_PROFILES["formal"]["validation_interval"], 5000)
 
 
 try:
-    import torch  # noqa: F401
+    import torch
 except ImportError:
     torch = None
 
 
-@unittest.skipIf(torch is None, "PyTorch is not installed in the local static-check environment")
-class TestDeterministicSampler(unittest.TestCase):
-    def test_resume_matches_uninterrupted_requests(self):
-        from cdd11_full.data import DeterministicStepBatchSampler
+@unittest.skipIf(torch is None, "PyTorch unavailable in local static-check environment")
+class TestTrainingCore(unittest.TestCase):
+    def test_balanced_sampler_is_step_deterministic(self):
+        from cdd11_full.data import BalancedDegradationBatchSampler, ManifestRecord
 
-        kwargs = dict(dataset_size=22, batch_size=2, accumulate=2, epochs=3, seed=3407)
-        entire = list(DeterministicStepBatchSampler(**kwargs))
-        resumed = list(DeterministicStepBatchSampler(**kwargs, start_step=3))
-        self.assertEqual(resumed, entire[3 * kwargs["accumulate"]:])
-        sampler = DeterministicStepBatchSampler(**kwargs)
-        per_epoch = sampler.steps_per_epoch * kwargs["accumulate"]
-        for epoch in range(kwargs["epochs"]):
-            requests = entire[epoch * per_epoch:(epoch + 1) * per_epoch]
-            indices = [index for batch in requests for index, _ in batch]
-            self.assertEqual(len(indices), len(set(indices)))
+        class Dataset:
+            split = "train"
+            records = [ManifestRecord(f"{degradation}-{scene}", degradation, "train",
+                       Path("/input"), Path("/target"), str(scene), degradation.count("_") + 1)
+                       for degradation in DEGRADATIONS for scene in range(3)]
+
+        first = list(BalancedDegradationBatchSampler(Dataset(), 20, 4, 3407))
+        second = list(BalancedDegradationBatchSampler(Dataset(), 20, 4, 3407))
+        resumed = list(BalancedDegradationBatchSampler(Dataset(), 22, 2, 3407))
+        self.assertEqual(first, second)
+        self.assertEqual(first[2:], resumed)
+        for batch in first:
+            categories = {Dataset.records[index].degradation for index, _ in batch}
+            self.assertEqual(categories, set(DEGRADATIONS))
+
+    def test_paper_loss_microbatch_equivalence(self):
+        from cdd11_full.model import OriginalDACGLoss
+
+        generator = torch.Generator().manual_seed(3407)
+        prediction = torch.rand((11, 3, 16, 16), generator=generator, requires_grad=True)
+        target = torch.rand((11, 3, 16, 16), generator=generator)
+        loss = OriginalDACGLoss()
+        full, _, _ = loss.per_sample(prediction, target)
+        micro = []
+        for start in range(0, 11, 3):
+            values, _, _ = loss.per_sample(prediction[start:start + 3], target[start:start + 3])
+            micro.extend(values)
+        self.assertTrue(torch.allclose(full, torch.stack(micro), atol=1e-7, rtol=1e-6))
+        self.assertTrue(torch.allclose(full.mean(), torch.stack(micro).sum() / 11, atol=1e-7, rtol=1e-6))
 
 
 if __name__ == "__main__":

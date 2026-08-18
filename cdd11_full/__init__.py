@@ -1,4 +1,4 @@
-"""Full official-train CDD-11 protocol for the original DACG-IR network."""
+"""DACG-IR adapter for CDD-11-v1 with the frozen paper loss exception."""
 
 from .protocol import DEGRADATIONS, PROTOCOL_NAME
 

@@ -1,4 +1,4 @@
-"""Convenience entry point for full official CDD-11 DACG training."""
+"""CDD-11-v1 DACG training entry point."""
 
 from cdd11_full.train import main
 

@@ -1,96 +1,135 @@
-"""W&B monitoring with local JSONL as the durable source of truth."""
+"""CDD-11-v1 W&B monitoring with durable local JSONL."""
 
 from __future__ import annotations
 
-import json
 import os
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
-from .protocol import PROTOCOL_NAME
-from .runtime import append_jsonl, atomic_json
+from .runtime import append_jsonl, atomic_json, preserve_rng_state
 
 WANDB_VERSION = "0.25.1"
-WANDB_PROJECT = "cdd11-restoration"
-WANDB_GROUP = PROTOCOL_NAME
 
 
 class Tracker:
-    def __init__(
-        self,
-        *,
-        run_dir: Path,
-        config: dict[str, Any],
-        entity: str | None,
-        mode: str,
-        resume: bool,
-    ) -> None:
-        import wandb
-
-        if wandb.__version__ != WANDB_VERSION:
-            raise RuntimeError(f"CDD-11 requires wandb=={WANDB_VERSION}, found {wandb.__version__}")
-        if mode == "online" and not entity:
-            raise ValueError("Online W&B requires --wandb-entity")
-        self.wandb = wandb
-        self.run_dir = run_dir
+    def __init__(self, run_dir: Path, config: dict, resume: bool):
+        monitoring = config["monitoring"]
+        self.run_dir, self.errors, self.resume = run_dir, 0, bool(resume)
+        self.run, self.wandb = None, None
+        self.run_name = str(config["run_name"])
+        self.resolved_entity, self.url = None, None
+        self.monitoring = dict(monitoring)
         self.error_path = run_dir / "logs" / "wandb_errors.jsonl"
-        self.metrics_path = run_dir / "train_metrics.jsonl"
         self.state_path = run_dir / "wandb_state.json"
-        self.id_path = run_dir / "wandb_run_id.txt"
-        if resume:
-            if not self.id_path.is_file() or not self.state_path.is_file():
-                raise RuntimeError("Resume requires wandb_run_id.txt and wandb_state.json")
-            run_id = self.id_path.read_text(encoding="utf-8").strip()
-            run_name = json.loads(self.state_path.read_text(encoding="utf-8"))["run_name"]
-        else:
-            run_id = uuid.uuid4().hex
-            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-            run_name = f"dacg-full-seed{config['seed']}-{timestamp}"
-        wandb_root = run_dir / "wandb"
-        for path in (wandb_root, wandb_root / "cache", wandb_root / "artifacts", wandb_root / "staging"):
+        if monitoring["mode"] == "disabled":
+            self._state(False)
+            return
+        try:
+            import wandb
+        except ImportError as error:
+            self._state(False, f"ImportError: {error}")
+            raise RuntimeError("W&B monitoring is enabled but wandb is not installed") from error
+        if wandb.__version__ != WANDB_VERSION:
+            self._state(False, f"version mismatch: {wandb.__version__}")
+            raise RuntimeError(f"CDD-11-v1 requires wandb=={WANDB_VERSION}, got {wandb.__version__}")
+        self.wandb = wandb
+        root = run_dir / "wandb"
+        for path in (root, root / "cache", root / "artifacts", root / "staging"):
             path.mkdir(parents=True, exist_ok=True)
-        os.environ.update({
-            "WANDB_DIR": str(wandb_root), "WANDB_CACHE_DIR": str(wandb_root / "cache"),
-            "WANDB_ARTIFACT_DIR": str(wandb_root / "artifacts"),
-            "WANDB_DATA_DIR": str(wandb_root / "staging"),
-        })
-        self.run_id, self.run_name, self.mode = run_id, run_name, mode
-        self.run = wandb.init(
-            entity=entity, project=WANDB_PROJECT, group=WANDB_GROUP,
-            name=run_name, id=run_id, resume="must" if resume else "never",
-            mode=mode, dir=str(wandb_root), config=config,
-            tags=[PROTOCOL_NAME, "full-official-train", "no-oof", config["model"].lower()],
-        )
+        os.environ.update({"WANDB_DIR": str(root), "WANDB_CACHE_DIR": str(root / "cache"),
+                           "WANDB_ARTIFACT_DIR": str(root / "artifacts"),
+                           "WANDB_DATA_DIR": str(root / "staging")})
+        try:
+            with preserve_rng_state():
+                self.run = wandb.init(
+                    entity=monitoring["entity"], project=monitoring["project"], group=monitoring["group"],
+                    job_type="train", name=config["run_name"], id=monitoring["wandb_run_id"],
+                    resume="must" if resume else "never", mode=monitoring["mode"], dir=str(root),
+                    config=config, tags=monitoring["tags"], force=monitoring["mode"] == "online",
+                )
+        except Exception as error:
+            self._state(False, f"{type(error).__name__}: {error}")
+            raise RuntimeError("Could not initialize W&B; verify login/network or use offline mode") from error
+        self.resolved_entity = getattr(self.run, "entity", None)
+        self.url = getattr(self.run, "url", None)
+        self._state(True)
+        self._safe("define_metrics", self._define_metrics)
+        if not resume:
+            self._safe("manifest_artifact", lambda: self._log_artifact(config))
+
+    def _define_metrics(self):
         self.run.define_metric("global_step")
-        for pattern in ("train/*", "diagnostics/*", "system/*", "test/*"):
+        for pattern in ("train/*", "val/*", "system/*", "diagnostics/*", "test/*"):
             self.run.define_metric(pattern, step_metric="global_step")
-        self.id_path.write_text(run_id + "\n", encoding="utf-8")
-        self._state("running")
 
-    def _state(self, status: str) -> None:
-        atomic_json(self.state_path, {
-            "status": status, "run_id": self.run_id, "run_name": self.run_name,
-            "project": WANDB_PROJECT, "group": WANDB_GROUP, "mode": self.mode,
-            "url": getattr(self.run, "url", None),
-        })
+    def _log_artifact(self, config):
+        artifact = self.wandb.Artifact(
+            name="cdd11-v1-frozen-manifests", type="dataset",
+            metadata={"protocol": config["protocol"],
+                      "manifest_sha256": config["data"]["manifest_sha256"]})
+        manifest_dir = Path(config["paths"]["manifest_dir"])
+        for filename in ("train.jsonl", "val.jsonl", "test.jsonl", "data_audit.json", "visual_samples.json"):
+            artifact.add_file(str(manifest_dir / filename), name=filename)
+        self.run.log_artifact(artifact)
 
-    def log(self, payload: dict[str, Any], step: int) -> None:
-        record = {"global_step": step, **payload}
-        append_jsonl(self.metrics_path, record)
+    def _state(self, active: bool, initialization_error: str | None = None):
+        monitoring = self.monitoring
+        value = {
+            "active": active, "errors": self.errors, "provider": "wandb",
+            "project": monitoring.get("project"), "group": monitoring.get("group"),
+            "mode": monitoring.get("mode"), "requested_entity": monitoring.get("entity"),
+            "resolved_entity": self.resolved_entity, "resume": self.resume,
+            "run_id": monitoring.get("wandb_run_id"),
+            "run_name": self.run_name, "url": self.url,
+            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        if initialization_error:
+            value["initialization_error"] = initialization_error
+        atomic_json(self.state_path, value)
+
+    def _safe(self, operation, function):
+        if self.run is None:
+            return
         try:
-            self.run.log(record, step=step)
+            with preserve_rng_state():
+                function()
         except Exception as error:
-            append_jsonl(self.error_path, {
-                "operation": "log", "global_step": step,
-                "error_type": type(error).__name__, "error": str(error),
-            })
-            print(f"W&B warning: {error}; local JSONL continues", flush=True)
+            self.errors += 1
+            append_jsonl(self.error_path, {"operation": operation, "error": str(error)})
+            self._state(True)
+            print(f"W&B warning during {operation}: {error}; local artifacts remain authoritative", flush=True)
 
-    def finish(self, status: str) -> None:
-        self._state(status)
-        try:
-            self.run.finish(exit_code=0 if status == "completed" else 1)
-        except Exception as error:
-            append_jsonl(self.error_path, {"operation": "finish", "error": str(error)})
+    def log(self, payload: dict, step: int):
+        self._safe("log_scalars", lambda: self.run.log({"global_step": step, **payload}, step=step))
+
+    def update_best(self, best: dict):
+        def operation():
+            self.run.summary["best/macro_psnr"] = best["macro_psnr"]
+            self.run.summary["best/macro_ssim"] = best["macro_ssim"]
+            self.run.summary["best/global_step"] = best["global_step"]
+        self._safe("update_best", operation)
+
+    def log_validation(self, summary: dict, visuals: list[dict], step: int):
+        def operation():
+            payload = {"global_step": step, **{f"val/{key}": value for key, value in summary.items()}}
+            if visuals:
+                columns = ["global_step", "degradation", "arity", "sample_id", "input",
+                           "prediction", "target", "absolute_error", "signed_residual", "psnr", "ssim"]
+                table = self.wandb.Table(columns=columns)
+                for visual in visuals:
+                    table.add_data(step, visual["degradation"], visual["arity"], visual["sample_id"],
+                                   self.wandb.Image(visual["input_path"]),
+                                   self.wandb.Image(visual["prediction_path"]),
+                                   self.wandb.Image(visual["target_path"]),
+                                   self.wandb.Image(visual["absolute_error_path"]),
+                                   self.wandb.Image(visual["signed_residual_path"]),
+                                   visual["psnr"], visual["ssim"])
+                payload["val/fixed_samples"] = table
+            self.run.log(payload, step=step)
+        self._safe("log_validation", operation)
+
+    def finish(self):
+        if self.run is not None:
+            self._safe("finish", self.run.finish)
+            self.run = None
+        self._state(False)

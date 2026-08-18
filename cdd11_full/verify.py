@@ -1,4 +1,4 @@
-"""Audit the standard CDD-11 layout for full training and official testing."""
+"""Verify reuse of the exact CDD-11-v1 manifest bundle."""
 
 from __future__ import annotations
 
@@ -6,36 +6,27 @@ import argparse
 import json
 from pathlib import Path
 
-from .data import dataset_fingerprint, validate_partition
-from .protocol import DEGRADATIONS, NUM_TEST_SCENES, NUM_TRAIN_SCENES, protocol_metadata
-from .runtime import atomic_json
+from .data import load_manifest
+from .protocol import DEGRADATIONS, OBJECTIVE_VARIANT, PROTOCOL_NAME
+from .train import _verify_manifests
 
 
-def audit(data_root: Path) -> dict:
-    train_ids = validate_partition(data_root, "train", NUM_TRAIN_SCENES)
-    test_ids = validate_partition(data_root, "test", NUM_TEST_SCENES)
-    overlap = sorted(set(train_ids) & set(test_ids))
-    # Scene filenames need not be globally unique across official partitions;
-    # report overlap rather than treating it as image-content leakage.
-    return {
-        "status": "pass", "protocol": protocol_metadata(),
-        "train": {"scenes": len(train_ids), "pairs": len(train_ids) * len(DEGRADATIONS),
-                  "fingerprint": dataset_fingerprint(data_root, "train", train_ids)},
-        "test": {"scenes": len(test_ids), "pairs": len(test_ids) * len(DEGRADATIONS),
-                 "fingerprint": dataset_fingerprint(data_root, "test", test_ids)},
-        "filename_overlap_count": len(overlap), "filename_overlap_examples": overlap[:10],
-    }
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Audit full CDD-11 layout without generating any split")
-    parser.add_argument("--data-root", type=Path, required=True)
-    parser.add_argument("--output", type=Path)
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--manifest-dir", type=Path, required=True)
     args = parser.parse_args()
-    result = audit(args.data_root)
-    if args.output:
-        atomic_json(args.output, result)
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    directory, hashes = _verify_manifests(args.manifest_dir)
+    counts = {}
+    expected = {"train": 11913, "val": 1100, "test": 2200}
+    for split, total in expected.items():
+        records = load_manifest(directory / f"{split}.jsonl", split)
+        by_degradation = {value: sum(record.degradation == value for record in records) for value in DEGRADATIONS}
+        if len(records) != total or len(set(by_degradation.values())) != 1:
+            raise RuntimeError(f"Invalid frozen {split} manifest: rows={len(records)}, counts={by_degradation}")
+        counts[split] = {"rows": len(records), "rows_by_degradation": by_degradation}
+    print(json.dumps({"status": "pass", "protocol": PROTOCOL_NAME,
+                      "objective_variant": OBJECTIVE_VARIANT, "directory": str(directory),
+                      "hashes": hashes, "splits": counts}, indent=2), flush=True)
 
 
 if __name__ == "__main__":

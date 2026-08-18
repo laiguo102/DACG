@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import random
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+import yaml
 
 
 def atomic_json(path: str | Path, payload: Any) -> None:
@@ -64,6 +67,15 @@ def restore_rng(state: dict[str, Any]) -> None:
         torch.cuda.set_rng_state_all(state["torch_cuda"])
 
 
+@contextmanager
+def preserve_rng_state():
+    state = rng_state()
+    try:
+        yield
+    finally:
+        restore_rng(state)
+
+
 def git_state(root: str | Path = ".") -> dict[str, Any]:
     try:
         commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True).stdout.strip()
@@ -71,3 +83,19 @@ def git_state(root: str | Path = ".") -> dict[str, Any]:
         return {"commit": commit, "dirty": bool(status.strip()), "status": status.splitlines()}
     except (OSError, subprocess.CalledProcessError) as error:
         return {"commit": None, "dirty": True, "error": str(error)}
+
+
+def file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def atomic_yaml(path: str | Path, payload: Any) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    os.replace(temporary, path)

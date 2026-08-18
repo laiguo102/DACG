@@ -14,10 +14,6 @@ MODEL_CONFIGS: dict[str, dict[str, Any]] = {
         "dim": 48, "num_blocks": [4, 6, 6, 8], "heads": [1, 2, 4, 8],
         "num_refinement_blocks": 4, "num_scales": 3,
     },
-    "DACG_IR_S": {
-        "dim": 32, "num_blocks": [4, 6, 6, 8], "heads": [1, 2, 4, 8],
-        "num_refinement_blocks": 4, "num_scales": 3,
-    },
 }
 
 
@@ -42,6 +38,24 @@ class OriginalDACGLoss(nn.Module):
         fft = torch.view_as_real(pred_fft).sub(torch.view_as_real(target_fft)).abs().mean() * 0.1
         loss = l1.float() + fft
         return loss, {"l1": l1.detach().float(), "fft": fft.detach().float()}
+
+    def per_sample(self, prediction: torch.Tensor, target: torch.Tensor):
+        """Paper loss for each item, enabling exact 11-sample microbatching."""
+        l1 = (prediction.float() - target.float()).abs().flatten(1).mean(1)
+        pred_fft = torch.view_as_real(torch.fft.rfft2(prediction.float(), dim=(-2, -1)))
+        target_fft = torch.view_as_real(torch.fft.rfft2(target.float(), dim=(-2, -1)))
+        fft = (pred_fft - target_fft).abs().flatten(1).mean(1) * 0.1
+        return l1 + fft, l1, fft
+
+
+def architecture_metadata(model_name: str = "DACG_IR") -> dict[str, object]:
+    config = MODEL_CONFIGS[model_name]
+    return {
+        "model_name": model_name,
+        "implementation": "original_dacg_ir",
+        "expected_trainable_parameters": 30_861_200,
+        **config,
+    }
 
 
 def load_network(checkpoint_path: str, device: torch.device) -> tuple[DACG_IR, dict[str, Any]]:
