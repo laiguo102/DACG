@@ -238,26 +238,24 @@ creates `test/state.json`, both summary tables, per-image metrics, 804 uniquely
 named predictions, and the deterministic 14-sample/70-image gallery. It refuses
 to overwrite an existing `test` directory.
 
-## CDD-11 scene-disjoint 5-fold OOF for DACG → Difix
+## Full official CDD-11 training and test
 
-For leakage-safe two-stage training on the standard `CDD11/train/{clear,low,...}`
-and `CDD11/test/{clear,low,...}` layout, use the separate `cdd11_oof` package.
-It generates the frozen seed-42 scene split, trains five fold-specific DACG
-models, checks that each checkpoint predicts only its held-out scenes, and emits
-a verified 11715-row `(degraded, coarse, gt)` JSONL manifest for Difix.
+The `cdd11_full` runner trains the original `DACG_IR` architecture on all 1183
+official training scenes and all 11 degradation folders. It does not create
+folds or a validation holdout. Consequently, the final completed checkpoint is
+the only selected checkpoint and the official 200-scene test partition is read
+only by the separate evaluator after training.
 
-See [`CDD11_OOF_SERVER_GUIDE.md`](CDD11_OOF_SERVER_GUIDE.md) for complete server
-commands, including DACG-final validation and official-test inference.
-The consolidated repository structure, environment, one-command launch, W&B,
-resume, memory tuning, outputs, and Difix handoff are documented in
-[`PROJECT_USAGE_GUIDE.md`](PROJECT_USAGE_GUIDE.md).
-
-The complete DACG-side OOF workflow can be launched with one resumable command:
+This protocol is not directly comparable to experiments that reserve 100 of the
+1183 training scenes for validation. See [`CDD11_FULL_SERVER_GUIDE.md`](CDD11_FULL_SERVER_GUIDE.md)
+for the complete environment, audit, launch, resume, W&B, and test commands.
 
 ```bash
-python train_cdd11_oof.py \
+python -m cdd11_full.verify --data-root /path/to/CDD11
+
+python train_cdd11_full.py \
   --data-root /path/to/CDD11 \
-  --output-root /path/to/output \
+  --output-dir /path/to/output/dacg-full-seed3407 \
   --wandb-mode online \
   --wandb-entity YOUR_ENTITY
 ```

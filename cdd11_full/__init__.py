@@ -1,4 +1,4 @@
-"""Scene-disjoint 5-fold OOF workflow for DACG-IR on CDD-11."""
+"""Full official-train CDD-11 protocol for the original DACG-IR network."""
 
 from .protocol import DEGRADATIONS, PROTOCOL_NAME
 
