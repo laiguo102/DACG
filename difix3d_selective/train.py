@@ -1,4 +1,4 @@
-"""End-to-end DACG coarse generation and selective Difix training."""
+"""Train selective Difix from precomputed DACG coarse images."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ from .model import (
     load_training_checkpoint,
     save_training_checkpoint,
 )
-from .prepare import prepare_selective_data
+from .prepare import prepare_selective_manifests
 
 
 def _validation(model, loader, lpips_model, accelerator, limit: int) -> tuple[float, float]:
@@ -78,18 +78,15 @@ def run(args: argparse.Namespace) -> None:
     output_dir = args.output_dir.resolve()
     if accelerator.is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
-        prepared = prepare_selective_data(
+        prepared = prepare_selective_manifests(
             data_root=args.data_root,
-            dacg_checkpoint=args.dacg_checkpoint,
+            coarse_root=args.coarse_root,
             output_dir=output_dir,
             pair_ids=args.degradation_pairs,
-            device=accelerator.device,
-            tile_size=args.dacg_tile_size,
-            tile_overlap=args.dacg_tile_overlap,
         )
         print(
-            f"Prepared {prepared['coarse_images']} coarse images, "
-            f"{prepared['train_samples']} train and {prepared['validation_samples']} validation samples",
+            f"Indexed {prepared['coarse_images']} coarse images, "
+            f"wrote {prepared['train_samples']} train and {prepared['validation_samples']} validation samples",
             flush=True,
         )
     accelerator.wait_for_everyone()
@@ -282,13 +279,11 @@ def run(args: argparse.Namespace) -> None:
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description=__doc__)
     value.add_argument("--data-root", type=Path, required=True)
-    value.add_argument("--dacg-checkpoint", type=Path, required=True)
+    value.add_argument("--coarse-root", type=Path, required=True)
     value.add_argument("--output-dir", type=Path, required=True)
     value.add_argument(
         "--degradation-pairs", nargs="+", type=int, choices=range(1, 6), required=True
     )
-    value.add_argument("--dacg-tile-size", type=int, default=0)
-    value.add_argument("--dacg-tile-overlap", type=int, default=64)
     value.add_argument("--resolution", type=int, default=512)
     value.add_argument("--max-train-steps", type=int, default=10_000)
     value.add_argument("--train-batch-size", type=int, default=1)

@@ -11,7 +11,7 @@ import torch
 from PIL import Image
 
 from difix3d_selective.main_view import select_main_view, select_main_view_skips
-from difix3d_selective.prepare import tiled_forward
+from difix3d_selective.prepare import prepare_selective_manifests, tiled_forward
 from difix3d_selective.protocol import (
     NUM_TRAIN_SCENES,
     NUM_VALIDATION_SCENES,
@@ -114,6 +114,54 @@ class TestDatasetAndPreparation(unittest.TestCase):
         result = tiled_forward(Double(), image, tile_size=6, overlap=2)
         self.assertEqual(result.shape, image.shape)
         self.assertTrue(torch.allclose(result, image * 2))
+
+    def test_manifests_read_main_images_from_independent_coarse_root(self):
+        root = Path.cwd().resolve()
+        data_root = root / "fake-cdd11"
+        coarse_root = root / "fake-coarse"
+        output_dir = root / "fake-run"
+        scene_ids = ("000001", "000002")
+        written = {}
+
+        def fake_index_images(path):
+            path = Path(path)
+            if path == coarse_root / "low_haze":
+                return {scene: path / f"{scene}.png" for scene in scene_ids}
+            return {scene: path / f"{scene}.jpg" for scene in scene_ids}
+
+        def capture_jsonl(path, records):
+            written[Path(path).name] = records
+
+        with (
+            patch("difix3d_selective.prepare.index_images", side_effect=fake_index_images),
+            patch("difix3d_selective.prepare._write_jsonl", side_effect=capture_jsonl),
+            patch(
+                "difix3d_selective.prepare.make_scene_split",
+                return_value={"train": [scene_ids[0]], "validation": [scene_ids[1]]},
+            ),
+            patch("pathlib.Path.mkdir"),
+            patch("pathlib.Path.write_text"),
+        ):
+            prepare_selective_manifests(
+                data_root=data_root,
+                coarse_root=coarse_root,
+                output_dir=output_dir,
+                pair_ids=[1],
+            )
+
+        train_records = written["train.jsonl"]
+        self.assertEqual(len(train_records), 2)
+        self.assertTrue(
+            all(
+                Path(record["image"]).parent == coarse_root / "low_haze"
+                for record in train_records
+            )
+        )
+        by_prompt = {
+            record["prompt"]: Path(record["target_image"]).parent.name for record in train_records
+        }
+        self.assertEqual(by_prompt["remove low light, preserve haze"], "haze")
+        self.assertEqual(by_prompt["remove haze, preserve low light"], "low")
 
     def test_cdd11_full_checkpoint_loader_uses_model_and_config_keys(self):
         from cdd11_full import model as dacg_model

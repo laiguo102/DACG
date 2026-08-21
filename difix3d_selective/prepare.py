@@ -1,4 +1,4 @@
-"""Generate DACG coarse images and directed Difix manifests from CDD11/train."""
+"""Precompute DACG coarse images and build directed Difix manifests."""
 
 from __future__ import annotations
 
@@ -9,8 +9,6 @@ import numpy as np
 import torch
 from PIL import Image
 from tqdm.auto import tqdm
-
-from cdd11_full.model import load_network
 
 from .protocol import PROMPT_NAMES, directed_tasks, make_scene_split, selected_pairs
 
@@ -72,6 +70,8 @@ def tiled_forward(
 
 
 def load_dacg_checkpoint(checkpoint: str | Path, device: torch.device):
+    from cdd11_full.model import load_network
+
     return load_network(str(Path(checkpoint).resolve()), device)
 
 
@@ -83,48 +83,41 @@ def _write_jsonl(path: Path, records: list[dict]) -> None:
     )
 
 
-def prepare_selective_data(
+def generate_cdd11_coarse(
     *,
     data_root: str | Path,
     dacg_checkpoint: str | Path,
-    output_dir: str | Path,
+    coarse_root: str | Path,
     pair_ids: list[int],
     device: torch.device,
     tile_size: int = 0,
     tile_overlap: int = 64,
 ) -> dict[str, Path | int]:
     data_root = Path(data_root).resolve()
-    prepared_root = Path(output_dir).resolve() / "prepared"
+    coarse_root = Path(coarse_root).resolve()
     train_root = data_root / "train"
     pairs = selected_pairs(pair_ids)
     clear = index_images(train_root / "clear")
-    splits = make_scene_split(list(clear))
     all_scene_ids = set(clear)
 
     source_images: dict[str, dict[str, Path]] = {}
-    target_images: dict[str, dict[str, Path]] = {}
     for _, pair in pairs:
         source_images[pair] = index_images(train_root / pair)
         if set(source_images[pair]) != all_scene_ids:
             raise ValueError(f"CDD11 scene mismatch in train/{pair}")
-    for degradation in PROMPT_NAMES:
-        target_images[degradation] = index_images(train_root / degradation)
-        if set(target_images[degradation]) != all_scene_ids:
-            raise ValueError(f"CDD11 scene mismatch in train/{degradation}")
 
-    jobs: list[tuple[str, str, Path, Path]] = []
-    for split, scene_ids in splits.items():
-        for _, pair in pairs:
-            for scene_id in scene_ids:
-                output = prepared_root / "coarse" / split / pair / f"{scene_id}.png"
-                if not output.is_file():
-                    jobs.append((split, pair, source_images[pair][scene_id], output))
+    jobs: list[tuple[Path, Path]] = []
+    for _, pair in pairs:
+        for scene_id, source in source_images[pair].items():
+            output = coarse_root / pair / f"{scene_id}.png"
+            if not output.is_file():
+                jobs.append((source, output))
 
     if jobs:
         model, checkpoint = load_dacg_checkpoint(dacg_checkpoint, device)
         del checkpoint
         with torch.inference_mode():
-            for _, _, source, output in tqdm(jobs, desc="Generating DACG coarse"):
+            for source, output in tqdm(jobs, desc="Generating DACG coarse"):
                 prediction = tiled_forward(
                     model,
                     image_tensor(source).to(device, non_blocking=True),
@@ -136,13 +129,58 @@ def prepare_selective_data(
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
+    info = {
+        "data_root": str(data_root),
+        "dacg_checkpoint": str(Path(dacg_checkpoint).resolve()),
+        "coarse_root": str(coarse_root),
+        "degradation_pairs": [{"id": pair_id, "name": pair} for pair_id, pair in pairs],
+        "coarse_images": len(clear) * len(pairs),
+    }
+    coarse_root.mkdir(parents=True, exist_ok=True)
+    (coarse_root / "coarse_preparation.json").write_text(
+        json.dumps(info, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    return {"coarse_root": coarse_root, "coarse_images": len(clear) * len(pairs)}
+
+
+def prepare_selective_manifests(
+    *,
+    data_root: str | Path,
+    coarse_root: str | Path,
+    output_dir: str | Path,
+    pair_ids: list[int],
+) -> dict[str, Path | int]:
+    data_root = Path(data_root).resolve()
+    coarse_root = Path(coarse_root).resolve()
+    prepared_root = Path(output_dir).resolve() / "prepared"
+    train_root = data_root / "train"
+    pairs = selected_pairs(pair_ids)
+    clear = index_images(train_root / "clear")
+    splits = make_scene_split(list(clear))
+    all_scene_ids = set(clear)
+
+    source_images: dict[str, dict[str, Path]] = {}
+    coarse_images: dict[str, dict[str, Path]] = {}
+    target_images: dict[str, dict[str, Path]] = {}
+    for _, pair in pairs:
+        source_images[pair] = index_images(train_root / pair)
+        coarse_images[pair] = index_images(coarse_root / pair)
+        if set(source_images[pair]) != all_scene_ids:
+            raise ValueError(f"CDD11 scene mismatch in train/{pair}")
+        if set(coarse_images[pair]) != all_scene_ids:
+            raise ValueError(f"CDD11 coarse scene mismatch in {coarse_root / pair}")
+    for degradation in PROMPT_NAMES:
+        target_images[degradation] = index_images(train_root / degradation)
+        if set(target_images[degradation]) != all_scene_ids:
+            raise ValueError(f"CDD11 scene mismatch in train/{degradation}")
+
     manifests: dict[str, Path] = {}
     counts: dict[str, int] = {}
     for split, scene_ids in splits.items():
         records: list[dict] = []
         for pair_id, pair in pairs:
             for scene_id in scene_ids:
-                coarse = prepared_root / "coarse" / split / pair / f"{scene_id}.png"
+                coarse = coarse_images[pair][scene_id]
                 reference = source_images[pair][scene_id]
                 for task in directed_tasks(pair_id):
                     target = target_images[task.preserve][scene_id]
@@ -169,7 +207,7 @@ def prepare_selective_data(
     info = {
         "seed": 42,
         "data_root": str(data_root),
-        "dacg_checkpoint": str(Path(dacg_checkpoint).resolve()),
+        "coarse_root": str(coarse_root),
         "degradation_pairs": [{"id": pair_id, "name": pair} for pair_id, pair in pairs],
         "train_scene_ids": splits["train"],
         "validation_scene_ids": splits["validation"],

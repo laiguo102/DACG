@@ -267,10 +267,11 @@ python train_cdd11.py \
 
 ## CDD11 selective-degradation Difix3D
 
-`train_cdd11_difix.py` accepts a CDD11 root and a completed full-DACG checkpoint,
-generates coarse images for selected double degradations, and trains two directed
-`remove A, preserve B` tasks per image. The degraded image is a conditioning-only
-reference: only the DACG main view's latent and VAE skips are decoded and supervised.
+Run `prepare_cdd11_coarse.py` once to write all DACG preliminary restorations to an
+independent folder. `train_cdd11_difix.py` then reads that folder and trains two
+directed `remove A, preserve B` tasks per image without loading or running DACG.
+The degraded image is a conditioning-only reference: only the DACG main view's latent
+and VAE skips are decoded and supervised.
 See [`CDD11_DIFIX_SERVER_GUIDE.md`](CDD11_DIFIX_SERVER_GUIDE.md) for installation,
 pair IDs, single/multi-GPU commands, outputs, and resume instructions.
 
