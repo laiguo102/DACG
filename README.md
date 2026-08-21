@@ -265,6 +265,18 @@ python train_cdd11.py \
   --wandb-entity YOUR_ENTITY
 ```
 
+## CDD11 selective-degradation Difix3D
+
+`train_cdd11_difix.py` accepts a CDD11 root and a completed full-DACG checkpoint,
+generates coarse images for selected double degradations, and trains two directed
+`remove A, preserve B` tasks per image. The degraded image is a conditioning-only
+reference: only the DACG main view's latent and VAE skips are decoded and supervised.
+See [`CDD11_DIFIX_SERVER_GUIDE.md`](CDD11_DIFIX_SERVER_GUIDE.md) for installation,
+pair IDs, single/multi-GPU commands, outputs, and resume instructions.
+
+This component incorporates NVIDIA Difix3D under its non-commercial license; see
+[`difix3d_selective/LICENSE_DIFIX3D.txt`](difix3d_selective/LICENSE_DIFIX3D.txt).
+
 # 📋Acknowledgements
 
 This code is built upon:
