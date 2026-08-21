@@ -458,6 +458,11 @@ class DACG_IR(nn.Module):
         self.output = nn.Conv2d(self.dim_list[1], out_channels, kernel_size=3, stride=1, padding=1, bias=bias)
 
     def forward(self, inp_img):
+        restored, _ = self.forward_with_degradation(inp_img)
+        return restored
+
+    def forward_with_degradation(self, inp_img):
+        """Restore an image and return the DAM global degradation descriptor."""
         B, C, H, W = inp_img.shape
         inp_img = self.check_image_size(inp_img)
 
@@ -504,7 +509,7 @@ class DACG_IR(nn.Module):
         # runners require the prediction to preserve the caller's exact shape.
         # Cropping is deliberately done without clamping: AIO3 computes its L1
         # loss on the raw prediction and clamps only for metrics/visualization.
-        return out[..., :H, :W]
+        return out[..., :H, :W], global_feat
 
     def check_image_size(self, x):
         _, _, h, w = x.size()

@@ -238,6 +238,30 @@ creates `test/state.json`, both summary tables, per-image metrics, 804 uniquely
 named predictions, and the deterministic 14-sample/70-image gallery. It refuses
 to overwrite an existing `test` directory.
 
+## DACG-conditioned Difix3D for CDD11
+
+This branch adds a two-view, degradation-conditioned Difix3D pipeline for CDD11:
+
+```text
+[DACG coarse restoration, original degraded reference] -> clear target
+```
+
+The frozen DACG degradation-aware module extracts `P_global` from the reference
+view. It conditions trainable UNet and VAE-decoder LoRA rank matrices, while the
+SD-Turbo bases, text encoder, and DAM remain frozen. Both views participate in
+the multi-view UNet, but only view 0 is decoded and only view-0 VAE encoder skips
+are used. The prompt is fixed to `remove degradation`.
+
+Install the pinned optional environment with `requirements_difix.txt`. The full
+server workflow, including coarse generation, smoke training, resume, ablations,
+cascade inference, and CDD11 evaluation, is in
+[`CDD11_DACG_DIFIX_SERVER_GUIDE.md`](CDD11_DACG_DIFIX_SERVER_GUIDE.md).
+
+The Difix3D-derived components are based on upstream commit
+`c76edc595586e16732c91ddee82f3a6d83a8a9cc`. See `dacg_difix/UPSTREAM.md` and
+`dacg_difix/LICENSE_DIFIX3D.txt`. Those components remain subject to NVIDIA's
+non-commercial research/evaluation license.
+
 ## CDD-11-v1 DACG training and test
 
 The CDD-11 runner trains the original full `DACG_IR` network under the same
