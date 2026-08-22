@@ -70,6 +70,16 @@ class _DummyDifix(torch.nn.Module):
 
 
 class TestDifixRuntime(unittest.TestCase):
+    def test_zero_gram_weight_does_not_build_vgg_gram_network(self):
+        fake_lpips = _DummyLPIPS()
+        with mock.patch.dict(
+            "sys.modules", {"lpips": mock.Mock(LPIPS=mock.Mock(return_value=fake_lpips))}
+        ):
+            from dacg_difix.loss import build_restoration_loss
+
+            loss = build_restoration_loss(lambda_gram=0)
+        self.assertIsInstance(loss.gram_model, torch.nn.Identity)
+
     def test_training_cli_accepts_folder_mode_without_manifests(self):
         argv = [
             "train_cdd11_difix.py",
@@ -183,7 +193,7 @@ class TestDifixRuntime(unittest.TestCase):
                 "--output-dir", "run",
             ]
         )
-        self.assertEqual(parsed.max_train_steps, 10_000)
+        self.assertEqual(parsed.max_train_steps, 100_000)
         self.assertEqual(parsed.mixed_precision, "bf16")
         self.assertEqual(parsed.timestep, 199)
         self.assertEqual(parsed.seed, 42)

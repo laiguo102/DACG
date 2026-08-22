@@ -71,9 +71,19 @@ python prepare_cdd11_difix.py \
 
 ## 3. 训练
 
-默认实验配置正是 MSE/LPIPS/Gram 权重 `1/1/1`、Gram 从第 2000 步启用、
-10000 个优化步、BF16、固定 diffusion timestep 199、随机种子 42。默认 LoRA 条件模式为
+默认训练步数现已设为 100000，精度为 BF16，固定 diffusion timestep 199、随机种子 42。
+默认 LoRA 条件模式为
 `p-global-layer-id`：`P_global` 与 UNet stage ID 共同生成每层 rank×rank 矩阵。
+
+参考 LUCID 的 SD-Turbo 训练配置，CDD-11 首轮正式实验建议使用 512 分辨率、有效
+batch 4、timestep 199、AdamW、linear schedule、500-step warmup、梯度裁剪 1.0。
+LUCID 训练 100000 步且使用 VAE LoRA rank 4，本实验也固定训练 100000 步，并用
+linear scheduler 将学习率完整衰减。最终测试不直接使用最后一步，而使用训练期间
+按完整验证集 PSNR 自动保存的 `best_psnr.pt`。首个 fidelity-first 基线使用
+MSE=1、LPIPS=1、Gram=0；Gram 与 LUCID 的 intrinsic feature loss 并不等价，
+不应直接用 Gram=1 冒充论文配置。
+下面命令按单卡编写，`batch 1 × accumulation 4` 的有效 batch 为 4；多卡时应保持
+`每卡 batch × GPU 数 × accumulation = 4`，不要随 GPU 数量把全局 batch 一起放大。
 
 ```bash
 accelerate launch train_cdd11_difix.py \
@@ -83,19 +93,26 @@ accelerate launch train_cdd11_difix.py \
   --output-dir /runs/cdd11_difix_pglobal_layer \
   --pretrained-model stabilityai/sd-turbo \
   --resolution 512 \
-  --max-train-steps 10000 \
+  --max-train-steps 100000 \
+  --train-batch-size 1 \
+  --gradient-accumulation-steps 4 \
   --mixed-precision bf16 \
   --timestep 199 \
   --lambda-mse 1 \
   --lambda-lpips 1 \
-  --lambda-gram 1 \
-  --gram-loss-warmup-steps 2000 \
+  --lambda-gram 0 \
   --lora-mode p-global-layer-id \
   --lora-rank-unet 32 \
-  --lora-rank-vae 16 \
+  --lora-rank-vae 4 \
+  --learning-rate 1e-5 \
+  --lr-scheduler linear \
+  --lr-warmup-steps 500 \
+  --max-grad-norm 1.0 \
   --gradient-checkpointing \
   --enable-xformers-memory-efficient-attention \
-  --validation-steps 1000 \
+  --allow-tf32 \
+  --checkpointing-steps 5000 \
+  --validation-steps 5000 \
   --validation-limit 0 \
   --validation-visualizations 4 \
   --report-to wandb \
@@ -130,7 +147,7 @@ accelerate launch train_cdd11_difix.py \
 ```
 
 两步 smoke 完成后，先确认 W&B 已出现 `validation/psnr`、`validation/ssim` 和
-`validation/degraded_coarse_final_gt`，再启动正式 10000 步训练。
+`validation/degraded_coarse_final_gt`，再启动正式 100000 步训练。
 
 训练期不会加载完整 DACG restoration 网络，只从同一 checkpoint 提取并冻结
 DAM。checkpoint 只包含 Difix LoRA、条件生成器、主视角 VAE skip conv，以及
@@ -165,7 +182,7 @@ for MODE in static p-global p-global-layer-id; do
     --dam-checkpoint /checkpoints/dacg_cdd11_best.pt \
     --output-dir "/runs/cdd11_difix_${MODE}" \
     --lora-mode "${MODE}" \
-    --max-train-steps 10000 \
+    --max-train-steps 100000 \
     --mixed-precision bf16
 done
 ```
@@ -185,7 +202,7 @@ python infer_cdd11_difix.py \
   --output /data/example/restored.png \
   --coarse-output /data/example/dacg_coarse.png \
   --dacg-checkpoint /checkpoints/dacg_cdd11_best.pt \
-  --difix-checkpoint /runs/cdd11_difix_pglobal_layer/checkpoints/latest.pt \
+  --difix-checkpoint /runs/cdd11_difix_pglobal_layer/checkpoints/best_psnr.pt \
   --lora-mode p-global-layer-id \
   --precision bf16 \
   --device cuda
@@ -202,7 +219,7 @@ python infer_cdd11_difix.py \
 python evaluate_cdd11_difix.py \
   --manifest /runs/cdd11_difix_pglobal_layer/prepared/manifests/test.jsonl \
   --dam-checkpoint /checkpoints/dacg_cdd11_best.pt \
-  --difix-checkpoint /runs/cdd11_difix_pglobal_layer/checkpoints/latest.pt \
+  --difix-checkpoint /runs/cdd11_difix_pglobal_layer/checkpoints/best_psnr.pt \
   --output-dir /runs/cdd11_difix_pglobal_layer/test \
   --lora-mode p-global-layer-id \
   --precision bf16 \

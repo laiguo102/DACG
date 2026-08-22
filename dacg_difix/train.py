@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from datetime import timedelta
 from pathlib import Path
@@ -13,7 +14,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from cdd11_full.metrics import rgb_psnr, rgb_ssim
-from cdd11_full.runtime import atomic_torch_save, restore_rng, rng_state
+from cdd11_full.runtime import atomic_json, atomic_torch_save, restore_rng, rng_state
 
 from .loss import build_restoration_loss
 
@@ -330,6 +331,10 @@ def run(args: argparse.Namespace) -> None:
     )
 
     global_step = 0
+    best_state_path = output_dir / "best_validation.json"
+    best_psnr = -math.inf
+    if best_state_path.is_file():
+        best_psnr = float(json.loads(best_state_path.read_text(encoding="utf-8"))["psnr"])
     if args.resume is not None:
         global_step = load_adapter_checkpoint(
             args.resume,
@@ -444,6 +449,27 @@ def run(args: argparse.Namespace) -> None:
                 accelerator.log(validation_logs, step=global_step)
             if accelerator.is_main_process:
                 print(f"validation step={global_step}: {metrics}", flush=True)
+                if math.isfinite(metrics["psnr"]) and metrics["psnr"] > best_psnr:
+                    best_psnr = metrics["psnr"]
+                    checkpoint_dir = output_dir / "checkpoints"
+                    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                    save_training_checkpoint(
+                        checkpoint_dir / "best_psnr.pt",
+                        accelerator.unwrap_model(model),
+                        global_step,
+                        args,
+                        optimizer,
+                        lr_scheduler,
+                    )
+                    atomic_json(best_state_path, {
+                        "global_step": global_step,
+                        "psnr": best_psnr,
+                        "ssim": metrics["ssim"],
+                    })
+                    print(
+                        f"new best validation PSNR={best_psnr:.4f} at step={global_step}",
+                        flush=True,
+                    )
 
         should_checkpoint = global_step % args.checkpointing_steps == 0 or global_step == args.max_train_steps
         if accelerator.is_main_process and should_checkpoint:
@@ -492,7 +518,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--timestep", type=int, default=199)
     value.add_argument("--prompt", default="remove degradation")
     value.add_argument("--resolution", type=int, default=512)
-    value.add_argument("--max-train-steps", type=int, default=10_000)
+    value.add_argument("--max-train-steps", type=int, default=100_000)
     value.add_argument("--train-batch-size", type=int, default=1)
     value.add_argument("--gradient-accumulation-steps", type=int, default=1)
     value.add_argument("--dataloader-num-workers", type=int, default=8)

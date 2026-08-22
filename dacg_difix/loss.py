@@ -161,11 +161,15 @@ def build_restoration_loss(
     """Build pretrained loss networks; called only by the training entry point."""
 
     import lpips
-    from torchvision.models import VGG16_Weights, vgg16
 
     lpips_model = lpips.LPIPS(net="vgg")
-    vgg_features = vgg16(weights=VGG16_Weights.DEFAULT).features
-    gram_model = VGGGramLoss(vgg_features)
+    if lambda_gram:
+        from torchvision.models import VGG16_Weights, vgg16
+
+        vgg_features = vgg16(weights=VGG16_Weights.DEFAULT).features
+        gram_model: nn.Module = VGGGramLoss(vgg_features)
+    else:
+        gram_model = nn.Identity()
     return DifixRestorationLoss(
         lpips_model,
         gram_model,

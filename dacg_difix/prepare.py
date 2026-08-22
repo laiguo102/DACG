@@ -202,8 +202,8 @@ def prepare_cdd11_folder_manifests(
             else (("test", sorted(test_clear)),)
         )
         for logical_split, scene_ids in logical_splits:
-            for degradation in DEGRADATIONS:
-                for scene_id in scene_ids:
+            for scene_id in scene_ids:
+                for degradation in DEGRADATIONS:
                     rows_by_split[logical_split].append({
                         "coarse": str(coarse_by_type[degradation][scene_id]),
                         "degraded": str(degraded_by_type[degradation][scene_id]),
