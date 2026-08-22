@@ -328,7 +328,6 @@ class DACGDifix(nn.Module):
             self.unet,
             unet_matrices,
             unet_stage_id,
-            repeat_interleave=NUM_VIEWS,
         )
         assign_condition_matrices(self.vae, vae_matrices, vae_decoder_stage_id)
 

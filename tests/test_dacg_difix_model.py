@@ -29,6 +29,49 @@ class FakeLoraLayer(nn.Module):
 
 
 class TestConditionalLoraMath(unittest.TestCase):
+    def test_condition_repeats_to_match_multiview_runtime_batch(self):
+        layer = FakeLoraLayer(
+            nn.Linear(2, 2, bias=False),
+            nn.Linear(2, 2, bias=False),
+            nn.Linear(2, 2, bias=False),
+        )
+        with torch.no_grad():
+            layer.base_layer.weight.zero_()
+            layer.lora_A["default"].weight.copy_(torch.eye(2))
+            layer.lora_B["default"].weight.copy_(torch.eye(2))
+        install_conditional_lora_forward(layer)
+
+        value = torch.tensor([
+            [1.0, 2.0],
+            [3.0, 4.0],
+            [5.0, 6.0],
+            [7.0, 8.0],
+        ])
+        for matrix in (
+            torch.eye(2).unsqueeze(0),
+            torch.stack((torch.eye(2), 2.0 * torch.eye(2))),
+        ):
+            with self.subTest(condition_batch=matrix.shape[0]):
+                matrix = matrix.requires_grad_()
+                layer.condition_matrix = matrix
+                result = layer(value)
+                expanded = matrix.repeat_interleave(4 // matrix.shape[0], dim=0)
+                expected = torch.einsum("br,brs->bs", value, expanded)
+                self.assertTrue(torch.equal(result, expected))
+                result.sum().backward()
+                self.assertIsNotNone(matrix.grad)
+
+    def test_condition_rejects_non_divisible_runtime_batch(self):
+        layer = FakeLoraLayer(
+            nn.Linear(2, 2, bias=False),
+            nn.Linear(2, 2, bias=False),
+            nn.Linear(2, 2, bias=False),
+        )
+        install_conditional_lora_forward(layer)
+        layer.condition_matrix = torch.eye(2).repeat(2, 1, 1)
+        with self.assertRaisesRegex(ValueError, "condition=2, input=3"):
+            layer(torch.ones(3, 2))
+
     def test_linear_c_equals_identity_plus_delta_and_gradients(self):
         layer = FakeLoraLayer(
             nn.Linear(2, 2, bias=False),

@@ -127,8 +127,18 @@ def _apply_rank_matrix(value: torch.Tensor, matrix: torch.Tensor) -> torch.Tenso
     matrix = matrix.to(device=value.device, dtype=value.dtype)
     if matrix.ndim == 2:
         matrix = matrix.unsqueeze(0)
-    if matrix.shape[0] == 1 and value.shape[0] != 1:
-        matrix = matrix.expand(value.shape[0], -1, -1)
+    value_batch = value.shape[0]
+    condition_batch = matrix.shape[0]
+    if condition_batch != value_batch:
+        if value_batch % condition_batch:
+            raise ValueError(
+                "LoRA condition batch cannot be aligned with the layer input: "
+                f"condition={condition_batch}, input={value_batch}"
+            )
+        # The multi-view UNet merges and re-expands views inside attention
+        # blocks.  Repeat each image condition to match the runtime layer
+        # batch instead of assuming one fixed expansion at assignment time.
+        matrix = matrix.repeat_interleave(value_batch // condition_batch, dim=0)
     if isinstance(value, torch.Tensor) and value.ndim == 4:
         return torch.einsum("brhw,brs->bshw", value, matrix)
     return torch.einsum("b...r,brs->b...s", value, matrix)
