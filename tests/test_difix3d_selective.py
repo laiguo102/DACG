@@ -67,6 +67,23 @@ class TestMainViewSelection(unittest.TestCase):
             self.assertTrue(torch.equal(result, source[[0, 2]]))
 
 
+class TestValidationVisualization(unittest.TestCase):
+    @unittest.skipIf(importlib.util.find_spec("torchvision") is None, "torchvision is not installed")
+    def test_comparison_order_is_degraded_coarse_final_gt(self):
+        from difix3d_selective.train import _comparison_image
+
+        source = torch.zeros(1, 2, 3, 12, 8)
+        source[:, 0].fill_(-0.5)  # coarse -> 0.25
+        source[:, 1].fill_(-1.0)  # degraded -> 0.0
+        prediction = torch.zeros(1, 3, 12, 8)  # final -> 0.5
+        target = torch.ones(1, 3, 12, 8)  # GT -> 1.0
+        comparison = _comparison_image(source, target, prediction)
+
+        self.assertEqual(tuple(comparison.shape), (3, 12, 32))
+        panel_means = [float(panel.mean()) for panel in comparison.split(8, dim=-1)]
+        self.assertEqual(panel_means, [0.0, 0.25, 0.5, 1.0])
+
+
 class TestDatasetAndPreparation(unittest.TestCase):
     @staticmethod
     def _save(path: Path, rgb):

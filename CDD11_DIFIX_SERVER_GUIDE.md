@@ -36,6 +36,22 @@ python -m pip install -r requirements_difix.txt
 
 ## 3. 一次性生成全部 coarse
 
+如果服务器上的 `background` 已经是 DACG 对五类双退化的初步恢复结果，且目录为
+`background/<pair>/<scene>.<suffix>`，不要再次运行 DACG。训练时直接令
+`--coarse-root /path/to/CDD11/background`。开始前应确认它至少包含：
+
+```text
+background/
+├── low_haze/<scene>.png
+├── low_rain/<scene>.png
+├── low_snow/<scene>.png
+├── haze_rain/<scene>.png
+└── haze_snow/<scene>.png
+```
+
+每个选中 pair 必须与 `CDD11/train/clear` 的 1183 个 scene 文件名 stem 完全一致。
+以下生成命令只用于服务器尚无这些结果的情况。
+
 ```bash
 python prepare_cdd11_coarse.py \
   --data-root /path/to/CDD11 \
@@ -64,7 +80,7 @@ CDD11-DACG-coarse/
 ```bash
 accelerate launch --mixed_precision=bf16 train_cdd11_difix.py \
   --data-root /path/to/CDD11 \
-  --coarse-root /path/to/CDD11-DACG-coarse \
+  --coarse-root /path/to/CDD11/background \
   --output-dir /path/to/difix-selective-run \
   --degradation-pairs 1 2 3 4 5 \
   --resolution 512 \
@@ -72,10 +88,44 @@ accelerate launch --mixed_precision=bf16 train_cdd11_difix.py \
   --train-batch-size 1 \
   --dataloader-num-workers 8 \
   --enable-xformers-memory-efficient-attention \
+  --eval-freq 1000 \
+  --viz-freq 1000 \
+  --num-validation-samples 100 \
+  --num-validation-visualizations 4 \
+  --report-to wandb \
+  --tracker-project-name difix-cdd11-selective \
   --tracker-run-name difix-selective-all-five
 ```
 
 训练启动时只索引 coarse、CDD 原退化图和单退化 target，并生成 manifest。
+每 `--eval-freq` 步上传验证集 RGB PSNR、RGB SSIM（另保留 LPIPS 作为辅助指标）；
+每 `--viz-freq` 步上传固定顺序的横向四联图：退化图、DACG 初步去除图、Difix
+最终图、GT。`--viz-freq` 应设置为 `--eval-freq` 的整数倍，四联图来自验证集而非
+训练 batch。
+
+正式跑 10000 步前，建议先用真实权重和 `background` 做两步 smoke：
+
+```bash
+accelerate launch --mixed_precision=bf16 train_cdd11_difix.py \
+  --data-root /path/to/CDD11 \
+  --coarse-root /path/to/CDD11/background \
+  --output-dir /path/to/difix-selective-smoke \
+  --degradation-pairs 1 2 3 4 5 \
+  --max-train-steps 2 \
+  --train-batch-size 1 \
+  --dataloader-num-workers 0 \
+  --checkpointing-steps 2 \
+  --eval-freq 1 \
+  --viz-freq 1 \
+  --num-validation-samples 2 \
+  --num-validation-visualizations 2 \
+  --report-to wandb \
+  --tracker-project-name difix-cdd11-selective \
+  --tracker-run-name difix-selective-smoke
+```
+
+确认 W&B 中出现 `validation/psnr`、`validation/ssim` 和
+`validation/degraded_coarse_final_gt` 后，再启动正式训练。
 
 ## 5. 多卡训练
 

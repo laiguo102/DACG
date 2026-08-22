@@ -21,6 +21,8 @@ from torchvision import transforms
 from torchvision.transforms.functional import crop
 from tqdm.auto import tqdm
 
+from cdd11_full.metrics import rgb_psnr, rgb_ssim
+
 from .data import SelectiveDifixDataset
 from .loss import gram_loss
 from .model import (
@@ -31,9 +33,33 @@ from .model import (
 from .prepare import prepare_selective_manifests
 
 
-def _validation(model, loader, lpips_model, accelerator, limit: int) -> tuple[float, float]:
+def _display(value: torch.Tensor) -> torch.Tensor:
+    return (value.detach().float().cpu() * 0.5 + 0.5).clamp(0, 1)
+
+
+def _comparison_image(
+    source: torch.Tensor, target: torch.Tensor, prediction: torch.Tensor
+) -> torch.Tensor:
+    """Join degraded, DACG coarse, Difix output and GT from left to right."""
+
+    degraded = _display(source[0, 1])
+    coarse = _display(source[0, 0])
+    final = _display(prediction[0])
+    ground_truth = _display(target[0])
+    return torch.cat((degraded, coarse, final, ground_truth), dim=-1)
+
+
+def _validation(
+    model,
+    loader,
+    lpips_model,
+    accelerator,
+    limit: int,
+    num_visualizations: int = 0,
+) -> tuple[dict[str, float], list[tuple[torch.Tensor, str]]]:
     model.eval()
-    l2_values, lpips_values = [], []
+    psnr_values, ssim_values, lpips_values = [], [], []
+    visualizations: list[tuple[torch.Tensor, str]] = []
     with torch.inference_mode():
         for index, batch in enumerate(loader):
             if index >= limit:
@@ -43,29 +69,36 @@ def _validation(model, loader, lpips_model, accelerator, limit: int) -> tuple[fl
                 batch["conditioning_pixel_values"],
                 prompt_tokens=batch["input_ids"],
             )
-            l2 = (prediction.float() - target.float()).square().flatten(1).mean(1)
+            prediction_01 = prediction.float().add(1).mul(0.5).clamp(0, 1)
+            target_01 = target.float().add(1).mul(0.5).clamp(0, 1)
+            psnr = prediction.new_tensor([rgb_psnr(prediction_01, target_01)]).float()
+            ssim = prediction.new_tensor([rgb_ssim(prediction_01, target_01)]).float()
             perceptual = lpips_model(prediction.float(), target.float()).flatten()
-            l2_values.append(accelerator.gather_for_metrics(l2))
+            psnr_values.append(accelerator.gather_for_metrics(psnr))
+            ssim_values.append(accelerator.gather_for_metrics(ssim))
             lpips_values.append(accelerator.gather_for_metrics(perceptual))
+            if accelerator.is_main_process and len(visualizations) < num_visualizations:
+                caption = (
+                    f"{batch['sample_id'][0]} | {batch['prompt'][0]} | "
+                    "left to right: degraded | DACG coarse | Difix final | GT"
+                )
+                visualizations.append((
+                    _comparison_image(batch["conditioning_pixel_values"], target, prediction),
+                    caption,
+                ))
     accelerator.unwrap_model(model).set_train()
-    return (
-        float(torch.cat(l2_values).mean()),
-        float(torch.cat(lpips_values).mean()),
-    )
+    metrics = {
+        "psnr": float(torch.cat(psnr_values).mean()),
+        "ssim": float(torch.cat(ssim_values).mean()),
+        "lpips": float(torch.cat(lpips_values).mean()),
+    }
+    return metrics, visualizations
 
 
-def _wandb_images(source, target, prediction, prompts):
+def _wandb_validation_images(visualizations):
     import wandb
 
-    def display(value):
-        return (value[0].detach().float().cpu() * 0.5 + 0.5).clamp(0, 1)
-
-    return {
-        "train/main_coarse": wandb.Image(display(source[:, 0]), caption=prompts[0]),
-        "train/reference_degraded": wandb.Image(display(source[:, 1]), caption=prompts[0]),
-        "train/target_preserved": wandb.Image(display(target), caption=prompts[0]),
-        "train/model_output": wandb.Image(display(prediction), caption=prompts[0]),
-    }
+    return [wandb.Image(image, caption=caption) for image, caption in visualizations]
 
 
 def run(args: argparse.Namespace) -> None:
@@ -225,28 +258,30 @@ def run(args: argparse.Namespace) -> None:
         }
         progress.set_postfix(loss=logs["train/loss"])
 
-        if (
-            accelerator.is_main_process
-            and args.report_to == "wandb"
-            and global_step % args.viz_freq == 0
-        ):
-            logs.update(_wandb_images(source, target, prediction, batch["prompt"]))
         if args.report_to != "none":
             accelerator.log(logs, step=global_step)
 
         if global_step % args.eval_freq == 0 or global_step == args.max_train_steps:
-            validation_l2, validation_lpips = _validation(
+            should_visualize = global_step % args.viz_freq == 0 or global_step == args.max_train_steps
+            validation_metrics, visualizations = _validation(
                 model,
                 validation_loader,
                 perceptual_model,
                 accelerator,
                 args.num_validation_samples,
+                args.num_validation_visualizations if should_visualize else 0,
             )
             if args.report_to != "none":
-                accelerator.log(
-                    {"validation/l2": validation_l2, "validation/lpips": validation_lpips},
-                    step=global_step,
-                )
+                validation_logs = {
+                    f"validation/{key}": value for key, value in validation_metrics.items()
+                }
+                if accelerator.is_main_process and args.report_to == "wandb" and visualizations:
+                    validation_logs["validation/degraded_coarse_final_gt"] = (
+                        _wandb_validation_images(visualizations)
+                    )
+                accelerator.log(validation_logs, step=global_step)
+            if accelerator.is_main_process:
+                print(f"validation step={global_step}: {validation_metrics}", flush=True)
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -305,8 +340,9 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--timestep", type=int, default=199)
     value.add_argument("--checkpointing-steps", type=int, default=1000)
     value.add_argument("--eval-freq", type=int, default=1000)
-    value.add_argument("--viz-freq", type=int, default=100)
+    value.add_argument("--viz-freq", type=int, default=1000)
     value.add_argument("--num-validation-samples", type=int, default=100)
+    value.add_argument("--num-validation-visualizations", type=int, default=4)
     value.add_argument("--gradient-checkpointing", action="store_true")
     value.add_argument("--enable-xformers-memory-efficient-attention", action="store_true")
     value.add_argument("--allow-tf32", action="store_true")
