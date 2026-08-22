@@ -14,7 +14,7 @@ from torch import nn
 
 import cdd11_full.model as cdd11_model
 from dacg_difix.data import PreparedCDD11Dataset, build_difix_loader
-from dacg_difix.prepare import prepare_cdd11_manifests
+from dacg_difix.prepare import prepare_cdd11_manifests, prepare_existing_cdd11_manifests
 from src.net.model import DACG_IR
 
 
@@ -54,6 +54,42 @@ class FakeTokenizer:
 
 
 class DACGDifixDataTests(unittest.TestCase):
+    def test_prepare_reuses_existing_background_without_dacg(self):
+        with _temporary_workspace() as root:
+            manifests = root / "manifests"
+            background = root / "background"
+            output = root / "prepared"
+            manifests.mkdir()
+            degraded = root / "degraded.png"
+            target = root / "target.png"
+            _save_image(degraded, 32, size=(12, 12))
+            _save_image(target, 224, size=(12, 12))
+            record = {
+                "id": "scene/train",
+                "degradation": "low_haze",
+                "input": str(degraded.resolve()),
+                "target": str(target.resolve()),
+                "scene_id": "scene",
+                "metadata": {"arity": 2},
+            }
+            for split in ("train", "val", "test"):
+                (manifests / f"{split}.jsonl").write_text(
+                    json.dumps(record) + "\n", encoding="utf-8"
+                )
+                coarse_dir = background / split / "low_haze"
+                coarse_dir.mkdir(parents=True)
+                _save_image(coarse_dir / degraded.name, 128, size=(12, 12))
+
+            metadata = prepare_existing_cdd11_manifests(
+                manifests, background, output
+            )
+            self.assertEqual(metadata["coarse_source"], "existing-background")
+            self.assertEqual(metadata["counts"], {"train": 1, "val": 1, "test": 1})
+            row = json.loads((output / "train.jsonl").read_text(encoding="utf-8"))
+            self.assertEqual(Path(row["coarse"]), (background / "train" / "low_haze" / degraded.name).resolve())
+            self.assertEqual(Path(row["degraded"]), degraded.resolve())
+            self.assertEqual(Path(row["target"]), target.resolve())
+
     def test_forward_with_degradation_preserves_forward_and_state_dict(self):
         model = DACG_IR(**SMALL_CONFIG).eval()
         keys = tuple(model.state_dict())

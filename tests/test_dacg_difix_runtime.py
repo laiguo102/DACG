@@ -14,6 +14,7 @@ from dacg_difix.inference import cascade_restore, pad_to_multiple
 from dacg_difix.loss import DifixRestorationLoss, gram_matrix
 from dacg_difix.train import (
     CHECKPOINT_FORMAT,
+    _comparison_image,
     adapter_checkpoint,
     load_adapter_checkpoint,
     parser as train_parser,
@@ -68,6 +69,18 @@ class _DummyDifix(torch.nn.Module):
 
 
 class TestDifixRuntime(unittest.TestCase):
+    def test_validation_comparison_is_degraded_coarse_final_gt(self):
+        degraded = torch.full((1, 3, 12, 8), -1.0)
+        coarse = torch.full((1, 3, 12, 8), -0.5)
+        final = torch.zeros(1, 3, 12, 8)
+        target = torch.ones(1, 3, 12, 8)
+        comparison = _comparison_image(degraded, coarse, final, target)
+        self.assertEqual(tuple(comparison.shape), (3, 12, 32))
+        self.assertEqual(
+            [float(panel.mean()) for panel in comparison.split(8, dim=-1)],
+            [0.0, 0.25, 0.5, 1.0],
+        )
+
     def test_gram_matrix_is_batched_not_cross_sample(self):
         features = torch.stack((torch.zeros(2, 3, 3), torch.ones(2, 3, 3)))
         grams = gram_matrix(features)
@@ -164,6 +177,7 @@ class TestDifixRuntime(unittest.TestCase):
             (1.0, 1.0, 1.0),
         )
         self.assertEqual(parsed.gram_loss_warmup_steps, 2_000)
+        self.assertEqual(parsed.validation_visualizations, 4)
 
 
 if __name__ == "__main__":

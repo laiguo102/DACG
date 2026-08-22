@@ -125,6 +125,35 @@ def _native_prediction(
     return prediction[..., :height, :width]
 
 
+def _display_image(value: torch.Tensor) -> torch.Tensor:
+    """Convert one normalized CHW image to a CPU [0, 1] tensor for logging."""
+
+    return value.detach().float().cpu().add(1).mul(0.5).clamp(0, 1)
+
+
+def _comparison_image(
+    degraded: torch.Tensor,
+    coarse: torch.Tensor,
+    final: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Join degraded, DACG coarse, Difix final and GT from left to right."""
+
+    panels = (
+        _display_image(degraded[0]),
+        _display_image(coarse[0]),
+        _display_image(final[0]),
+        _display_image(target[0]),
+    )
+    return torch.cat(panels, dim=-1)
+
+
+def _wandb_validation_images(visualizations: list[tuple[torch.Tensor, str]]) -> list[Any]:
+    import wandb
+
+    return [wandb.Image(image, caption=caption) for image, caption in visualizations]
+
+
 def _build_model(args: argparse.Namespace) -> torch.nn.Module:
     from .model import DACGDifix
 
@@ -175,9 +204,11 @@ def _validate(
     lpips_model: torch.nn.Module,
     accelerator: Any,
     limit: int,
-) -> dict[str, float]:
+    visualization_limit: int = 0,
+) -> tuple[dict[str, float], list[tuple[torch.Tensor, str]]]:
     model.eval()
     rows: list[torch.Tensor] = []
+    visualizations: list[tuple[torch.Tensor, str]] = []
     for index, batch in enumerate(loader):
         if limit and index >= limit:
             break
@@ -191,18 +222,42 @@ def _validate(
         )
         target = batch["target"]
         prediction_01 = prediction.float().add(1).mul(0.5).clamp(0, 1)
+        coarse_01 = batch["main"].float().add(1).mul(0.5).clamp(0, 1)
         target_01 = target.float().add(1).mul(0.5).clamp(0, 1)
         perceptual = lpips_model(prediction.float(), target.float()).mean()
         row = prediction.new_tensor(
-            [rgb_psnr(prediction_01, target_01), rgb_ssim(prediction_01, target_01)]
+            [
+                rgb_psnr(prediction_01, target_01),
+                rgb_ssim(prediction_01, target_01),
+                rgb_psnr(coarse_01, target_01),
+                rgb_ssim(coarse_01, target_01),
+            ]
         ).float()
         rows.append(torch.cat((row, perceptual.reshape(1).float())))
+        if accelerator.is_main_process and len(visualizations) < visualization_limit:
+            caption = (
+                f"{batch['id'][0]} | {batch['degradation'][0]} | "
+                "left to right: degraded | DACG coarse | Difix final | GT"
+            )
+            visualizations.append((
+                _comparison_image(batch["ref"], batch["main"], prediction, target),
+                caption,
+            ))
     if not rows:
-        return {"psnr": math.nan, "ssim": math.nan, "lpips": math.nan}
+        metrics = {
+            "psnr": math.nan,
+            "ssim": math.nan,
+            "coarse_psnr": math.nan,
+            "coarse_ssim": math.nan,
+            "lpips": math.nan,
+        }
+        model.train()
+        return metrics, visualizations
     gathered = accelerator.gather_for_metrics(torch.stack(rows))
     means = gathered.mean(0).cpu().tolist()
     model.train()
-    return dict(zip(("psnr", "ssim", "lpips"), means, strict=True))
+    metric_names = ("psnr", "ssim", "coarse_psnr", "coarse_ssim", "lpips")
+    return dict(zip(metric_names, means, strict=True)), visualizations
 
 
 def run(args: argparse.Namespace) -> None:
@@ -295,7 +350,14 @@ def run(args: argparse.Namespace) -> None:
             key: str(value) if isinstance(value, Path) else value
             for key, value in vars(args).items()
         }
-        accelerator.init_trackers(args.tracker_project_name, config=config)
+        init_kwargs = {"wandb": {"dir": str(output_dir)}}
+        if args.tracker_run_name:
+            init_kwargs["wandb"]["name"] = args.tracker_run_name
+        accelerator.init_trackers(
+            args.tracker_project_name,
+            config=config,
+            init_kwargs=init_kwargs,
+        )
 
     progress = tqdm(
         total=args.max_train_steps,
@@ -345,19 +407,24 @@ def run(args: argparse.Namespace) -> None:
 
         should_validate = global_step % args.validation_steps == 0 or global_step == args.max_train_steps
         if should_validate:
-            metrics = _validate(
+            metrics, visualizations = _validate(
                 model,
                 dam,
                 validation_loader,
                 loss_model.lpips_model,
                 accelerator,
                 args.validation_limit,
+                args.validation_visualizations,
             )
             if args.report_to != "none":
-                accelerator.log(
-                    {f"validation/{key}": value for key, value in metrics.items()},
-                    step=global_step,
-                )
+                validation_logs = {
+                    f"validation/{key}": value for key, value in metrics.items()
+                }
+                if accelerator.is_main_process and args.report_to == "wandb" and visualizations:
+                    validation_logs["validation/degraded_coarse_final_gt"] = (
+                        _wandb_validation_images(visualizations)
+                    )
+                accelerator.log(validation_logs, step=global_step)
             if accelerator.is_main_process:
                 print(f"validation step={global_step}: {metrics}", flush=True)
 
@@ -425,6 +492,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--checkpointing-steps", type=int, default=1_000)
     value.add_argument("--validation-steps", type=int, default=1_000)
     value.add_argument("--validation-limit", type=int, default=100)
+    value.add_argument("--validation-visualizations", type=int, default=4)
     value.add_argument("--mixed-precision", choices=("no", "fp16", "bf16"), default="bf16")
     value.add_argument("--gradient-checkpointing", action="store_true")
     value.add_argument("--enable-xformers-memory-efficient-attention", action="store_true")
@@ -433,6 +501,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--resume", type=Path)
     value.add_argument("--report-to", choices=("wandb", "none"), default="none")
     value.add_argument("--tracker-project-name", default="cdd11-dacg-difix")
+    value.add_argument("--tracker-run-name")
     return value
 
 

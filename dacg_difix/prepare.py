@@ -17,6 +17,7 @@ from cdd11_full.runtime import file_sha256
 
 
 SPLITS = ("train", "val", "test")
+IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
 
 
 def _load_rgb(path: Path) -> torch.Tensor:
@@ -100,6 +101,96 @@ def _read_manifest(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def _existing_coarse_path(
+    coarse_root: Path, record: dict[str, Any], split: str
+) -> Path:
+    """Resolve a precomputed background image using common CDD-11 layouts."""
+
+    degradation = str(record["degradation"])
+    input_path = Path(str(record["input"]))
+    directories = (
+        coarse_root / split / degradation,
+        coarse_root / degradation,
+        coarse_root / split,
+        coarse_root,
+    )
+    names = (input_path.name,) + tuple(
+        f"{input_path.stem}{suffix}" for suffix in IMAGE_SUFFIXES
+    )
+    checked: list[Path] = []
+    for directory in directories:
+        for name in dict.fromkeys(names):
+            candidate = directory / name
+            checked.append(candidate)
+            if candidate.is_file():
+                return candidate.resolve()
+    preview = ", ".join(str(path) for path in checked[:4])
+    raise FileNotFoundError(
+        f"no existing DACG background for record {record['id']!r}; checked {preview}, ..."
+    )
+
+
+def _prepared_row(
+    record: dict[str, Any], split: str, coarse_path: Path
+) -> dict[str, Any]:
+    degraded_path = Path(str(record["input"]))
+    target_path = Path(str(record["target"]))
+    arity = int(record.get("arity", record.get("metadata", {}).get(
+        "arity", str(record["degradation"]).count("_") + 1
+    )))
+    return {
+        "coarse": str(coarse_path.resolve()),
+        "degraded": str(degraded_path.resolve()),
+        "target": str(target_path.resolve()),
+        "degradation": str(record["degradation"]),
+        "split": split,
+        "id": str(record["id"]),
+        "scene_id": str(record["scene_id"]),
+        "arity": arity,
+    }
+
+
+def _write_prepared_manifest(path: Path, rows: list[dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as stream:
+        for row in rows:
+            stream.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def prepare_existing_cdd11_manifests(
+    source_manifest_dir: str | Path,
+    coarse_root: str | Path,
+    output_dir: str | Path,
+    *,
+    splits: Iterable[str] = SPLITS,
+) -> dict[str, Any]:
+    """Build Difix manifests around DACG background images that already exist."""
+
+    source_manifest_dir = Path(source_manifest_dir)
+    coarse_root = Path(coarse_root).resolve()
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    counts: dict[str, int] = {}
+    for split in tuple(splits):
+        records = _read_manifest(source_manifest_dir / f"{split}.jsonl")
+        rows = [
+            _prepared_row(record, split, _existing_coarse_path(coarse_root, record, split))
+            for record in records
+        ]
+        _write_prepared_manifest(output_dir / f"{split}.jsonl", rows)
+        counts[split] = len(rows)
+    metadata = {
+        "source_manifest_dir": str(source_manifest_dir.resolve()),
+        "coarse_root": str(coarse_root),
+        "coarse_source": "existing-background",
+        "counts": counts,
+    }
+    (output_dir / "prepare_metadata.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return metadata
+
+
 def prepare_cdd11_manifests(
     source_manifest_dir: str | Path,
     output_dir: str | Path,
@@ -128,34 +219,19 @@ def prepare_cdd11_manifests(
             prepared_path = output_dir / f"{split}.jsonl"
             rows = []
             for record in _read_manifest(source_path):
-                degraded_path = Path(str(record["input"]))
-                target_path = Path(str(record["target"]))
                 coarse_path = _coarse_path(output_dir, record, split).resolve()
                 coarse = restore_native(
                     model,
-                    _load_rgb(degraded_path),
+                    _load_rgb(Path(str(record["input"]))),
                     device,
                     tile_size=tile_size,
                     tile_overlap=tile_overlap,
                 )
                 _save_rgb(coarse, coarse_path)
-                arity = int(record.get("arity", record.get("metadata", {}).get(
-                    "arity", str(record["degradation"]).count("_") + 1
-                )))
-                rows.append({
-                    "coarse": str(coarse_path),
-                    "degraded": str(degraded_path.resolve()),
-                    "target": str(target_path.resolve()),
-                    "degradation": str(record["degradation"]),
-                    "split": split,
-                    "id": str(record["id"]),
-                    "scene_id": str(record["scene_id"]),
-                    "arity": arity,
-                    "dacg_checkpoint_sha256": checkpoint_sha256,
-                })
-            with prepared_path.open("w", encoding="utf-8", newline="\n") as stream:
-                for row in rows:
-                    stream.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+                row = _prepared_row(record, split, coarse_path)
+                row["dacg_checkpoint_sha256"] = checkpoint_sha256
+                rows.append(row)
+            _write_prepared_manifest(prepared_path, rows)
             counts[split] = len(rows)
 
     metadata = {

@@ -30,6 +30,22 @@ accelerate config
 `MANIFEST_DIR` 包含 CDD-11 的 `train.jsonl`、`val.jsonl`、`test.jsonl`；
 `DACG_CKPT` 是在 `cdd11-dacg-paper-loss-training-testing` 代码上训练的完整权重。
 
+如果 CDD-11 服务器上的 `background` 已经是 DACG 初步去除退化后的结果，则无需
+重复运行本节的 DACG 推理。直接用以下命令生成供 Difix 使用的 manifests：
+
+```bash
+python prepare_cdd11_difix.py \
+  --manifest-dir /data/cdd11/manifests \
+  --coarse-root /data/CDD-11/background \
+  --output-dir /data/cdd11_difix_prepared
+```
+
+脚本支持 `background/<split>/<degradation>/<原文件名>`、
+`background/<degradation>/<原文件名>`、`background/<split>/<原文件名>` 和
+`background/<原文件名>` 四种布局，并会在缺少任何对应图时立即报错。生成的每条
+记录中，`coarse` 指向 background，`degraded` 指向原退化图，`target` 指向 GT。
+训练阶段只会读取这些路径，不会再次运行完整 DACG restoration 网络。
+
 ```bash
 python prepare_cdd11_difix.py \
   --manifest-dir /data/cdd11/manifests \
@@ -69,8 +85,20 @@ accelerate launch train_cdd11_difix.py \
   --lora-rank-unet 32 \
   --lora-rank-vae 16 \
   --gradient-checkpointing \
-  --enable-xformers-memory-efficient-attention
+  --enable-xformers-memory-efficient-attention \
+  --validation-steps 1000 \
+  --validation-limit 0 \
+  --validation-visualizations 4 \
+  --report-to wandb \
+  --tracker-project-name cdd11-dacg-difix \
+  --tracker-run-name cdd11-difix-pglobal-layer
 ```
+
+每次验证向 W&B 上传 `validation/psnr`、`validation/ssim` 两个主要指标，并保留
+`validation/coarse_psnr`、`validation/coarse_ssim` 用于衡量相对 DACG 初步结果的
+增益，`validation/lpips` 作为辅助指标。`--validation-limit 0` 表示正式训练使用完整
+验证集。`validation/degraded_coarse_final_gt` 是来自固定验证顺序的横向四联图，
+顺序为：原退化图、DACG 初步去除图、Difix 最终图、GT。
 
 正式训练前先做两步 GPU smoke，验证真实 SD-Turbo、PEFT、DAM 权重和数据路径：
 
@@ -85,8 +113,15 @@ accelerate launch train_cdd11_difix.py \
   --validation-steps 2 \
   --validation-limit 2 \
   --dataloader-num-workers 0 \
-  --mixed-precision bf16
+  --mixed-precision bf16 \
+  --validation-visualizations 2 \
+  --report-to wandb \
+  --tracker-project-name cdd11-dacg-difix \
+  --tracker-run-name cdd11-difix-smoke
 ```
+
+两步 smoke 完成后，先确认 W&B 已出现 `validation/psnr`、`validation/ssim` 和
+`validation/degraded_coarse_final_gt`，再启动正式 10000 步训练。
 
 训练期不会加载完整 DACG restoration 网络，只从同一 checkpoint 提取并冻结
 DAM。checkpoint 只包含 Difix LoRA、条件生成器、主视角 VAE skip conv，以及
