@@ -120,6 +120,8 @@ accelerate launch train_cdd11_difix.py \
   --tracker-run-name cdd11-difix-pglobal-layer
 ```
 
+`--validation-visualizations` 控制每次上传到 W&B 的验证对比图数量。图片会从本次实际验证的样本中无重复随机抽取，并使用训练步数作为随机种子，因此不同验证步会展示不同样本；例如设为 `8` 可每次上传 8 张。
+
 每次验证向 W&B 上传 `validation/psnr`、`validation/ssim` 两个主要指标，并保留
 `validation/coarse_psnr`、`validation/coarse_ssim` 用于衡量相对 DACG 初步结果的
 增益，`validation/lpips` 作为辅助指标。`--validation-limit 0` 表示正式训练使用完整

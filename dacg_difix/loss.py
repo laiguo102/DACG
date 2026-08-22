@@ -88,12 +88,17 @@ class VGGGramLoss(nn.Module):
         prediction_features = self._activations(prediction)
         with torch.no_grad():
             target_features = self._activations(target)
+        if not (
+            len(prediction_features)
+            == len(target_features)
+            == len(self.style_weights)
+        ):
+            raise RuntimeError("VGG feature and style-weight counts do not match")
         losses = []
         for pred, reference, weight in zip(
             prediction_features,
             target_features,
             self.style_weights,
-            strict=True,
         ):
             _, channels, height, width = reference.shape
             layer_loss = weight * F.mse_loss(

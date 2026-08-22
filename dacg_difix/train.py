@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -155,6 +156,21 @@ def _wandb_validation_images(visualizations: list[tuple[torch.Tensor, str]]) -> 
     return [wandb.Image(image, caption=caption) for image, caption in visualizations]
 
 
+def _reservoir_slot(
+    sample_index: int,
+    visualization_limit: int,
+    rng: random.Random,
+) -> int | None:
+    """Choose a slot for uniform sampling without replacement from a stream."""
+
+    if visualization_limit <= 0:
+        return None
+    if sample_index < visualization_limit:
+        return sample_index
+    slot = rng.randrange(sample_index + 1)
+    return slot if slot < visualization_limit else None
+
+
 def _build_model(args: argparse.Namespace) -> torch.nn.Module:
     from .model import DACGDifix
 
@@ -206,10 +222,12 @@ def _validate(
     accelerator: Any,
     limit: int,
     visualization_limit: int = 0,
+    visualization_seed: int | None = None,
 ) -> tuple[dict[str, float], list[tuple[torch.Tensor, str]]]:
     model.eval()
     rows: list[torch.Tensor] = []
     visualizations: list[tuple[torch.Tensor, str]] = []
+    visualization_rng = random.Random(visualization_seed)
     for index, batch in enumerate(loader):
         if limit and index >= limit:
             break
@@ -235,15 +253,24 @@ def _validate(
             ]
         ).float()
         rows.append(torch.cat((row, perceptual.reshape(1).float())))
-        if accelerator.is_main_process and len(visualizations) < visualization_limit:
+        visualization_slot = _reservoir_slot(
+            index,
+            visualization_limit,
+            visualization_rng,
+        )
+        if accelerator.is_main_process and visualization_slot is not None:
             caption = (
                 f"{batch['id'][0]} | {batch['degradation'][0]} | "
                 "left to right: degraded | DACG coarse | Difix final | GT"
             )
-            visualizations.append((
+            visualization = (
                 _comparison_image(batch["ref"], batch["main"], prediction, target),
                 caption,
-            ))
+            )
+            if visualization_slot == len(visualizations):
+                visualizations.append(visualization)
+            else:
+                visualizations[visualization_slot] = visualization
     if not rows:
         metrics = {
             "psnr": math.nan,
@@ -258,7 +285,11 @@ def _validate(
     means = gathered.mean(0).cpu().tolist()
     model.train()
     metric_names = ("psnr", "ssim", "coarse_psnr", "coarse_ssim", "lpips")
-    return dict(zip(metric_names, means, strict=True)), visualizations
+    if len(means) != len(metric_names):
+        raise RuntimeError(
+            f"expected {len(metric_names)} validation metrics, got {len(means)}"
+        )
+    return dict(zip(metric_names, means)), visualizations
 
 
 def run(args: argparse.Namespace) -> None:
@@ -437,6 +468,7 @@ def run(args: argparse.Namespace) -> None:
                 accelerator,
                 args.validation_limit,
                 args.validation_visualizations,
+                args.seed + global_step,
             )
             if args.report_to != "none":
                 validation_logs = {
@@ -537,7 +569,12 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--checkpointing-steps", type=int, default=1_000)
     value.add_argument("--validation-steps", type=int, default=1_000)
     value.add_argument("--validation-limit", type=int, default=100)
-    value.add_argument("--validation-visualizations", type=int, default=4)
+    value.add_argument(
+        "--validation-visualizations",
+        type=int,
+        default=4,
+        help="number of randomly sampled validation comparisons to log per validation",
+    )
     value.add_argument("--mixed-precision", choices=("no", "fp16", "bf16"), default="bf16")
     value.add_argument("--gradient-checkpointing", action="store_true")
     value.add_argument("--enable-xformers-memory-efficient-attention", action="store_true")

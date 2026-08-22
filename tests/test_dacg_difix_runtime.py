@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import unittest
 from argparse import Namespace
 from unittest import mock
@@ -15,6 +16,7 @@ from dacg_difix.loss import DifixRestorationLoss, gram_matrix
 from dacg_difix.train import (
     CHECKPOINT_FORMAT,
     _comparison_image,
+    _reservoir_slot,
     adapter_checkpoint,
     load_adapter_checkpoint,
     main as train_main,
@@ -70,6 +72,26 @@ class _DummyDifix(torch.nn.Module):
 
 
 class TestDifixRuntime(unittest.TestCase):
+    def test_validation_visualizations_are_unique_and_change_by_seed(self):
+        def selected_indices(seed):
+            rng = random.Random(seed)
+            selected = []
+            for index in range(100):
+                slot = _reservoir_slot(index, 8, rng)
+                if slot is None:
+                    continue
+                if slot == len(selected):
+                    selected.append(index)
+                else:
+                    selected[slot] = index
+            return selected
+
+        first = selected_indices(5_000)
+        second = selected_indices(10_000)
+        self.assertEqual(len(first), 8)
+        self.assertEqual(len(set(first)), 8)
+        self.assertNotEqual(first, second)
+
     def test_zero_gram_weight_does_not_build_vgg_gram_network(self):
         fake_lpips = _DummyLPIPS()
         with mock.patch.dict(
