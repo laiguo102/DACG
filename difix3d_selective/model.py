@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import torch
@@ -231,7 +232,26 @@ def save_training_checkpoint(
         "optimizer": optimizer.state_dict(),
         "lr_scheduler": scheduler.state_dict(),
     }
-    torch.save(checkpoint, path)
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".tmp")
+    torch.save(checkpoint, temporary)
+    os.replace(temporary, destination)
+
+
+def _apply_model_checkpoint(model: SelectiveDifix, checkpoint: dict) -> int:
+    model.unet.load_state_dict(checkpoint["state_dict_unet"], strict=True)
+    vae_state = model.vae.state_dict()
+    vae_state.update(checkpoint["state_dict_vae"])
+    model.vae.load_state_dict(vae_state, strict=True)
+    return int(checkpoint["global_step"])
+
+
+def load_model_checkpoint(model: SelectiveDifix, path: str | Path) -> int:
+    """Load model weights only, for validation/backfill without an optimizer."""
+
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    return _apply_model_checkpoint(model, checkpoint)
 
 
 def load_training_checkpoint(
@@ -241,10 +261,7 @@ def load_training_checkpoint(
     path: str | Path,
 ) -> int:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    model.unet.load_state_dict(checkpoint["state_dict_unet"], strict=True)
-    vae_state = model.vae.state_dict()
-    vae_state.update(checkpoint["state_dict_vae"])
-    model.vae.load_state_dict(vae_state, strict=True)
+    global_step = _apply_model_checkpoint(model, checkpoint)
     optimizer.load_state_dict(checkpoint["optimizer"])
     scheduler.load_state_dict(checkpoint["lr_scheduler"])
-    return int(checkpoint["global_step"])
+    return global_step

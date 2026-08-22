@@ -45,6 +45,7 @@ class SelectiveDifixDataset(torch.utils.data.Dataset):
         main = _image_tensor(record["image"], self.resolution)
         reference = _image_tensor(record["ref_image"], self.resolution)
         target = _image_tensor(record["target_image"], self.resolution)
+        ground_truth = _image_tensor(record["clear_image"], self.resolution)
         input_ids = self.tokenizer(
             record["prompt"],
             max_length=self.tokenizer.model_max_length,
@@ -55,6 +56,7 @@ class SelectiveDifixDataset(torch.utils.data.Dataset):
         return {
             "conditioning_pixel_values": torch.stack([main, reference]),
             "output_pixel_values": target,
+            "ground_truth_pixel_values": ground_truth,
             "input_ids": input_ids,
             "prompt": record["prompt"],
             "sample_id": record["id"],

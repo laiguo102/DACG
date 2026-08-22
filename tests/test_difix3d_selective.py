@@ -11,6 +11,7 @@ import torch
 from PIL import Image
 
 from difix3d_selective.main_view import select_main_view, select_main_view_skips
+from difix3d_selective.loss import gram_matrix
 from difix3d_selective.prepare import prepare_selective_manifests, tiled_forward
 from difix3d_selective.protocol import (
     NUM_TRAIN_SCENES,
@@ -68,20 +69,100 @@ class TestMainViewSelection(unittest.TestCase):
 
 
 class TestValidationVisualization(unittest.TestCase):
-    @unittest.skipIf(importlib.util.find_spec("torchvision") is None, "torchvision is not installed")
-    def test_comparison_order_is_degraded_coarse_final_gt(self):
-        from difix3d_selective.train import _comparison_image
+    def test_comparison_order_is_degraded_coarse_target_final_gt(self):
+        from difix3d_selective.validation import comparison_image
 
         source = torch.zeros(1, 2, 3, 12, 8)
         source[:, 0].fill_(-0.5)  # coarse -> 0.25
         source[:, 1].fill_(-1.0)  # degraded -> 0.0
         prediction = torch.zeros(1, 3, 12, 8)  # final -> 0.5
-        target = torch.ones(1, 3, 12, 8)  # GT -> 1.0
-        comparison = _comparison_image(source, target, prediction)
+        target = torch.full((1, 3, 12, 8), 0.5)  # target -> 0.75
+        ground_truth = torch.ones(1, 3, 12, 8)  # clean GT -> 1.0
+        comparison = comparison_image(source, target, prediction, ground_truth)
 
-        self.assertEqual(tuple(comparison.shape), (3, 12, 32))
+        self.assertEqual(tuple(comparison.shape), (3, 12, 40))
         panel_means = [float(panel.mean()) for panel in comparison.split(8, dim=-1)]
-        self.assertEqual(panel_means, [0.0, 0.25, 0.5, 1.0])
+        self.assertEqual(panel_means, [0.0, 0.25, 0.75, 0.5, 1.0])
+
+    def test_stratified_indices_round_robin_all_directed_tasks(self):
+        from difix3d_selective.validation import stratified_indices
+
+        records = []
+        for scene in range(3):
+            for pair_id in range(1, 6):
+                for direction in range(2):
+                    records.append({
+                        "pair_id": pair_id,
+                        "remove": f"r{direction}",
+                        "preserve": f"p{direction}",
+                        "scene": scene,
+                    })
+        selected = stratified_indices(records, 10)
+        keys = {
+            (records[index]["pair_id"], records[index]["remove"])
+            for index in selected
+        }
+        self.assertEqual(len(selected), 10)
+        self.assertEqual(len(keys), 10)
+
+    def test_validation_exposes_primary_and_diagnostic_metrics(self):
+        from difix3d_selective.validation import METRIC_NAMES, validate
+
+        class Model(torch.nn.Module):
+            def forward(self, source, prompt_tokens):
+                return torch.zeros_like(source[:, 0])
+
+            def set_train(self):
+                self.train()
+
+        class Lpips(torch.nn.Module):
+            def forward(self, prediction, target):
+                return (prediction - target).abs().mean((1, 2, 3), keepdim=True)
+
+        class Accelerator:
+            is_main_process = True
+
+            @staticmethod
+            def unwrap_model(model):
+                return model
+
+            @staticmethod
+            def gather_for_metrics(value):
+                return value
+
+        source = torch.full((1, 2, 3, 12, 12), -0.5)
+        batch = {
+            "conditioning_pixel_values": source,
+            "output_pixel_values": torch.full((1, 3, 12, 12), 0.2),
+            "ground_truth_pixel_values": torch.full((1, 3, 12, 12), 0.4),
+            "input_ids": torch.ones(1, 4, dtype=torch.long),
+            "sample_id": ["validation/low_haze/1/remove-low-preserve-haze"],
+            "prompt": ["remove low light, preserve haze"],
+        }
+        metrics, images = validate(
+            Model(), [batch], Lpips(), Accelerator(), visualization_limit=1
+        )
+        self.assertEqual(set(metrics), set(METRIC_NAMES))
+        self.assertEqual(len(images), 1)
+        self.assertEqual(tuple(images[0][0].shape), (3, 12, 60))
+
+
+class TestGramLoss(unittest.TestCase):
+    def test_gram_matrix_is_per_image_and_batch_one_compatible(self):
+        features = torch.arange(2 * 3 * 2 * 2, dtype=torch.float32).reshape(2, 3, 2, 2)
+        grams = gram_matrix(features)
+        expected = torch.stack([
+            image.flatten(1) @ image.flatten(1).T for image in features
+        ])
+        self.assertEqual(tuple(grams.shape), (2, 3, 3))
+        self.assertTrue(torch.equal(grams, expected))
+        self.assertTrue(torch.equal(gram_matrix(features[:1])[0], expected[0]))
+
+    def test_second_sample_does_not_change_first_gram(self):
+        features = torch.randn(2, 4, 3, 3)
+        original = gram_matrix(features)[0]
+        features[1].mul_(1000)
+        self.assertTrue(torch.equal(gram_matrix(features)[0], original))
 
 
 class TestDatasetAndPreparation(unittest.TestCase):
@@ -97,10 +178,13 @@ class TestDatasetAndPreparation(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(dir=".") as directory:
             root = Path(directory)
-            main, reference, target = root / "main.png", root / "ref.png", root / "target.png"
+            main, reference, target, clear = (
+                root / "main.png", root / "ref.png", root / "target.png", root / "clear.png"
+            )
             self._save(main, (0, 0, 0))
             self._save(reference, (255, 0, 0))
             self._save(target, (0, 255, 0))
+            self._save(clear, (0, 0, 255))
             manifest = root / "train.jsonl"
             manifest.write_text(
                 json.dumps(
@@ -110,6 +194,7 @@ class TestDatasetAndPreparation(unittest.TestCase):
                         "image": str(main),
                         "ref_image": str(reference),
                         "target_image": str(target),
+                        "clear_image": str(clear),
                     }
                 )
                 + "\n",
@@ -118,6 +203,7 @@ class TestDatasetAndPreparation(unittest.TestCase):
             sample = SelectiveDifixDataset(manifest, FakeTokenizer(), resolution=8)[0]
             self.assertEqual(tuple(sample["conditioning_pixel_values"].shape), (2, 3, 8, 8))
             self.assertEqual(tuple(sample["output_pixel_values"].shape), (3, 8, 8))
+            self.assertEqual(tuple(sample["ground_truth_pixel_values"].shape), (3, 8, 8))
             self.assertTrue(torch.equal(sample["input_ids"], torch.tensor([1, 2, 3, 4])))
             self.assertLess(float(sample["conditioning_pixel_values"][0].mean()), -0.99)
             self.assertGreater(float(sample["output_pixel_values"][1].mean()), 0.99)
@@ -179,6 +265,62 @@ class TestDatasetAndPreparation(unittest.TestCase):
         }
         self.assertEqual(by_prompt["remove low light, preserve haze"], "haze")
         self.assertEqual(by_prompt["remove haze, preserve low light"], "low")
+        self.assertTrue(
+            all(Path(record["clear_image"]).parent.name == "clear" for record in train_records)
+        )
+
+
+class TestTrainingPolicy(unittest.TestCase):
+    def test_lucid_defaults_and_independent_triggers(self):
+        from difix3d_selective.train import gram_is_enabled, parser, trigger_schedule
+
+        action = parser()
+        defaults = {
+            item.dest: item.default for item in action._actions
+        }
+        self.assertEqual(defaults["max_train_steps"], 100_000)
+        self.assertEqual(defaults["train_batch_size"], 4)
+        self.assertEqual(defaults["learning_rate"], 5e-6)
+        self.assertEqual(defaults["lr_scheduler"], "linear")
+        self.assertEqual(defaults["lr_warmup_steps"], 500)
+        self.assertEqual(defaults["lambda_gram"], 0.0)
+        self.assertTrue(trigger_schedule(500, 100_000, 500))
+        self.assertFalse(trigger_schedule(500, 100_000, 1000))
+        self.assertTrue(trigger_schedule(100_000, 100_000, 0))
+        self.assertFalse(gram_is_enabled(0.0, 10_000, 2000))
+        self.assertFalse(gram_is_enabled(1.0, 1999, 2000))
+        self.assertTrue(gram_is_enabled(1.0, 2000, 2000))
+
+    @unittest.skipIf(importlib.util.find_spec("diffusers") is None, "diffusers is not installed")
+    def test_linear_scheduler_warmup_and_decay(self):
+        from diffusers.optimization import get_scheduler
+
+        parameter = torch.nn.Parameter(torch.tensor(0.0))
+        optimizer = torch.optim.AdamW([parameter], lr=5e-6)
+        scheduler = get_scheduler(
+            "linear", optimizer=optimizer, num_warmup_steps=500,
+            num_training_steps=100_000,
+        )
+        values = [optimizer.param_groups[0]["lr"]]
+        for _ in range(100_000):
+            optimizer.step()
+            scheduler.step()
+            if scheduler.last_epoch in (500, 100_000):
+                values.append(optimizer.param_groups[0]["lr"])
+        self.assertAlmostEqual(values[0], 0.0)
+        self.assertAlmostEqual(values[1], 5e-6)
+        self.assertAlmostEqual(values[2], 0.0)
+
+    def test_backfill_checkpoint_discovery_deduplicates_final(self):
+        from difix3d_selective.backfill import discover_checkpoints
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "model_1000.pkl").touch()
+            (root / "model_002000.pkl").touch()
+            torch.save({"global_step": 2000}, root / "final.pkl")
+            found = discover_checkpoints(root)
+        self.assertEqual([step for step, _ in found], [1000, 2000])
 
     def test_cdd11_full_checkpoint_loader_uses_model_and_config_keys(self):
         from cdd11_full import model as dacg_model

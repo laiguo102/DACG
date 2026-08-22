@@ -1,5 +1,4 @@
 import torch
-from torchvision import transforms, models
 
 # Define style weights for different layers
 STYLE_WEIGHTS = {
@@ -47,12 +46,11 @@ def gram_matrix(tensor):
         tensor (torch.Tensor): Input tensor of shape (batch_size, depth, height, width).
 
     Returns:
-        torch.Tensor: Gram matrix of the input tensor.
+        torch.Tensor: Per-image Gram matrices with shape ``[B, C, C]``.
     """
-    b, d, h, w = tensor.size()
-    tensor = tensor.view(b * d, h * w)  # Reshape tensor for matrix multiplication
-    gram = torch.mm(tensor, tensor.t())  # Compute Gram matrix
-    return gram
+    batch, channels, height, width = tensor.size()
+    flattened = tensor.reshape(batch, channels, height * width)
+    return torch.bmm(flattened, flattened.transpose(1, 2))
 
 def gram_loss(style, target, model):
     """
@@ -66,7 +64,8 @@ def gram_loss(style, target, model):
     Returns:
         torch.Tensor: The computed Gram loss.
     """
-    # Extract features for the style and target images
+    # Keep Gram matrices per image. The released Difix3D flattening couples
+    # unrelated samples when the training batch is larger than one.
     style_features = get_features(style, model)
     target_features = get_features(target, model)
 

@@ -184,6 +184,7 @@ def prepare_selective_manifests(
                 reference = source_images[pair][scene_id]
                 for task in directed_tasks(pair_id):
                     target = target_images[task.preserve][scene_id]
+                    ground_truth = clear[scene_id]
                     records.append(
                         {
                             "id": f"{split}/{pair}/{scene_id}/remove-{task.remove}-preserve-{task.preserve}",
@@ -197,6 +198,7 @@ def prepare_selective_manifests(
                             "image": str(coarse.resolve()),
                             "ref_image": str(reference.resolve()),
                             "target_image": str(target.resolve()),
+                            "clear_image": str(ground_truth.resolve()),
                         }
                     )
         manifest = prepared_root / "manifests" / f"{split}.jsonl"

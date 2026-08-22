@@ -75,7 +75,11 @@ CDD11-DACG-coarse/
 
 如果只需预生成部分类型，可显式添加 `--degradation-pairs 1 3 5`。
 
-## 4. 单卡训练
+## 4. 单卡训练（LUCID 风格主实验）
+
+主实验采用更适合有像素级监督恢复任务的 LUCID 配置：batch 4、`5e-6`、500 步
+warmup 后 linear decay、L2+LPIPS，并默认关闭 Difix3D 的 Gram loss。训练长度跟随
+LUCID 设为 100000 步。BF16 保留不变；Gram/VGG 在主实验中不会加载。
 
 ```bash
 accelerate launch --mixed_precision=bf16 train_cdd11_difix.py \
@@ -84,24 +88,36 @@ accelerate launch --mixed_precision=bf16 train_cdd11_difix.py \
   --output-dir /path/to/difix-selective-run \
   --degradation-pairs 1 2 3 4 5 \
   --resolution 512 \
-  --max-train-steps 10000 \
-  --train-batch-size 1 \
+  --max-train-steps 100000 \
+  --train-batch-size 4 \
   --dataloader-num-workers 8 \
+  --learning-rate 5e-6 \
+  --lr-scheduler linear \
+  --lr-warmup-steps 500 \
+  --lambda-l2 1 \
+  --lambda-lpips 1 \
+  --lambda-gram 0 \
   --enable-xformers-memory-efficient-attention \
-  --eval-freq 1000 \
+  --eval-freq 500 \
+  --full-eval-freq 5000 \
   --viz-freq 1000 \
   --num-validation-samples 100 \
-  --num-validation-visualizations 4 \
+  --num-validation-visualizations 10 \
+  --latest-checkpointing-steps 1000 \
+  --milestone-steps 10000 \
   --report-to wandb \
   --tracker-project-name difix-cdd11-selective \
-  --tracker-run-name difix-selective-all-five
+  --tracker-run-name difix-selective-lucid-100k
 ```
 
-训练启动时只索引 coarse、CDD 原退化图和单退化 target，并生成 manifest。
-每 `--eval-freq` 步上传验证集 RGB PSNR、RGB SSIM（另保留 LPIPS 作为辅助指标）；
-每 `--viz-freq` 步上传固定顺序的横向四联图：退化图、DACG 初步去除图、Difix
-最终图、GT。`--viz-freq` 应设置为 `--eval-freq` 的整数倍，四联图来自验证集而非
-训练 batch。
+训练启动时索引 coarse、CDD 原双退化图、单退化 target 和 clean GT，并生成
+manifest。每 500 步在按 10 个有向任务分层固定的 100 张验证图上上传 RGB PSNR、
+RGB SSIM 和辅助 LPIPS；每 5000 步对全部 1180 张验证图上传同名
+`validation_full/*` 指标。主指标始终是最终图相对单退化 target，另记录相对 clean
+GT 和 DACG coarse 相对 target 的诊断指标。
+
+每 1000 步上传 10 张固定验证样本的横向五联图：双退化图、DACG 初步去除图、
+单退化 target、Difix 最终图、clean GT。可视化频率与快验证、全量验证相互独立。
 
 正式跑 10000 步前，建议先用真实权重和 `background` 做两步 smoke：
 
@@ -112,10 +128,12 @@ accelerate launch --mixed_precision=bf16 train_cdd11_difix.py \
   --output-dir /path/to/difix-selective-smoke \
   --degradation-pairs 1 2 3 4 5 \
   --max-train-steps 2 \
-  --train-batch-size 1 \
+  --train-batch-size 4 \
   --dataloader-num-workers 0 \
   --checkpointing-steps 2 \
+  --latest-checkpointing-steps 2 \
   --eval-freq 1 \
+  --full-eval-freq 2 \
   --viz-freq 1 \
   --num-validation-samples 2 \
   --num-validation-visualizations 2 \
@@ -125,7 +143,21 @@ accelerate launch --mixed_precision=bf16 train_cdd11_difix.py \
 ```
 
 确认 W&B 中出现 `validation/psnr`、`validation/ssim` 和
-`validation/degraded_coarse_final_gt` 后，再启动正式训练。
+`validation/degraded_coarse_target_final_gt` 后，再启动正式训练。
+
+### NVIDIA Difix3D 风格消融
+
+如需复现发布版 Difix3D 的训练策略，只改变以下参数。batch 固定为 1，避免其原始
+Gram 定义在多样本间耦合；本仓库的实现即使 batch 大于 1 也会逐图计算 Gram。
+
+```bash
+--max-train-steps 10000 \
+--train-batch-size 1 \
+--learning-rate 2e-5 \
+--lr-scheduler constant \
+--lambda-gram 1 \
+--gram-loss-warmup-steps 2000
+```
 
 ## 5. 多卡训练
 
@@ -137,8 +169,8 @@ accelerate launch --mixed_precision=bf16 --multi_gpu --num_processes 4 \
   --output-dir /path/to/difix-selective-run \
   --degradation-pairs 1 3 5 \
   --resolution 512 \
-  --max-train-steps 10000 \
-  --train-batch-size 1 \
+  --max-train-steps 100000 \
+  --train-batch-size 4 \
   --gradient-accumulation-steps 2 \
   --enable-xformers-memory-efficient-attention \
   --gradient-checkpointing
@@ -154,7 +186,9 @@ difix-selective-run/
 │   ├── manifests/{train,validation}.jsonl
 │   └── split_and_preparation.json
 └── checkpoints/
-    ├── model_<step>.pkl
+    ├── latest.pkl
+    ├── best_psnr.pkl
+    ├── model_<10k-step>.pkl
     └── final.pkl
 ```
 
@@ -162,8 +196,33 @@ manifest 中的 `image` 字段直接指向 `--coarse-root` 下的对应图像。
 数据根目录和类别选择一致并增加：
 
 ```bash
---resume /path/to/difix-selective-run/checkpoints/model_5000.pkl
+--resume /path/to/difix-selective-run/checkpoints/latest.pkl
 ```
+
+`latest.pkl` 每 1000 步原子覆盖；永久里程碑每 10000 步保存；`best_psnr.pkl` 按
+全量验证 PSNR 更新，并在根目录 `best_validation.json` 记录 step、PSNR 和 SSIM。
+
+## 7. 回填已有 10k run 的 W&B
+
+旧训练无需重跑。以下命令按 checkpoint step 去重并评估现有 `model_*.pkl` 与
+`final.pkl`，将完整验证 PSNR/SSIM、五联图和 clean/coarse 诊断上传到新的 companion
+run；不会改写原 W&B 历史。
+
+```bash
+python -m difix3d_selective.backfill \
+  --data-root /path/to/CDD11 \
+  --coarse-root /path/to/CDD11/background \
+  --run-dir /path/to/old-difix-selective-run \
+  --degradation-pairs 1 2 3 4 5 \
+  --report-to wandb \
+  --tracker-project-name difix-cdd11-selective \
+  --tracker-run-name all5-bs4-10k-seed42-v1-backfill \
+  --source-wandb-run ENTITY/PROJECT/RUN_ID
+```
+
+本地结果写入 `<run-dir>/backfill/{metrics.jsonl,summary.json,media/}`。只有已保存的
+checkpoint 才能恢复，因此旧 run 默认只能得到每 1000 步的历史点，不能重建 500
+步时的模型输出。
 
 选择 K 类时应得到 `1183×K` 张 coarse、`1065×K×2` 条训练记录和
 `118×K×2` 条验证记录。
