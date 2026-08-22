@@ -127,7 +127,11 @@ def validate(
         raise ValueError("validation loader produced no samples")
     gathered = accelerator.gather_for_metrics(torch.stack(rows))
     means = gathered.float().mean(0).cpu().tolist()
-    return dict(zip(METRIC_NAMES, means, strict=True)), visualizations
+    if len(METRIC_NAMES) != len(means):
+        raise RuntimeError(
+            f"Expected {len(METRIC_NAMES)} validation metrics, got {len(means)}"
+        )
+    return dict(zip(METRIC_NAMES, means)), visualizations
 
 
 def wandb_images(visualizations: list[tuple[torch.Tensor, str]]) -> list[Any]:
