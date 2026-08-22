@@ -167,7 +167,11 @@ class TestDatasetAndPreparation(unittest.TestCase):
         from cdd11_full import model as dacg_model
 
         tiny = torch.nn.Conv2d(3, 3, 1)
-        checkpoint = {"config": {"model": "DACG_IR"}, "model": tiny.state_dict()}
+        checkpoint = {
+            "config": {"model": {"model_name": "DACG_IR", "id": "dacg"}},
+            "architecture": {"model_name": "DACG_IR", "dim": 48},
+            "model": tiny.state_dict(),
+        }
         with (
             patch.object(dacg_model.torch, "load", return_value=checkpoint),
             patch.object(dacg_model, "build_model", return_value=torch.nn.Conv2d(3, 3, 1)),
@@ -175,7 +179,9 @@ class TestDatasetAndPreparation(unittest.TestCase):
             loaded, loaded_checkpoint = dacg_model.load_network(
                 "final.pth", torch.device("cpu")
             )
-        self.assertEqual(loaded_checkpoint["config"]["model"], "DACG_IR")
+        self.assertEqual(
+            loaded_checkpoint["config"]["model"]["model_name"], "DACG_IR"
+        )
         for key, value in tiny.state_dict().items():
             self.assertTrue(torch.equal(loaded.state_dict()[key], value))
 

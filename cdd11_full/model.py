@@ -60,7 +60,15 @@ def architecture_metadata(model_name: str = "DACG_IR") -> dict[str, object]:
 
 def load_network(checkpoint_path: str, device: torch.device) -> tuple[DACG_IR, dict[str, Any]]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    model_name = checkpoint.get("config", {}).get("model", "DACG_IR")
+    model_info = checkpoint.get("architecture") or checkpoint.get("config", {}).get(
+        "model", "DACG_IR"
+    )
+    if isinstance(model_info, dict):
+        model_name = model_info.get("model_name", "DACG_IR")
+    elif isinstance(model_info, str):
+        model_name = model_info
+    else:
+        raise ValueError(f"Invalid model metadata in checkpoint: {model_info!r}")
     network = build_model(model_name)
     network.load_state_dict(checkpoint["model"], strict=True)
     return network.to(device).eval(), checkpoint
