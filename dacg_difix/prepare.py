@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import re
 from contextlib import nullcontext
 from pathlib import Path
@@ -13,11 +14,17 @@ import numpy as np
 import torch
 from PIL import Image
 
+from cdd11_full.protocol import DEGRADATIONS
 from cdd11_full.runtime import file_sha256
 
 
 SPLITS = ("train", "val", "test")
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+FOLDER_SPLIT_SEED = 42
+NUM_TRAIN_SCENES = 1183
+NUM_OPTIMIZATION_SCENES = 1065
+NUM_VALIDATION_SCENES = 118
+NUM_TEST_SCENES = 200
 
 
 def _load_rgb(path: Path) -> torch.Tensor:
@@ -99,6 +106,136 @@ def _read_manifest(path: Path) -> list[dict[str, Any]]:
             if line.strip():
                 records.append(json.loads(line))
     return records
+
+
+def index_images(directory: Path) -> dict[str, Path]:
+    """Index one flat CDD-11 image directory by filename stem."""
+
+    if not directory.is_dir():
+        raise FileNotFoundError(directory)
+    images = {
+        path.stem: path.resolve()
+        for path in sorted(directory.iterdir())
+        if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+    }
+    if not images:
+        raise ValueError(f"no images found in {directory}")
+    return images
+
+
+def make_folder_scene_split(scene_ids: Iterable[str]) -> dict[str, list[str]]:
+    """Reproduce the selective branch's seed-42 1065/118 scene split."""
+
+    values = list(scene_ids)
+    if len(values) != NUM_TRAIN_SCENES or len(set(values)) != NUM_TRAIN_SCENES:
+        raise ValueError(
+            f"CDD-11 train must contain {NUM_TRAIN_SCENES} unique scenes, got {len(values)}"
+        )
+    shuffled = sorted(values)
+    random.Random(FOLDER_SPLIT_SEED).shuffle(shuffled)
+    return {
+        "train": shuffled[:NUM_OPTIMIZATION_SCENES],
+        "validation": shuffled[NUM_OPTIMIZATION_SCENES:],
+    }
+
+
+def _coarse_directory(coarse_root: Path, split: str, degradation: str) -> Path:
+    candidates = (
+        coarse_root / split / "background" / degradation,
+        coarse_root / "background" / split / degradation,
+        coarse_root / "background" / degradation,
+        coarse_root / split / degradation,
+        coarse_root / degradation,
+    )
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    raise FileNotFoundError(
+        "missing DACG background directory; expected one of: "
+        + ", ".join(str(path) for path in candidates)
+    )
+
+
+def prepare_cdd11_folder_manifests(
+    data_root: str | Path,
+    coarse_root: str | Path,
+    output_dir: str | Path,
+) -> dict[str, Any]:
+    """Auto-index CDD-11 like selective and keep the official test untouched."""
+
+    data_root = Path(data_root).resolve()
+    coarse_root = Path(coarse_root).resolve()
+    prepared_root = Path(output_dir).resolve() / "prepared"
+    manifest_root = prepared_root / "manifests"
+    manifest_root.mkdir(parents=True, exist_ok=True)
+
+    train_clear = index_images(data_root / "train" / "clear")
+    scene_splits = make_folder_scene_split(train_clear)
+    test_clear = index_images(data_root / "test" / "clear")
+    if len(test_clear) != NUM_TEST_SCENES:
+        raise ValueError(
+            f"CDD-11 official test must contain {NUM_TEST_SCENES} scenes, got {len(test_clear)}"
+        )
+
+    rows_by_split: dict[str, list[dict[str, Any]]] = {
+        "train": [], "validation": [], "test": [],
+    }
+    for physical_split, clear_images in (("train", train_clear), ("test", test_clear)):
+        expected_scenes = set(clear_images)
+        degraded_by_type: dict[str, dict[str, Path]] = {}
+        coarse_by_type: dict[str, dict[str, Path]] = {}
+        for degradation in DEGRADATIONS:
+            degraded_dir = data_root / physical_split / degradation
+            coarse_dir = _coarse_directory(coarse_root, physical_split, degradation)
+            degraded = index_images(degraded_dir)
+            coarse = index_images(coarse_dir)
+            if set(degraded) != expected_scenes:
+                raise ValueError(f"CDD-11 scene mismatch in {degraded_dir}")
+            if expected_scenes - set(coarse):
+                raise ValueError(f"CDD-11 background scene mismatch in {coarse_dir}")
+            degraded_by_type[degradation] = degraded
+            coarse_by_type[degradation] = coarse
+
+        logical_splits = (
+            (("train", scene_splits["train"]), ("validation", scene_splits["validation"]))
+            if physical_split == "train"
+            else (("test", sorted(test_clear)),)
+        )
+        for logical_split, scene_ids in logical_splits:
+            for degradation in DEGRADATIONS:
+                for scene_id in scene_ids:
+                    rows_by_split[logical_split].append({
+                        "coarse": str(coarse_by_type[degradation][scene_id]),
+                        "degraded": str(degraded_by_type[degradation][scene_id]),
+                        "target": str(clear_images[scene_id]),
+                        "degradation": degradation,
+                        "split": logical_split,
+                        "id": f"{logical_split}/{degradation}/{scene_id}",
+                        "scene_id": scene_id,
+                        "arity": degradation.count("_") + 1,
+                    })
+
+    manifests: dict[str, str] = {}
+    for split, rows in rows_by_split.items():
+        path = manifest_root / f"{split}.jsonl"
+        _write_prepared_manifest(path, rows)
+        manifests[split] = str(path)
+    metadata = {
+        "protocol": "selective-style-folder-split",
+        "seed": FOLDER_SPLIT_SEED,
+        "data_root": str(data_root),
+        "coarse_root": str(coarse_root),
+        "train_scene_ids": scene_splits["train"],
+        "validation_scene_ids": scene_splits["validation"],
+        "test_scene_ids": sorted(test_clear),
+        "counts": {split: len(rows) for split, rows in rows_by_split.items()},
+        "manifests": manifests,
+    }
+    (prepared_root / "split_and_preparation.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return metadata
 
 
 def _existing_coarse_path(

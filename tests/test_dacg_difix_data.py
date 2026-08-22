@@ -6,6 +6,7 @@ import unittest
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
@@ -14,7 +15,12 @@ from torch import nn
 
 import cdd11_full.model as cdd11_model
 from dacg_difix.data import PreparedCDD11Dataset, build_difix_loader
-from dacg_difix.prepare import prepare_cdd11_manifests, prepare_existing_cdd11_manifests
+from dacg_difix.prepare import (
+    make_folder_scene_split,
+    prepare_cdd11_folder_manifests,
+    prepare_cdd11_manifests,
+    prepare_existing_cdd11_manifests,
+)
 from src.net.model import DACG_IR
 
 
@@ -54,6 +60,49 @@ class FakeTokenizer:
 
 
 class DACGDifixDataTests(unittest.TestCase):
+    def test_folder_split_matches_selective_branch(self):
+        scene_ids = [f"{index:06d}" for index in range(1183)]
+        first = make_folder_scene_split(scene_ids)
+        second = make_folder_scene_split(reversed(scene_ids))
+        self.assertEqual(first, second)
+        self.assertEqual(len(first["train"]), 1065)
+        self.assertEqual(len(first["validation"]), 118)
+        self.assertFalse(set(first["train"]) & set(first["validation"]))
+
+    def test_folder_preparation_writes_train_validation_and_untouched_test(self):
+        with _temporary_workspace() as root:
+            data_root = root / "CDD11"
+            coarse_root = root / "background"
+            output_dir = root / "run"
+
+            def fake_index(path):
+                path = Path(path)
+                count = 200 if "test" in path.parts else 1183
+                return {
+                    f"{index:06d}": path / f"{index:06d}.png"
+                    for index in range(count)
+                }
+
+            def fake_coarse(root_path, split, degradation):
+                return Path(root_path) / split / degradation
+
+            with (
+                mock.patch("dacg_difix.prepare.index_images", side_effect=fake_index),
+                mock.patch("dacg_difix.prepare._coarse_directory", side_effect=fake_coarse),
+            ):
+                metadata = prepare_cdd11_folder_manifests(
+                    data_root, coarse_root, output_dir
+                )
+
+            self.assertEqual(
+                metadata["counts"],
+                {"train": 1065 * 11, "validation": 118 * 11, "test": 200 * 11},
+            )
+            test_rows = (output_dir / "prepared" / "manifests" / "test.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            self.assertEqual(len(test_rows), 2200)
+
     def test_prepare_reuses_existing_background_without_dacg(self):
         with _temporary_workspace() as root:
             manifests = root / "manifests"

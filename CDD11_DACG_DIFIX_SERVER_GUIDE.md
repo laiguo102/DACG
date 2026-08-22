@@ -27,24 +27,33 @@ accelerate config
 
 ## 2. 用已训练 DACG 预生成主图
 
-`MANIFEST_DIR` 包含 CDD-11 的 `train.jsonl`、`val.jsonl`、`test.jsonl`；
-`DACG_CKPT` 是在 `cdd11-dacg-paper-loss-training-testing` 代码上训练的完整权重。
-
 如果 CDD-11 服务器上的 `background` 已经是 DACG 初步去除退化后的结果，则无需
-重复运行本节的 DACG 推理。直接用以下命令生成供 Difix 使用的 manifests：
+重复运行本节的 DACG 推理，也不需要手工传入 manifests。训练启动时由 global
+rank 0 像 selective 分支一样扫描文件名 stem，并在运行目录的
+`prepared/manifests/` 下自动生成 `train.jsonl`、`validation.jsonl` 和
+`test.jsonl`。
 
-```bash
-python prepare_cdd11_difix.py \
-  --manifest-dir /data/cdd11/manifests \
-  --coarse-root /data/CDD-11/background \
-  --output-dir /data/cdd11_difix_prepared
+划分固定为 seed 42：原始 1183 个 train scene 分成 1065 train + 118
+validation，官方 test 的 200 scene 完全保留。11 类分别得到 11715、1298、2200
+条记录。background 支持以下常见布局：
+
+```text
+<coarse-root>/<split>/<degradation>/<scene>.<suffix>
+<coarse-root>/<split>/background/<degradation>/<scene>.<suffix>
+<coarse-root>/background/<split>/<degradation>/<scene>.<suffix>
+<coarse-root>/background/<degradation>/<scene>.<suffix>
+<coarse-root>/<degradation>/<scene>.<suffix>
 ```
 
-脚本支持 `background/<split>/<degradation>/<原文件名>`、
-`background/<degradation>/<原文件名>`、`background/<split>/<原文件名>` 和
-`background/<原文件名>` 四种布局，并会在缺少任何对应图时立即报错。生成的每条
-记录中，`coarse` 指向 background，`degraded` 指向原退化图，`target` 指向 GT。
-训练阶段只会读取这些路径，不会再次运行完整 DACG restoration 网络。
+其中 `<split>` 为 `train` 或 `test`，文件 stem 必须与 CDD-11 原图一致。训练仍需
+DACG checkpoint，但只加载并冻结 DAM 来计算 `P_global`，不会运行完整 DACG
+restoration 网络。如果实际路径是 `CDD-11/train/background/<degradation>` 和
+`CDD-11/test/background/<degradation>`，应传 `--coarse-root /data/CDD-11`；如果
+实际路径是 `CDD-11/background/train/<degradation>`，则既可传 `/data/CDD-11`，
+也可传 `/data/CDD-11/background`。
+
+只有服务器尚无 background 时，才使用以下旧入口重新运行 DACG。`MANIFEST_DIR`
+包含原先的 CDD-11 `train.jsonl`、`val.jsonl`、`test.jsonl`：
 
 ```bash
 python prepare_cdd11_difix.py \
@@ -68,8 +77,8 @@ python prepare_cdd11_difix.py \
 
 ```bash
 accelerate launch train_cdd11_difix.py \
-  --train-manifest /data/cdd11_difix_prepared/train.jsonl \
-  --validation-manifest /data/cdd11_difix_prepared/val.jsonl \
+  --data-root /data/CDD-11 \
+  --coarse-root /data/CDD-11 \
   --dam-checkpoint /checkpoints/dacg_cdd11_best.pt \
   --output-dir /runs/cdd11_difix_pglobal_layer \
   --pretrained-model stabilityai/sd-turbo \
@@ -104,8 +113,8 @@ accelerate launch train_cdd11_difix.py \
 
 ```bash
 accelerate launch train_cdd11_difix.py \
-  --train-manifest /data/cdd11_difix_prepared/train.jsonl \
-  --validation-manifest /data/cdd11_difix_prepared/val.jsonl \
+  --data-root /data/CDD-11 \
+  --coarse-root /data/CDD-11 \
   --dam-checkpoint /checkpoints/dacg_cdd11_best.pt \
   --output-dir /runs/cdd11_difix_smoke \
   --max-train-steps 2 \
@@ -132,8 +141,8 @@ DAM。checkpoint 只包含 Difix LoRA、条件生成器、主视角 VAE skip con
 
 ```bash
 accelerate launch train_cdd11_difix.py \
-  --train-manifest /data/cdd11_difix_prepared/train.jsonl \
-  --validation-manifest /data/cdd11_difix_prepared/val.jsonl \
+  --data-root /data/CDD-11 \
+  --coarse-root /data/CDD-11 \
   --dam-checkpoint /checkpoints/dacg_cdd11_best.pt \
   --output-dir /runs/cdd11_difix_pglobal_layer \
   --resume /runs/cdd11_difix_pglobal_layer/checkpoints/latest.pt \
@@ -151,8 +160,8 @@ accelerate launch train_cdd11_difix.py \
 ```bash
 for MODE in static p-global p-global-layer-id; do
   accelerate launch train_cdd11_difix.py \
-    --train-manifest /data/cdd11_difix_prepared/train.jsonl \
-    --validation-manifest /data/cdd11_difix_prepared/val.jsonl \
+    --data-root /data/CDD-11 \
+    --coarse-root /data/CDD-11 \
     --dam-checkpoint /checkpoints/dacg_cdd11_best.pt \
     --output-dir "/runs/cdd11_difix_${MODE}" \
     --lora-mode "${MODE}" \
@@ -191,7 +200,7 @@ python infer_cdd11_difix.py \
 
 ```bash
 python evaluate_cdd11_difix.py \
-  --manifest /data/cdd11_difix_prepared/test.jsonl \
+  --manifest /runs/cdd11_difix_pglobal_layer/prepared/manifests/test.jsonl \
   --dam-checkpoint /checkpoints/dacg_cdd11_best.pt \
   --difix-checkpoint /runs/cdd11_difix_pglobal_layer/checkpoints/latest.pt \
   --output-dir /runs/cdd11_difix_pglobal_layer/test \

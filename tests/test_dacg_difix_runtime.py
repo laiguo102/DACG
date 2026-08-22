@@ -17,6 +17,7 @@ from dacg_difix.train import (
     _comparison_image,
     adapter_checkpoint,
     load_adapter_checkpoint,
+    main as train_main,
     parser as train_parser,
     save_training_checkpoint,
 )
@@ -69,6 +70,20 @@ class _DummyDifix(torch.nn.Module):
 
 
 class TestDifixRuntime(unittest.TestCase):
+    def test_training_cli_accepts_folder_mode_without_manifests(self):
+        argv = [
+            "train_cdd11_difix.py",
+            "--data-root", "CDD11",
+            "--coarse-root", "CDD11",
+            "--dam-checkpoint", "dacg.pt",
+            "--output-dir", "run",
+        ]
+        with mock.patch("sys.argv", argv), mock.patch("dacg_difix.train.run") as run:
+            train_main()
+        parsed = run.call_args.args[0]
+        self.assertEqual(str(parsed.data_root), "CDD11")
+        self.assertIsNone(parsed.train_manifest)
+
     def test_validation_comparison_is_degraded_coarse_final_gt(self):
         degraded = torch.full((1, 3, 12, 8), -1.0)
         coarse = torch.full((1, 3, 12, 8), -0.5)

@@ -279,6 +279,23 @@ def run(args: argparse.Namespace) -> None:
     if accelerator.is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.data_root is not None:
+        if accelerator.is_main_process:
+            from .prepare import prepare_cdd11_folder_manifests
+
+            prepared = prepare_cdd11_folder_manifests(
+                args.data_root,
+                args.coarse_root,
+                output_dir,
+            )
+            print(f"prepared CDD-11 folder split: {prepared['counts']}", flush=True)
+        accelerator.wait_for_everyone()
+        train_manifest = output_dir / "prepared" / "manifests" / "train.jsonl"
+        validation_manifest = output_dir / "prepared" / "manifests" / "validation.jsonl"
+    else:
+        train_manifest = args.train_manifest
+        validation_manifest = args.validation_manifest
+
     with accelerator.main_process_first():
         model = _build_model(args)
         loss_model = build_restoration_loss(
@@ -323,7 +340,7 @@ def run(args: argparse.Namespace) -> None:
         )
 
     train_loader = _make_loader(
-        args.train_manifest,
+        train_manifest,
         model,
         resolution=args.resolution,
         prompt=args.prompt,
@@ -332,7 +349,7 @@ def run(args: argparse.Namespace) -> None:
         workers=args.dataloader_num_workers,
     )
     validation_loader = _make_loader(
-        args.validation_manifest,
+        validation_manifest,
         model,
         resolution=None,
         prompt=args.prompt,
@@ -457,8 +474,10 @@ def run(args: argparse.Namespace) -> None:
 
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description=__doc__)
-    value.add_argument("--train-manifest", type=Path, required=True)
-    value.add_argument("--validation-manifest", type=Path, required=True)
+    value.add_argument("--train-manifest", type=Path)
+    value.add_argument("--validation-manifest", type=Path)
+    value.add_argument("--data-root", type=Path)
+    value.add_argument("--coarse-root", type=Path)
     value.add_argument("--dam-checkpoint", type=Path, required=True)
     value.add_argument("--output-dir", type=Path, required=True)
     value.add_argument("--pretrained-model", default="stabilityai/sd-turbo")
@@ -506,7 +525,19 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    run(parser().parse_args())
+    args = parser().parse_args()
+    folder_mode = args.data_root is not None or args.coarse_root is not None
+    manifest_mode = args.train_manifest is not None or args.validation_manifest is not None
+    if folder_mode == manifest_mode:
+        raise SystemExit(
+            "choose exactly one input mode: --data-root with --coarse-root, or "
+            "--train-manifest with --validation-manifest"
+        )
+    if folder_mode and (args.data_root is None or args.coarse_root is None):
+        raise SystemExit("folder mode requires both --data-root and --coarse-root")
+    if manifest_mode and (args.train_manifest is None or args.validation_manifest is None):
+        raise SystemExit("manifest mode requires both training and validation manifests")
+    run(args)
 
 
 if __name__ == "__main__":
