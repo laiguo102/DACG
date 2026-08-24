@@ -276,7 +276,10 @@ See [`CDD11_DIFIX_SERVER_GUIDE.md`](CDD11_DIFIX_SERVER_GUIDE.md) for installatio
 pair IDs, single/multi-GPU commands, outputs, resume instructions, and official-test
 evaluation. The test evaluator reports PSNR/SSIM plus LPIPS-VGG and DISTS for the
 degraded input, DACG coarse result, and final Difix output, with directed-task and
-pair-level summaries.
+pair-level summaries. It also supports a deterministic `--model-source initialization`
+baseline that reconstructs the seed-matched step-0 model without loading a checkpoint;
+`compare_cdd11_difix.py` performs paired trained-vs-initialization comparisons with
+scene-cluster bootstrap confidence intervals.
 
 This component incorporates NVIDIA Difix3D under its non-commercial license; see
 [`difix3d_selective/LICENSE_DIFIX3D.txt`](difix3d_selective/LICENSE_DIFIX3D.txt).

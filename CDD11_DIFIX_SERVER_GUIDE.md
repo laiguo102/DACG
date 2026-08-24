@@ -301,6 +301,46 @@ test_best_psnr/
 中断后会跳过已有 `records/` 并继续；完成目录不会被覆盖，需要重测时请指定新的
 `--output-dir`。首次使用 DISTS/LPIPS 时会下载相应的感知网络权重。
 
+### 8.3 与训练前 step-0 初始化做配对比较
+
+为了隔离本项目训练本身的作用，评测器可以构造与训练开始时完全相同的模型初始化，
+但不加载任何训练 checkpoint。该基线仍使用 `stabilityai/sd-turbo` 权重、本项目的
+双视图 UNet、VAE skip/LoRA、相同 timestep 和提示词；训练 seed 为 42 时必须显式
+保持 `--seed 42`。除是否加载训练权重外，其余测试输入和设置均与正式测试相同：
+
+```bash
+python -u evaluate_cdd11_difix.py \
+  --model-source initialization \
+  --data-root /path/to/CDD11 \
+  --test-coarse-root /path/to/CDD11-DACG-coarse-test \
+  --output-dir /path/to/difix-selective-run/test_initialization_seed42 \
+  --degradation-pairs 1 2 3 4 5 \
+  --resolution 512 \
+  --workers 4 \
+  --mixed-precision bf16 \
+  --seed 42 \
+  --enable-xformers-memory-efficient-attention
+```
+
+初始化基线不接受 `--checkpoint`。输出仍使用 `final_*` 字段表示该 step-0 模型的
+输出指标，`metrics.json` 会记录 `model_source=initialization`、初始化来源与 seed。
+
+完成后，对已有训练结果和初始化结果执行逐图配对比较：
+
+```bash
+python -u compare_cdd11_difix.py \
+  --trained-dir /path/to/difix-selective-run/test_best_psnr_step080000 \
+  --initialization-dir /path/to/difix-selective-run/test_initialization_seed42 \
+  --output-dir /path/to/difix-selective-run/compare_step080000_vs_initialization
+```
+
+比较器会先确认两侧 2000 个 `sample_id`、任务、prompt，以及 degraded/coarse 指标
+完全对应，然后输出 `per_image_comparison.csv`、`summary.csv` 和
+`comparison.json`。`trained_advantage` 统一为正值代表训练后更好；95% 置信区间
+使用 10000 次按 `scene_id` 聚类的 bootstrap，以避免把同一 scene 的 10 个有向任务
+错误地视为相互独立。如果某指标的 `ci95_low > 0`，对应结论为
+`trained_better`；区间跨 0 时标记为 `inconclusive`。
+
 若已有可信的 test coarse 但没有元数据，可显式传
 `--allow-unverified-test-coarse`；这会在结果配置中标记
 `coarse_metadata_verified=false`，不建议用于正式报告。

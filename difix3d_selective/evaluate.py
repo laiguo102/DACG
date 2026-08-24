@@ -1,4 +1,4 @@
-"""Evaluate a trained selective Difix checkpoint on the official CDD11 test split."""
+"""Evaluate trained or initialization-only selective Difix on CDD11 test."""
 
 from __future__ import annotations
 
@@ -164,13 +164,29 @@ def run(args: argparse.Namespace) -> None:
     from .prepare import prepare_selective_test_manifest
     from .validation import comparison_image, stratified_indices
 
-    checkpoint = args.checkpoint.resolve()
-    if not checkpoint.is_file():
-        raise FileNotFoundError(checkpoint)
-    pair_ids = _infer_pair_ids(checkpoint, args.degradation_pairs)
-    output_dir = (
-        args.output_dir or checkpoint.parent.parent / f"test_{checkpoint.stem}"
-    ).resolve()
+    model_source = getattr(args, "model_source", "trained")
+    checkpoint = args.checkpoint.resolve() if args.checkpoint is not None else None
+    if model_source == "trained":
+        if checkpoint is None:
+            raise ValueError("--checkpoint is required for --model-source trained")
+        if not checkpoint.is_file():
+            raise FileNotFoundError(checkpoint)
+        pair_ids = _infer_pair_ids(checkpoint, args.degradation_pairs)
+        default_output_dir = checkpoint.parent.parent / f"test_{checkpoint.stem}"
+    else:
+        if checkpoint is not None:
+            raise ValueError(
+                "Do not pass --checkpoint with --model-source initialization"
+            )
+        if not args.degradation_pairs:
+            raise ValueError(
+                "--degradation-pairs is required for initialization evaluation"
+            )
+        pair_ids = [pair_id for pair_id, _ in selected_pairs(args.degradation_pairs)]
+        if args.output_dir is None:
+            raise ValueError("--output-dir is required for initialization evaluation")
+        default_output_dir = args.output_dir
+    output_dir = (args.output_dir or default_output_dir).resolve()
     if (output_dir / "metrics.json").exists():
         raise RuntimeError(
             f"Completed metrics already exist in {output_dir}; choose a new --output-dir"
@@ -191,7 +207,6 @@ def run(args: argparse.Namespace) -> None:
         )
 
     config = {
-        "checkpoint": _checkpoint_identity(checkpoint),
         "data_root": str(args.data_root.resolve()),
         "test_coarse_root": str(args.test_coarse_root.resolve()),
         "test_manifest_sha256": _file_sha256(prepared["manifest"]),
@@ -209,6 +224,16 @@ def run(args: argparse.Namespace) -> None:
         "save_predictions": args.save_predictions,
         "coarse_metadata_verified": prepared["coarse_metadata_verified"],
     }
+    if model_source == "trained":
+        config["checkpoint"] = _checkpoint_identity(checkpoint)
+    else:
+        config.update(
+            {
+                "model_source": "initialization",
+                "initialization": "stabilityai/sd-turbo plus selective Difix adapters",
+                "initialization_seed": args.seed,
+            }
+        )
     state_path = output_dir / "state.json"
     records_dir = output_dir / "records"
     partial_rows = _load_partial_rows(records_dir)
@@ -236,12 +261,17 @@ def run(args: argparse.Namespace) -> None:
     elif args.mixed_precision != "no":
         raise ValueError("CPU evaluation requires --mixed-precision no")
 
+    # Training calls accelerate.set_seed(args.seed) before constructing this model.
+    # Reusing the same seed makes the initialization baseline the exact step-0 model.
+    torch.manual_seed(args.seed)
     model = SelectiveDifix(lora_rank_vae=args.lora_rank_vae, timestep=args.timestep).to(
         device
     )
     if args.enable_xformers_memory_efficient_attention:
         model.unet.enable_xformers_memory_efficient_attention()
-    global_step = load_model_checkpoint(model, checkpoint)
+    global_step = (
+        load_model_checkpoint(model, checkpoint) if model_source == "trained" else 0
+    )
     model.set_eval()
     metric_suite = FullReferenceMetricSuite(device)
 
@@ -365,6 +395,7 @@ def run(args: argparse.Namespace) -> None:
     summary = summarize_test_rows(rows)
     metadata = {
         "protocol": "cdd11-selective-difix-test-v1",
+        "model_source": model_source,
         "global_step": global_step,
         "created_at_utc": _now(),
         "config": config,
@@ -376,7 +407,11 @@ def run(args: argparse.Namespace) -> None:
         "baselines": {
             "degraded": "original double-degradation input",
             "coarse": "DACG preliminary restoration",
-            "final": "selective Difix output",
+            "final": (
+                "trained selective Difix output"
+                if model_source == "trained"
+                else "step-0 selective Difix initialization output"
+            ),
         },
         "metrics": {
             "psnr": {
@@ -431,7 +466,7 @@ def run(args: argparse.Namespace) -> None:
         {"metadata": metadata, "summary": summary, "per_image_count": len(rows)},
     )
     print(
-        f"Completed {total} samples at step {global_step}. "
+        f"Completed {total} {model_source} samples at step {global_step}. "
         f"PSNR={macro['final_psnr']:.4f}, SSIM={macro['final_ssim']:.6f}, "
         f"LPIPS-VGG={macro['final_lpips_vgg']:.6f}, "
         f"DISTS={macro['final_dists']:.6f}. Results: {output_dir}",
@@ -443,7 +478,10 @@ def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description=__doc__)
     value.add_argument("--data-root", type=Path, required=True)
     value.add_argument("--test-coarse-root", type=Path, required=True)
-    value.add_argument("--checkpoint", type=Path, required=True)
+    value.add_argument(
+        "--model-source", choices=("trained", "initialization"), default="trained"
+    )
+    value.add_argument("--checkpoint", type=Path)
     value.add_argument("--output-dir", type=Path)
     value.add_argument("--degradation-pairs", nargs="+", type=int, choices=range(1, 6))
     value.add_argument("--resolution", type=int, default=512)

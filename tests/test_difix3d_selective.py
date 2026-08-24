@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from difix3d_selective.compare import paired_rows, summarize_comparison
 from difix3d_selective.evaluate import _resolve_device
 from difix3d_selective.loss import gram_matrix
 from difix3d_selective.main_view import select_main_view, select_main_view_skips
@@ -68,6 +69,58 @@ class TestSelectiveProtocol(unittest.TestCase):
             {"coarse": 3549, "train": 6390, "validation": 708},
         )
         self.assertEqual(expected_test_count([1, 3, 5]), 1200)
+
+
+class TestTrainedInitializationComparison(unittest.TestCase):
+    @staticmethod
+    def _row(sample_id, final_psnr, final_ssim, final_lpips, final_dists):
+        row = {
+            "sample_id": sample_id,
+            "scene_id": sample_id.split("-")[0],
+            "pair_id": "1",
+            "pair": "low_haze",
+            "remove": "low",
+            "preserve": "haze",
+            "prompt": "remove low light, preserve haze",
+            "final_psnr": str(final_psnr),
+            "final_ssim": str(final_ssim),
+            "final_lpips_vgg": str(final_lpips),
+            "final_dists": str(final_dists),
+        }
+        for stage in ("degraded", "coarse"):
+            for metric, value in (
+                ("psnr", 10),
+                ("ssim", 0.5),
+                ("lpips_vgg", 0.4),
+                ("dists", 0.3),
+            ):
+                row[f"{stage}_{metric}"] = str(value)
+        return row
+
+    def test_paired_advantage_is_positive_when_trained_is_better(self):
+        trained = [self._row("001-a", 25, 0.8, 0.1, 0.05)]
+        initialization = [self._row("001-a", 20, 0.7, 0.2, 0.1)]
+        row = paired_rows(trained, initialization)[0]
+        self.assertEqual(row["trained_advantage_psnr"], 5)
+        self.assertAlmostEqual(row["trained_advantage_ssim"], 0.1)
+        self.assertAlmostEqual(row["trained_advantage_lpips_vgg"], 0.1)
+        self.assertAlmostEqual(row["trained_advantage_dists"], 0.05)
+
+    def test_scene_cluster_bootstrap_reports_trained_better(self):
+        trained = [
+            self._row(f"{scene}-a", 25, 0.8, 0.1, 0.05)
+            for scene in ("001", "002", "003")
+        ]
+        initialization = [
+            self._row(f"{scene}-a", 20, 0.7, 0.2, 0.1)
+            for scene in ("001", "002", "003")
+        ]
+        summary = summarize_comparison(
+            paired_rows(trained, initialization), resamples=100, seed=42
+        )
+        overall = {row["metric"]: row for row in summary if row["group"] == "overall"}
+        self.assertEqual(overall["psnr"]["conclusion"], "trained_better")
+        self.assertGreater(overall["lpips_vgg"]["ci95_low"], 0)
 
 
 class TestMainViewSelection(unittest.TestCase):
