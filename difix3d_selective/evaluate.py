@@ -116,6 +116,14 @@ def _autocast(device: torch.device, mixed_precision: str):
     return torch.autocast(device_type="cuda", dtype=dtype)
 
 
+def _resolve_device(value: str) -> torch.device:
+    """Return an explicitly indexed CUDA device for older PyTorch releases."""
+    device = torch.device(value)
+    if device.type == "cuda" and device.index is None:
+        return torch.device("cuda", 0)
+    return device
+
+
 def _load_partial_rows(records_dir: Path) -> dict[str, dict]:
     rows: dict[str, dict] = {}
     if not records_dir.is_dir():
@@ -220,11 +228,11 @@ def run(args: argparse.Namespace) -> None:
         _state_payload(config, "evaluating", len(partial_rows), total),
     )
 
-    device = torch.device(args.device)
+    device = _resolve_device(args.device)
     if device.type == "cuda":
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA was requested but is not available")
-        torch.cuda.set_device(device)
+        torch.cuda.set_device(device.index)
     elif args.mixed_precision != "no":
         raise ValueError("CPU evaluation requires --mixed-precision no")
 

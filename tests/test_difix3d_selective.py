@@ -11,8 +11,9 @@ import numpy as np
 import torch
 from PIL import Image
 
-from difix3d_selective.main_view import select_main_view, select_main_view_skips
+from difix3d_selective.evaluate import _resolve_device
 from difix3d_selective.loss import gram_matrix
+from difix3d_selective.main_view import select_main_view, select_main_view_skips
 from difix3d_selective.prepare import (
     prepare_selective_manifests,
     prepare_selective_test_manifest,
@@ -37,6 +38,11 @@ class FakeTokenizer:
 
 
 class TestSelectiveProtocol(unittest.TestCase):
+    def test_evaluation_resolves_unindexed_cuda_for_older_torch(self):
+        self.assertEqual(_resolve_device("cuda"), torch.device("cuda:0"))
+        self.assertEqual(_resolve_device("cuda:2"), torch.device("cuda:2"))
+        self.assertEqual(_resolve_device("cpu"), torch.device("cpu"))
+
     def test_scene_split_is_fixed_disjoint_and_complete(self):
         scene_ids = [f"{index:06d}" for index in range(1183)]
         first = make_scene_split(scene_ids)
