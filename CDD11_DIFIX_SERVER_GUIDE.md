@@ -226,3 +226,81 @@ checkpoint 才能恢复，因此旧 run 默认只能得到每 1000 步的历史�
 
 选择 K 类时应得到 `1183×K` 张 coarse、`1065×K×2` 条训练记录和
 `118×K×2` 条验证记录。
+
+## 8. 在官方 test 上评估
+
+测试只使用训练期间从未读取的 `CDD11/test`。应优先测试由验证集选择出的
+`best_psnr.pkl`；不要根据 test 指标在 `final.pkl` 和多个 milestone 之间反复选择，
+否则 test 会事实上变成验证集。
+
+### 8.1 生成独立的 test coarse
+
+使用与训练 coarse 完全相同的 DACG checkpoint，但必须写入新的目录。不要把
+`CDD11/background`（训练 scene 的 coarse）传给测试器。
+
+```bash
+python -u prepare_cdd11_coarse.py \
+  --split test \
+  --data-root /path/to/CDD11 \
+  --dacg-checkpoint /path/to/cdd11-full-run/checkpoints/final.pth \
+  --coarse-root /path/to/CDD11-DACG-coarse-test \
+  --degradation-pairs 1 2 3 4 5 \
+  --device cuda
+```
+
+选择 K 个 pair 时应生成 `200×K` 张 coarse。目录根部的
+`coarse_preparation.json` 会明确记录 `split=test` 和 `status=completed`；评测器会
+检查该标记，防止训练 coarse 与测试 coarse 混用。显存不足时同样可增加
+`--tile-size 512 --tile-overlap 64`，中断后用同一命令续跑。
+
+### 8.2 运行选择性 DiFix 测试
+
+```bash
+python -u evaluate_cdd11_difix.py \
+  --data-root /path/to/CDD11 \
+  --test-coarse-root /path/to/CDD11-DACG-coarse-test \
+  --checkpoint /path/to/difix-selective-run/checkpoints/best_psnr.pkl \
+  --resolution 512 \
+  --workers 4 \
+  --mixed-precision bf16 \
+  --enable-xformers-memory-efficient-attention
+```
+
+默认从 checkpoint 所属 run 的 `prepared/split_and_preparation.json` 推断训练时选择的
+pair；旧 run 若缺少该文件，可显式增加 `--degradation-pairs 1 2 3 4 5`。若训练时
+修改过 `--lora-rank-vae` 或 `--timestep`，测试命令必须传入相同值。
+
+五类完整测试共 `200×5×2=2000` 个有向任务样本。每个样本以“需要保留的单退化图”
+为主参考，分别评估：
+
+- `degraded`：原始双退化输入；
+- `coarse`：DACG 初步恢复；
+- `final`：选择性 DiFix 输出。
+
+指标包括 RGB PSNR、RGB SSIM、LPIPS-VGG 和 DISTS。PSNR/SSIM 越高越好，
+LPIPS-VGG/DISTS 越低越好。所有 `improvement_*` 都统一成“正值表示 final 优于
+coarse”：PSNR/SSIM 使用 `final-coarse`，LPIPS/DISTS 使用 `coarse-final`；同时输出
+逐图胜率。指标在训练协议相同的 512×512 bicubic 输入/参考图上计算，不应与
+native-resolution DACG 正式测试数字混为一列。
+
+默认结果目录为 `<run-dir>/test_best_psnr/`：
+
+```text
+test_best_psnr/
+├── state.json
+├── manifest.jsonl
+├── metrics.json
+├── summary.csv
+├── per_image_metrics.csv
+├── records/                 # 每图原子记录，用于断点续跑
+├── predictions/             # 2000 张 final；可用 --no-save-predictions 关闭
+└── gallery/                 # 固定分层五联图
+```
+
+`summary.csv` 按 10 个有向任务、5 个 pair、micro 和 task-macro 分组。同一命令在
+中断后会跳过已有 `records/` 并继续；完成目录不会被覆盖，需要重测时请指定新的
+`--output-dir`。首次使用 DISTS/LPIPS 时会下载相应的感知网络权重。
+
+若已有可信的 test coarse 但没有元数据，可显式传
+`--allow-unverified-test-coarse`；这会在结果配置中标记
+`coarse_metadata_verified=false`，不建议用于正式报告。

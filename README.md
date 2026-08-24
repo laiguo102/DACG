@@ -273,7 +273,10 @@ directed `remove A, preserve B` tasks per image without loading or running DACG.
 The degraded image is a conditioning-only reference: only the DACG main view's latent
 and VAE skips are decoded and supervised.
 See [`CDD11_DIFIX_SERVER_GUIDE.md`](CDD11_DIFIX_SERVER_GUIDE.md) for installation,
-pair IDs, single/multi-GPU commands, outputs, and resume instructions.
+pair IDs, single/multi-GPU commands, outputs, resume instructions, and official-test
+evaluation. The test evaluator reports PSNR/SSIM plus LPIPS-VGG and DISTS for the
+degraded input, DACG coarse result, and final Difix output, with directed-task and
+pair-level summaries.
 
 This component incorporates NVIDIA Difix3D under its non-commercial license; see
 [`difix3d_selective/LICENSE_DIFIX3D.txt`](difix3d_selective/LICENSE_DIFIX3D.txt).

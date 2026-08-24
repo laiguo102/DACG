@@ -42,7 +42,12 @@ def vae_decoder_forward(self, sample, latent_embeds=None):
     sample = self.conv_in(sample)
     upscale_dtype = next(iter(self.up_blocks.parameters())).dtype
     sample = self.mid_block(sample, latent_embeds).to(upscale_dtype)
-    skip_convs = [self.skip_conv_1, self.skip_conv_2, self.skip_conv_3, self.skip_conv_4]
+    skip_convs = [
+        self.skip_conv_1,
+        self.skip_conv_2,
+        self.skip_conv_3,
+        self.skip_conv_4,
+    ]
     for index, up_block in enumerate(self.up_blocks):
         skip = skip_convs[index](self.incoming_skip_acts[::-1][index] * self.gamma)
         sample = up_block(sample + skip, latent_embeds)
@@ -57,12 +62,18 @@ class SelectiveDifix(torch.nn.Module):
     def __init__(self, lora_rank_vae: int = 4, timestep: int = 199):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(SD_TURBO, subfolder="tokenizer")
-        self.text_encoder = CLIPTextModel.from_pretrained(SD_TURBO, subfolder="text_encoder")
+        self.text_encoder = CLIPTextModel.from_pretrained(
+            SD_TURBO, subfolder="text_encoder"
+        )
         self.scheduler = make_1step_scheduler()
 
         vae = AutoencoderKL.from_pretrained(SD_TURBO, subfolder="vae")
-        vae.encoder.forward = vae_encoder_forward.__get__(vae.encoder, vae.encoder.__class__)
-        vae.decoder.forward = vae_decoder_forward.__get__(vae.decoder, vae.decoder.__class__)
+        vae.encoder.forward = vae_encoder_forward.__get__(
+            vae.encoder, vae.encoder.__class__
+        )
+        vae.decoder.forward = vae_decoder_forward.__get__(
+            vae.decoder, vae.decoder.__class__
+        )
         vae.decoder.skip_conv_1 = torch.nn.Conv2d(512, 512, 1, bias=False)
         vae.decoder.skip_conv_2 = torch.nn.Conv2d(256, 512, 1, bias=False)
         vae.decoder.skip_conv_3 = torch.nn.Conv2d(128, 512, 1, bias=False)
@@ -95,7 +106,8 @@ class SelectiveDifix(torch.nn.Module):
         self.target_modules_vae = [
             name
             for name, _ in vae.named_modules()
-            if "decoder" in name and any(name.endswith(suffix) for suffix in target_suffixes)
+            if "decoder" in name
+            and any(name.endswith(suffix) for suffix in target_suffixes)
         ]
         self.lora_rank_vae = lora_rank_vae
         vae.add_adapter(
@@ -201,12 +213,17 @@ class SelectiveDifix(torch.nn.Module):
     ) -> Image.Image:
         transform = transforms.Compose(
             [
-                transforms.Resize((resolution, resolution), interpolation=transforms.InterpolationMode.BICUBIC),
+                transforms.Resize(
+                    (resolution, resolution),
+                    interpolation=transforms.InterpolationMode.BICUBIC,
+                ),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5] * 3, [0.5] * 3),
             ]
         )
-        images = torch.stack([transform(image.convert("RGB")), transform(reference.convert("RGB"))])
+        images = torch.stack(
+            [transform(image.convert("RGB")), transform(reference.convert("RGB"))]
+        )
         images = images.unsqueeze(0).to(next(self.parameters()).device)
         output = self(images, prompt=[prompt])[0].float().cpu() * 0.5 + 0.5
         return transforms.ToPILImage()(output.clamp(0, 1))
@@ -221,6 +238,7 @@ def save_training_checkpoint(
 ) -> None:
     checkpoint = {
         "global_step": global_step,
+        "timestep": int(model.timesteps.item()),
         "vae_lora_target_modules": model.target_modules_vae,
         "rank_vae": model.lora_rank_vae,
         "state_dict_unet": model.unet.state_dict(),
@@ -240,6 +258,19 @@ def save_training_checkpoint(
 
 
 def _apply_model_checkpoint(model: SelectiveDifix, checkpoint: dict) -> int:
+    checkpoint_rank = int(checkpoint.get("rank_vae", model.lora_rank_vae))
+    if checkpoint_rank != model.lora_rank_vae:
+        raise ValueError(
+            f"Checkpoint VAE LoRA rank is {checkpoint_rank}, but the model was built "
+            f"with rank {model.lora_rank_vae}"
+        )
+    if "timestep" in checkpoint and int(checkpoint["timestep"]) != int(
+        model.timesteps.item()
+    ):
+        raise ValueError(
+            f"Checkpoint timestep is {checkpoint['timestep']}, but the model was built "
+            f"with timestep {int(model.timesteps.item())}"
+        )
     model.unet.load_state_dict(checkpoint["state_dict_unet"], strict=True)
     vae_state = model.vae.state_dict()
     vae_state.update(checkpoint["state_dict_vae"])

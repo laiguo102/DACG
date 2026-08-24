@@ -9,6 +9,7 @@ SEED = 42
 NUM_SCENES = 1183
 NUM_TRAIN_SCENES = 1065
 NUM_VALIDATION_SCENES = 118
+NUM_TEST_SCENES = 200
 
 PROMPT_NAMES = {
     "low": "low light",
@@ -79,3 +80,9 @@ def expected_counts(pair_ids: list[int] | tuple[int, ...]) -> dict[str, int]:
         "train": NUM_TRAIN_SCENES * pair_count * 2,
         "validation": NUM_VALIDATION_SCENES * pair_count * 2,
     }
+
+
+def expected_test_count(pair_ids: list[int] | tuple[int, ...]) -> int:
+    """Return the number of directed samples in the official CDD11 test split."""
+
+    return NUM_TEST_SCENES * len(selected_pairs(pair_ids)) * 2

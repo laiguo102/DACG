@@ -1,4 +1,4 @@
-"""Precompute DACG outputs for all CDD11 double-degradation training images."""
+"""Precompute DACG outputs for CDD11 double-degradation train or test images."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--data-root", type=Path, required=True)
     value.add_argument("--dacg-checkpoint", type=Path, required=True)
     value.add_argument("--coarse-root", type=Path, required=True)
+    value.add_argument("--split", choices=("train", "test"), default="train")
     value.add_argument(
         "--degradation-pairs",
         nargs="+",
@@ -38,8 +39,12 @@ def main() -> None:
         device=torch.device(args.device),
         tile_size=args.tile_size,
         tile_overlap=args.tile_overlap,
+        split=args.split,
     )
-    print(f"Prepared {result['coarse_images']} coarse images in {result['coarse_root']}")
+    print(
+        f"Prepared {result['coarse_images']} {args.split} coarse images in "
+        f"{result['coarse_root']}"
+    )
 
 
 if __name__ == "__main__":

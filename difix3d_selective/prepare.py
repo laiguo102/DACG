@@ -10,7 +10,14 @@ import torch
 from PIL import Image
 from tqdm.auto import tqdm
 
-from .protocol import PROMPT_NAMES, directed_tasks, make_scene_split, selected_pairs
+from .protocol import (
+    NUM_SCENES,
+    NUM_TEST_SCENES,
+    PROMPT_NAMES,
+    directed_tasks,
+    make_scene_split,
+    selected_pairs,
+)
 
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
 
@@ -56,16 +63,28 @@ def tiled_forward(
     if overlap >= tile_size:
         raise ValueError("DACG tile overlap must be smaller than tile size")
     stride = tile_size - overlap
-    tops = list(range(0, max(height - tile_size, 0), stride)) + [max(height - tile_size, 0)]
-    lefts = list(range(0, max(width - tile_size, 0), stride)) + [max(width - tile_size, 0)]
+    tops = list(range(0, max(height - tile_size, 0), stride)) + [
+        max(height - tile_size, 0)
+    ]
+    lefts = list(range(0, max(width - tile_size, 0), stride)) + [
+        max(width - tile_size, 0)
+    ]
     output = torch.zeros_like(image)
     weight = torch.zeros_like(image)
     for top in dict.fromkeys(tops):
         for left in dict.fromkeys(lefts):
             patch = image[..., top : top + tile_size, left : left + tile_size]
             prediction = model(patch)[..., : patch.shape[-2], : patch.shape[-1]]
-            output[..., top : top + prediction.shape[-2], left : left + prediction.shape[-1]] += prediction
-            weight[..., top : top + prediction.shape[-2], left : left + prediction.shape[-1]] += 1
+            output[
+                ...,
+                top : top + prediction.shape[-2],
+                left : left + prediction.shape[-1],
+            ] += prediction
+            weight[
+                ...,
+                top : top + prediction.shape[-2],
+                left : left + prediction.shape[-1],
+            ] += 1
     return output / weight.clamp_min(1)
 
 
@@ -92,19 +111,65 @@ def generate_cdd11_coarse(
     device: torch.device,
     tile_size: int = 0,
     tile_overlap: int = 64,
+    split: str = "train",
 ) -> dict[str, Path | int]:
     data_root = Path(data_root).resolve()
     coarse_root = Path(coarse_root).resolve()
-    train_root = data_root / "train"
+    if split not in ("train", "test"):
+        raise ValueError(f"Unsupported CDD11 split: {split}")
+    split_root = data_root / split
     pairs = selected_pairs(pair_ids)
-    clear = index_images(train_root / "clear")
+    clear = index_images(split_root / "clear")
+    expected_scenes = NUM_SCENES if split == "train" else NUM_TEST_SCENES
+    if len(clear) != expected_scenes:
+        raise ValueError(
+            f"CDD11 {split} must contain {expected_scenes} clear scenes, got {len(clear)}"
+        )
     all_scene_ids = set(clear)
 
     source_images: dict[str, dict[str, Path]] = {}
     for _, pair in pairs:
-        source_images[pair] = index_images(train_root / pair)
+        source_images[pair] = index_images(split_root / pair)
         if set(source_images[pair]) != all_scene_ids:
-            raise ValueError(f"CDD11 scene mismatch in train/{pair}")
+            raise ValueError(f"CDD11 scene mismatch in {split}/{pair}")
+
+    metadata_path = coarse_root / "coarse_preparation.json"
+    metadata_pairs = {pair_id: pair for pair_id, pair in pairs}
+    if metadata_path.is_file():
+        existing = json.loads(metadata_path.read_text(encoding="utf-8"))
+        existing_split = existing.get("split", "train")
+        if existing_split != split:
+            raise ValueError(
+                f"{coarse_root} contains {existing_split} coarse images; use a separate "
+                f"directory for CDD11 {split}"
+            )
+        if (
+            existing.get("data_root")
+            and Path(existing["data_root"]).resolve() != data_root
+        ):
+            raise ValueError(
+                f"{coarse_root} was prepared from {existing['data_root']}, not {data_root}"
+            )
+        requested_checkpoint = Path(dacg_checkpoint).resolve()
+        if (
+            existing.get("dacg_checkpoint")
+            and Path(existing["dacg_checkpoint"]).resolve() != requested_checkpoint
+        ):
+            raise ValueError(
+                f"{coarse_root} was prepared with a different DACG checkpoint; "
+                "use a separate coarse directory to prevent mixed predictions"
+            )
+        for value in existing.get("degradation_pairs", []):
+            metadata_pairs[int(value["id"])] = str(value["name"])
+    elif split == "test" and any(
+        (coarse_root / pair).is_dir() and any((coarse_root / pair).iterdir())
+        for _, pair in pairs
+    ):
+        raise ValueError(
+            "Refusing to label existing unverified files as official test coarse images; "
+            "use a new --coarse-root, or pass an existing test coarse root directly to "
+            "the evaluator with --allow-unverified-test-coarse"
+        )
 
     jobs: list[tuple[Path, Path]] = []
     for _, pair in pairs:
@@ -112,6 +177,23 @@ def generate_cdd11_coarse(
             output = coarse_root / pair / f"{scene_id}.png"
             if not output.is_file():
                 jobs.append((source, output))
+
+    info = {
+        "status": "preparing" if jobs else "completed",
+        "split": split,
+        "data_root": str(data_root),
+        "dacg_checkpoint": str(Path(dacg_checkpoint).resolve()),
+        "coarse_root": str(coarse_root),
+        "degradation_pairs": [
+            {"id": pair_id, "name": metadata_pairs[pair_id]}
+            for pair_id in sorted(metadata_pairs)
+        ],
+        "coarse_images": len(clear) * len(metadata_pairs),
+    }
+    coarse_root.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(
+        json.dumps(info, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
 
     if jobs:
         model, checkpoint = load_dacg_checkpoint(dacg_checkpoint, device)
@@ -129,18 +211,30 @@ def generate_cdd11_coarse(
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    info = {
-        "data_root": str(data_root),
-        "dacg_checkpoint": str(Path(dacg_checkpoint).resolve()),
-        "coarse_root": str(coarse_root),
-        "degradation_pairs": [{"id": pair_id, "name": pair} for pair_id, pair in pairs],
-        "coarse_images": len(clear) * len(pairs),
-    }
-    coarse_root.mkdir(parents=True, exist_ok=True)
-    (coarse_root / "coarse_preparation.json").write_text(
+    incomplete_pairs = []
+    for pair in metadata_pairs.values():
+        directory = coarse_root / pair
+        if not directory.is_dir() or set(index_images(directory)) != all_scene_ids:
+            incomplete_pairs.append(pair)
+    if incomplete_pairs:
+        info["status"] = "preparing"
+        metadata_path.write_text(
+            json.dumps(info, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        raise RuntimeError(
+            "Coarse preparation remains incomplete for: "
+            + ", ".join(sorted(incomplete_pairs))
+            + ". Rerun with the corresponding --degradation-pairs."
+        )
+
+    info["status"] = "completed"
+    metadata_path.write_text(
         json.dumps(info, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
-    return {"coarse_root": coarse_root, "coarse_images": len(clear) * len(pairs)}
+    return {
+        "coarse_root": coarse_root,
+        "coarse_images": len(clear) * len(metadata_pairs),
+    }
 
 
 def prepare_selective_manifests(
@@ -227,4 +321,102 @@ def prepare_selective_manifests(
         "coarse_images": len(clear) * len(pairs),
         "train_samples": counts["train"],
         "validation_samples": counts["validation"],
+    }
+
+
+def prepare_selective_test_manifest(
+    *,
+    data_root: str | Path,
+    coarse_root: str | Path,
+    output_dir: str | Path,
+    pair_ids: list[int],
+    require_coarse_metadata: bool = True,
+) -> dict[str, Path | int]:
+    """Build directed selective-restoration records from official CDD11/test."""
+
+    data_root = Path(data_root).resolve()
+    coarse_root = Path(coarse_root).resolve()
+    output_dir = Path(output_dir).resolve()
+    test_root = data_root / "test"
+    pairs = selected_pairs(pair_ids)
+
+    metadata_path = coarse_root / "coarse_preparation.json"
+    if require_coarse_metadata:
+        if not metadata_path.is_file():
+            raise FileNotFoundError(
+                f"Missing {metadata_path}. Generate test coarse images with "
+                "prepare_cdd11_coarse.py --split test, or explicitly pass "
+                "--allow-unverified-test-coarse."
+            )
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata.get("split") != "test" or metadata.get("status") != "completed":
+            raise ValueError(
+                f"Invalid official-test coarse metadata in {metadata_path}: "
+                f"split={metadata.get('split')!r}, status={metadata.get('status')!r}"
+            )
+        if Path(metadata.get("data_root", "")).resolve() != data_root:
+            raise ValueError(
+                f"Test coarse metadata was prepared from {metadata.get('data_root')}, "
+                f"not {data_root}"
+            )
+        prepared_pairs = {int(value["id"]) for value in metadata["degradation_pairs"]}
+        missing_pairs = sorted(set(pair_ids) - prepared_pairs)
+        if missing_pairs:
+            raise ValueError(
+                f"Test coarse metadata is missing pair IDs: {missing_pairs}"
+            )
+
+    clear = index_images(test_root / "clear")
+    if len(clear) != NUM_TEST_SCENES:
+        raise ValueError(
+            f"CDD11 test must contain {NUM_TEST_SCENES} clear scenes, got {len(clear)}"
+        )
+    all_scene_ids = set(clear)
+    source_images: dict[str, dict[str, Path]] = {}
+    coarse_images: dict[str, dict[str, Path]] = {}
+    target_images: dict[str, dict[str, Path]] = {}
+    for _, pair in pairs:
+        source_images[pair] = index_images(test_root / pair)
+        coarse_images[pair] = index_images(coarse_root / pair)
+        if set(source_images[pair]) != all_scene_ids:
+            raise ValueError(f"CDD11 scene mismatch in test/{pair}")
+        if set(coarse_images[pair]) != all_scene_ids:
+            raise ValueError(
+                f"CDD11 test coarse scene mismatch in {coarse_root / pair}"
+            )
+    for degradation in PROMPT_NAMES:
+        target_images[degradation] = index_images(test_root / degradation)
+        if set(target_images[degradation]) != all_scene_ids:
+            raise ValueError(f"CDD11 scene mismatch in test/{degradation}")
+
+    records: list[dict] = []
+    for pair_id, pair in pairs:
+        for scene_id in sorted(all_scene_ids):
+            for task in directed_tasks(pair_id):
+                records.append(
+                    {
+                        "id": f"test/{pair}/{scene_id}/remove-{task.remove}-preserve-{task.preserve}",
+                        "split": "test",
+                        "scene_id": scene_id,
+                        "pair_id": pair_id,
+                        "pair": pair,
+                        "remove": task.remove,
+                        "preserve": task.preserve,
+                        "prompt": task.prompt,
+                        "image": str(coarse_images[pair][scene_id].resolve()),
+                        "ref_image": str(source_images[pair][scene_id].resolve()),
+                        "target_image": str(
+                            target_images[task.preserve][scene_id].resolve()
+                        ),
+                        "clear_image": str(clear[scene_id].resolve()),
+                    }
+                )
+
+    manifest = output_dir / "manifest.jsonl"
+    _write_jsonl(manifest, records)
+    return {
+        "manifest": manifest,
+        "test_scenes": len(clear),
+        "test_samples": len(records),
+        "coarse_metadata_verified": require_coarse_metadata,
     }

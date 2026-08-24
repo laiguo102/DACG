@@ -1,9 +1,10 @@
 import json
 import importlib.util
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -12,12 +13,17 @@ from PIL import Image
 
 from difix3d_selective.main_view import select_main_view, select_main_view_skips
 from difix3d_selective.loss import gram_matrix
-from difix3d_selective.prepare import prepare_selective_manifests, tiled_forward
+from difix3d_selective.prepare import (
+    prepare_selective_manifests,
+    prepare_selective_test_manifest,
+    tiled_forward,
+)
 from difix3d_selective.protocol import (
     NUM_TRAIN_SCENES,
     NUM_VALIDATION_SCENES,
     directed_tasks,
     expected_counts,
+    expected_test_count,
     make_scene_split,
     selected_pairs,
 )
@@ -55,6 +61,7 @@ class TestSelectiveProtocol(unittest.TestCase):
             expected_counts([1, 3, 5]),
             {"coarse": 3549, "train": 6390, "validation": 708},
         )
+        self.assertEqual(expected_test_count([1, 3, 5]), 1200)
 
 
 class TestMainViewSelection(unittest.TestCase):
@@ -91,16 +98,17 @@ class TestValidationVisualization(unittest.TestCase):
         for scene in range(3):
             for pair_id in range(1, 6):
                 for direction in range(2):
-                    records.append({
-                        "pair_id": pair_id,
-                        "remove": f"r{direction}",
-                        "preserve": f"p{direction}",
-                        "scene": scene,
-                    })
+                    records.append(
+                        {
+                            "pair_id": pair_id,
+                            "remove": f"r{direction}",
+                            "preserve": f"p{direction}",
+                            "scene": scene,
+                        }
+                    )
         selected = stratified_indices(records, 10)
         keys = {
-            (records[index]["pair_id"], records[index]["remove"])
-            for index in selected
+            (records[index]["pair_id"], records[index]["remove"]) for index in selected
         }
         self.assertEqual(len(selected), 10)
         self.assertEqual(len(keys), 10)
@@ -151,9 +159,9 @@ class TestGramLoss(unittest.TestCase):
     def test_gram_matrix_is_per_image_and_batch_one_compatible(self):
         features = torch.arange(2 * 3 * 2 * 2, dtype=torch.float32).reshape(2, 3, 2, 2)
         grams = gram_matrix(features)
-        expected = torch.stack([
-            image.flatten(1) @ image.flatten(1).T for image in features
-        ])
+        expected = torch.stack(
+            [image.flatten(1) @ image.flatten(1).T for image in features]
+        )
         self.assertEqual(tuple(grams.shape), (2, 3, 3))
         self.assertTrue(torch.equal(grams, expected))
         self.assertTrue(torch.equal(gram_matrix(features[:1])[0], expected[0]))
@@ -172,14 +180,19 @@ class TestDatasetAndPreparation(unittest.TestCase):
         array[:] = rgb
         Image.fromarray(array, "RGB").save(path)
 
-    @unittest.skipIf(importlib.util.find_spec("torchvision") is None, "torchvision is not installed")
+    @unittest.skipIf(
+        importlib.util.find_spec("torchvision") is None, "torchvision is not installed"
+    )
     def test_dataset_loads_two_conditioning_views_and_one_target(self):
         from difix3d_selective.data import SelectiveDifixDataset
 
         with tempfile.TemporaryDirectory(dir=".") as directory:
             root = Path(directory)
             main, reference, target, clear = (
-                root / "main.png", root / "ref.png", root / "target.png", root / "clear.png"
+                root / "main.png",
+                root / "ref.png",
+                root / "target.png",
+                root / "clear.png",
             )
             self._save(main, (0, 0, 0))
             self._save(reference, (255, 0, 0))
@@ -201,10 +214,16 @@ class TestDatasetAndPreparation(unittest.TestCase):
                 encoding="utf-8",
             )
             sample = SelectiveDifixDataset(manifest, FakeTokenizer(), resolution=8)[0]
-            self.assertEqual(tuple(sample["conditioning_pixel_values"].shape), (2, 3, 8, 8))
+            self.assertEqual(
+                tuple(sample["conditioning_pixel_values"].shape), (2, 3, 8, 8)
+            )
             self.assertEqual(tuple(sample["output_pixel_values"].shape), (3, 8, 8))
-            self.assertEqual(tuple(sample["ground_truth_pixel_values"].shape), (3, 8, 8))
-            self.assertTrue(torch.equal(sample["input_ids"], torch.tensor([1, 2, 3, 4])))
+            self.assertEqual(
+                tuple(sample["ground_truth_pixel_values"].shape), (3, 8, 8)
+            )
+            self.assertTrue(
+                torch.equal(sample["input_ids"], torch.tensor([1, 2, 3, 4]))
+            )
             self.assertLess(float(sample["conditioning_pixel_values"][0].mean()), -0.99)
             self.assertGreater(float(sample["output_pixel_values"][1].mean()), 0.99)
 
@@ -236,7 +255,9 @@ class TestDatasetAndPreparation(unittest.TestCase):
             written[Path(path).name] = records
 
         with (
-            patch("difix3d_selective.prepare.index_images", side_effect=fake_index_images),
+            patch(
+                "difix3d_selective.prepare.index_images", side_effect=fake_index_images
+            ),
             patch("difix3d_selective.prepare._write_jsonl", side_effect=capture_jsonl),
             patch(
                 "difix3d_selective.prepare.make_scene_split",
@@ -261,13 +282,272 @@ class TestDatasetAndPreparation(unittest.TestCase):
             )
         )
         by_prompt = {
-            record["prompt"]: Path(record["target_image"]).parent.name for record in train_records
+            record["prompt"]: Path(record["target_image"]).parent.name
+            for record in train_records
         }
         self.assertEqual(by_prompt["remove low light, preserve haze"], "haze")
         self.assertEqual(by_prompt["remove haze, preserve low light"], "low")
         self.assertTrue(
-            all(Path(record["clear_image"]).parent.name == "clear" for record in train_records)
+            all(
+                Path(record["clear_image"]).parent.name == "clear"
+                for record in train_records
+            )
         )
+
+    def test_official_test_manifest_builds_both_directions_from_test_only(self):
+        root = Path.cwd().resolve()
+        data_root = root / "fake-cdd11"
+        coarse_root = root / "fake-test-coarse"
+        output_dir = root / "fake-test-output"
+        scene_ids = ("000001", "000002")
+        written = {}
+
+        def fake_index_images(path):
+            path = Path(path)
+            suffix = ".png" if path.parent == coarse_root else ".jpg"
+            return {scene: path / f"{scene}{suffix}" for scene in scene_ids}
+
+        def capture_jsonl(path, records):
+            written[Path(path).name] = records
+
+        with (
+            patch(
+                "difix3d_selective.prepare.index_images", side_effect=fake_index_images
+            ),
+            patch("difix3d_selective.prepare._write_jsonl", side_effect=capture_jsonl),
+            patch("difix3d_selective.prepare.NUM_TEST_SCENES", 2),
+        ):
+            result = prepare_selective_test_manifest(
+                data_root=data_root,
+                coarse_root=coarse_root,
+                output_dir=output_dir,
+                pair_ids=[1],
+                require_coarse_metadata=False,
+            )
+
+        records = written["manifest.jsonl"]
+        self.assertEqual(result["test_samples"], 4)
+        self.assertEqual({record["split"] for record in records}, {"test"})
+        self.assertEqual(
+            {record["prompt"] for record in records},
+            {
+                "remove low light, preserve haze",
+                "remove haze, preserve low light",
+            },
+        )
+        self.assertTrue(
+            all(
+                Path(record["ref_image"]).parts[-3:-1] == ("test", "low_haze")
+                for record in records
+            )
+        )
+        self.assertTrue(
+            all(
+                Path(record["image"]).parent == coarse_root / "low_haze"
+                for record in records
+            )
+        )
+
+    def test_official_test_rejects_training_coarse_metadata(self):
+        with tempfile.TemporaryDirectory(dir=".") as directory:
+            root = Path(directory).resolve()
+            coarse_root = root / "coarse"
+            coarse_root.mkdir()
+            (coarse_root / "coarse_preparation.json").write_text(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "split": "train",
+                        "data_root": str(root / "CDD11"),
+                        "degradation_pairs": [{"id": 1, "name": "low_haze"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "official-test coarse metadata"):
+                prepare_selective_test_manifest(
+                    data_root=root / "CDD11",
+                    coarse_root=coarse_root,
+                    output_dir=root / "output",
+                    pair_ids=[1],
+                )
+
+
+class TestSelectiveTestMetrics(unittest.TestCase):
+    def test_perceptual_metrics_compare_final_to_coarse_with_positive_gain(self):
+        from difix3d_selective.metrics import (
+            FullReferenceMetricSuite,
+            flatten_sample_metrics,
+            summarize_test_rows,
+        )
+
+        class MeanDistance(torch.nn.Module):
+            def forward(self, prediction, target):
+                return (prediction - target).abs().mean((1, 2, 3), keepdim=True)
+
+        target = torch.zeros(1, 3, 12, 12)
+        candidates = {
+            "degraded": torch.full_like(target, 0.4),
+            "coarse": torch.full_like(target, 0.2),
+            "final": torch.full_like(target, 0.1),
+        }
+        suite = FullReferenceMetricSuite(
+            torch.device("cpu"),
+            lpips_model=MeanDistance(),
+            dists_model=MeanDistance(),
+        )
+        flattened = flatten_sample_metrics(suite(candidates, target))
+        for metric in ("psnr", "ssim", "lpips_vgg", "dists"):
+            self.assertGreater(flattened[f"improvement_{metric}"], 0)
+            self.assertEqual(flattened[f"final_wins_{metric}"], 1)
+
+        rows = []
+        for remove, preserve in (("low", "haze"), ("haze", "low")):
+            rows.append(
+                {
+                    "pair": "low_haze",
+                    "remove": remove,
+                    "preserve": preserve,
+                    "inference_time_seconds": 1.0,
+                    **flattened,
+                }
+            )
+        summary = summarize_test_rows(rows)
+        self.assertEqual(summary["overall"]["macro"]["tasks"], 2)
+        self.assertEqual(summary["overall"]["macro"]["win_rate_dists"], 1.0)
+        self.assertAlmostEqual(
+            summary["overall"]["macro"]["improvement_lpips_vgg"],
+            flattened["improvement_lpips_vgg"],
+        )
+
+    @unittest.skipIf(
+        importlib.util.find_spec("torchvision") is None, "torchvision is not installed"
+    )
+    def test_evaluator_writes_resumable_outputs_and_completed_summary(self):
+        from difix3d_selective.evaluate import run
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self, **kwargs):
+                super().__init__()
+                self.anchor = torch.nn.Parameter(torch.zeros(()))
+                self.tokenizer = FakeTokenizer()
+
+            def forward(self, source, prompt_tokens):
+                return source[:, 0]
+
+            def set_eval(self):
+                self.eval().requires_grad_(False)
+
+        class FakeMetricSuite:
+            def __call__(self, candidates, target):
+                return {
+                    "degraded": {
+                        "psnr": 10,
+                        "ssim": 0.5,
+                        "lpips_vgg": 0.4,
+                        "dists": 0.3,
+                    },
+                    "coarse": {
+                        "psnr": 20,
+                        "ssim": 0.7,
+                        "lpips_vgg": 0.2,
+                        "dists": 0.15,
+                    },
+                    "final": {"psnr": 21, "ssim": 0.75, "lpips_vgg": 0.1, "dists": 0.1},
+                }
+
+        with tempfile.TemporaryDirectory(dir=".") as directory:
+            root = Path(directory).resolve()
+            images = {}
+            for name, color in (
+                ("coarse", (64, 64, 64)),
+                ("degraded", (32, 32, 32)),
+                ("target", (96, 96, 96)),
+                ("clear", (128, 128, 128)),
+            ):
+                images[name] = root / f"{name}.png"
+                array = np.zeros((12, 12, 3), dtype=np.uint8)
+                array[:] = color
+                Image.fromarray(array, "RGB").save(images[name])
+            manifest = root / "manifest.jsonl"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "id": "test/low_haze/000001/remove-low-preserve-haze",
+                        "split": "test",
+                        "scene_id": "000001",
+                        "pair_id": 1,
+                        "pair": "low_haze",
+                        "remove": "low",
+                        "preserve": "haze",
+                        "prompt": "remove low light, preserve haze",
+                        "image": str(images["coarse"]),
+                        "ref_image": str(images["degraded"]),
+                        "target_image": str(images["target"]),
+                        "clear_image": str(images["clear"]),
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            checkpoint = root / "run" / "checkpoints" / "best_psnr.pkl"
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_bytes(b"checkpoint-identity")
+            output_dir = root / "test-output"
+            args = SimpleNamespace(
+                checkpoint=checkpoint,
+                degradation_pairs=[1],
+                output_dir=output_dir,
+                data_root=root / "CDD11",
+                test_coarse_root=root / "test-coarse",
+                allow_unverified_test_coarse=False,
+                resolution=12,
+                lora_rank_vae=4,
+                timestep=199,
+                seed=42,
+                mixed_precision="no",
+                save_predictions=False,
+                device="cpu",
+                enable_xformers_memory_efficient_attention=False,
+                workers=0,
+                num_gallery_samples=0,
+            )
+            prepared = {
+                "manifest": manifest,
+                "test_samples": 1,
+                "coarse_metadata_verified": True,
+            }
+            fake_model_module = ModuleType("difix3d_selective.model")
+            fake_model_module.SelectiveDifix = FakeModel
+            fake_model_module.load_model_checkpoint = lambda model, path: 123
+            with (
+                patch.dict(
+                    sys.modules,
+                    {"difix3d_selective.model": fake_model_module},
+                ),
+                patch(
+                    "difix3d_selective.prepare.prepare_selective_test_manifest",
+                    return_value=prepared,
+                ),
+                patch(
+                    "difix3d_selective.evaluate.FullReferenceMetricSuite",
+                    return_value=FakeMetricSuite(),
+                ),
+                patch("difix3d_selective.evaluate.expected_test_count", return_value=1),
+            ):
+                run(args)
+
+            state = json.loads((output_dir / "state.json").read_text(encoding="utf-8"))
+            metrics = json.loads(
+                (output_dir / "metrics.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(state["status"], "completed")
+            self.assertEqual(state["global_step"], 123)
+            self.assertEqual(metrics["per_image_count"], 1)
+            self.assertEqual(metrics["summary"]["overall"]["macro"]["final_psnr"], 21)
+            self.assertTrue((output_dir / "per_image_metrics.csv").is_file())
+            self.assertTrue((output_dir / "summary.csv").is_file())
+            self.assertEqual(len(list((output_dir / "records").rglob("*.json"))), 1)
 
 
 class TestTrainingPolicy(unittest.TestCase):
@@ -275,9 +555,7 @@ class TestTrainingPolicy(unittest.TestCase):
         from difix3d_selective.train import gram_is_enabled, parser, trigger_schedule
 
         action = parser()
-        defaults = {
-            item.dest: item.default for item in action._actions
-        }
+        defaults = {item.dest: item.default for item in action._actions}
         self.assertEqual(defaults["max_train_steps"], 100_000)
         self.assertEqual(defaults["train_batch_size"], 4)
         self.assertEqual(defaults["learning_rate"], 5e-6)
@@ -291,14 +569,18 @@ class TestTrainingPolicy(unittest.TestCase):
         self.assertFalse(gram_is_enabled(1.0, 1999, 2000))
         self.assertTrue(gram_is_enabled(1.0, 2000, 2000))
 
-    @unittest.skipIf(importlib.util.find_spec("diffusers") is None, "diffusers is not installed")
+    @unittest.skipIf(
+        importlib.util.find_spec("diffusers") is None, "diffusers is not installed"
+    )
     def test_linear_scheduler_warmup_and_decay(self):
         from diffusers.optimization import get_scheduler
 
         parameter = torch.nn.Parameter(torch.tensor(0.0))
         optimizer = torch.optim.AdamW([parameter], lr=5e-6)
         scheduler = get_scheduler(
-            "linear", optimizer=optimizer, num_warmup_steps=500,
+            "linear",
+            optimizer=optimizer,
+            num_warmup_steps=500,
             num_training_steps=100_000,
         )
         values = [optimizer.param_groups[0]["lr"]]
@@ -333,14 +615,14 @@ class TestTrainingPolicy(unittest.TestCase):
         }
         with (
             patch.object(dacg_model.torch, "load", return_value=checkpoint),
-            patch.object(dacg_model, "build_model", return_value=torch.nn.Conv2d(3, 3, 1)),
+            patch.object(
+                dacg_model, "build_model", return_value=torch.nn.Conv2d(3, 3, 1)
+            ),
         ):
             loaded, loaded_checkpoint = dacg_model.load_network(
                 "final.pth", torch.device("cpu")
             )
-        self.assertEqual(
-            loaded_checkpoint["config"]["model"]["model_name"], "DACG_IR"
-        )
+        self.assertEqual(loaded_checkpoint["config"]["model"]["model_name"], "DACG_IR")
         for key, value in tiny.state_dict().items():
             self.assertTrue(torch.equal(loaded.state_dict()[key], value))
 

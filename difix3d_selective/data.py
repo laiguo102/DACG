@@ -60,4 +60,10 @@ class SelectiveDifixDataset(torch.utils.data.Dataset):
             "input_ids": input_ids,
             "prompt": record["prompt"],
             "sample_id": record["id"],
+            "split": record.get("split", ""),
+            "scene_id": str(record.get("scene_id", "")),
+            "pair_id": int(record.get("pair_id", -1)),
+            "pair": record.get("pair", ""),
+            "remove": record.get("remove", ""),
+            "preserve": record.get("preserve", ""),
         }
