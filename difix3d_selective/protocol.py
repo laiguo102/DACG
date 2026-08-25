@@ -26,12 +26,26 @@ PAIR_FOLDERS = {
     5: "haze_snow",
 }
 
+TRIPLE_FOLDERS = {
+    1: "low_haze_rain",
+    2: "low_haze_snow",
+}
+
 
 @dataclass(frozen=True)
 class DirectedTask:
     pair_id: int
     pair: str
     remove: str
+    preserve: str
+    prompt: str
+
+
+@dataclass(frozen=True)
+class TripleTask:
+    triple_id: int
+    triple: str
+    remove: tuple[str, str]
     preserve: str
     prompt: str
 
@@ -62,6 +76,39 @@ def directed_tasks(pair_id: int) -> tuple[DirectedTask, DirectedTask]:
     )
 
 
+def selected_triples(
+    triple_ids: list[int] | tuple[int, ...],
+) -> list[tuple[int, str]]:
+    if not triple_ids:
+        raise ValueError("At least one triple-degradation combination must be selected")
+    if len(set(triple_ids)) != len(triple_ids):
+        raise ValueError("Duplicate triple-degradation IDs are not allowed")
+    unknown = sorted(set(triple_ids) - set(TRIPLE_FOLDERS))
+    if unknown:
+        raise ValueError(f"Unknown triple-degradation IDs: {unknown}")
+    return [(triple_id, TRIPLE_FOLDERS[triple_id]) for triple_id in triple_ids]
+
+
+def triple_tasks(
+    triple_id: int, prompt_template: str = "preserve-first"
+) -> tuple[TripleTask, TripleTask, TripleTask]:
+    triple = TRIPLE_FOLDERS[triple_id]
+    degradations = tuple(triple.split("_"))
+    if prompt_template not in ("preserve-first", "remove-first"):
+        raise ValueError(f"Unknown triple prompt template: {prompt_template}")
+    tasks = []
+    for preserve in degradations:
+        remove = tuple(value for value in degradations if value != preserve)
+        remove_text = " and ".join(PROMPT_NAMES[value] for value in remove)
+        preserve_text = PROMPT_NAMES[preserve]
+        if prompt_template == "preserve-first":
+            prompt = f"preserve {preserve_text}, remove {remove_text}"
+        else:
+            prompt = f"remove {remove_text}, preserve {preserve_text}"
+        tasks.append(TripleTask(triple_id, triple, remove, preserve, prompt))
+    return tuple(tasks)
+
+
 def make_scene_split(scene_ids: list[str]) -> dict[str, list[str]]:
     if len(scene_ids) != NUM_SCENES or len(set(scene_ids)) != NUM_SCENES:
         raise ValueError(f"CDD11 train must contain {NUM_SCENES} unique scenes")
@@ -86,3 +133,9 @@ def expected_test_count(pair_ids: list[int] | tuple[int, ...]) -> int:
     """Return the number of directed samples in the official CDD11 test split."""
 
     return NUM_TEST_SCENES * len(selected_pairs(pair_ids)) * 2
+
+
+def expected_triple_test_count(triple_ids: list[int] | tuple[int, ...]) -> int:
+    """Return the number of selective tasks in the CDD11 triple OOD test."""
+
+    return NUM_TEST_SCENES * len(selected_triples(triple_ids)) * 3

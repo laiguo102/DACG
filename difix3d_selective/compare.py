@@ -184,9 +184,12 @@ def summarize_comparison(
     *,
     resamples: int,
     seed: int,
+    combination_group: str = "pair",
 ) -> list[dict[str, str | float | int]]:
     if resamples < 100:
         raise ValueError("--bootstrap-resamples must be at least 100")
+    if combination_group not in ("pair", "triple"):
+        raise ValueError(f"Unknown combination group: {combination_group}")
     rng = np.random.default_rng(seed)
     by_task: dict[str, list[dict[str, str | float | int]]] = defaultdict(list)
     by_pair: dict[str, list[dict[str, str | float | int]]] = defaultdict(list)
@@ -209,7 +212,7 @@ def summarize_comparison(
         result.extend(
             _summarize_group(
                 by_pair[condition],
-                group="pair",
+                group=combination_group,
                 condition=condition,
                 resamples=resamples,
                 rng=rng,
@@ -255,6 +258,17 @@ def run(args: argparse.Namespace) -> None:
     trained_step = int(trained_metrics["metadata"].get("global_step", 0))
     if trained_step <= 0:
         raise ValueError("The trained result must have global_step > 0")
+    trained_family = trained_metrics["metadata"].get("task_family", "pair")
+    initialization_family = initialization_metrics["metadata"].get(
+        "task_family", "pair"
+    )
+    if trained_family != initialization_family:
+        raise ValueError(
+            "The trained and initialization results use different task families: "
+            f"{trained_family!r} != {initialization_family!r}"
+        )
+    if trained_family not in ("pair", "triple"):
+        raise ValueError(f"Unsupported task family: {trained_family}")
     paired = paired_rows(
         _read_csv(trained_dir / "per_image_metrics.csv"),
         _read_csv(initialization_dir / "per_image_metrics.csv"),
@@ -263,12 +277,18 @@ def run(args: argparse.Namespace) -> None:
         paired,
         resamples=args.bootstrap_resamples,
         seed=args.bootstrap_seed,
+        combination_group=trained_family,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_csv(output_dir / "per_image_comparison.csv", paired)
     _write_csv(output_dir / "summary.csv", summary)
     payload = {
-        "protocol": "cdd11-selective-difix-trained-vs-initialization-v1",
+        "protocol": (
+            "cdd11-selective-difix-triple-trained-vs-initialization-v1"
+            if trained_family == "triple"
+            else "cdd11-selective-difix-trained-vs-initialization-v1"
+        ),
+        "task_family": trained_family,
         "trained_dir": str(trained_dir),
         "initialization_dir": str(initialization_dir),
         "trained_global_step": trained_step,

@@ -280,6 +280,12 @@ pair-level summaries. It also supports a deterministic `--model-source initializ
 baseline that reconstructs the seed-matched step-0 model without loading a checkpoint;
 `compare_cdd11_difix.py` performs paired trained-vs-initialization comparisons with
 scene-cluster bootstrap confidence intervals.
+The same frozen double-degradation checkpoint can be evaluated out of distribution on
+CDD11's `low_haze_rain` and `low_haze_snow` test images with
+`prepare_cdd11_triple_coarse.py` and `--triple-combinations 1 2`. This produces 1200
+single-preservation tasks using the primary prompt template
+`preserve A, remove B and C`; an optional remove-first template and the step-0 paired
+baseline are available as controlled comparisons.
 
 This component incorporates NVIDIA Difix3D under its non-commercial license; see
 [`difix3d_selective/LICENSE_DIFIX3D.txt`](difix3d_selective/LICENSE_DIFIX3D.txt).

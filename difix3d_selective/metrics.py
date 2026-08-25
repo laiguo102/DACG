@@ -10,7 +10,6 @@ import torch
 
 from cdd11_full.metrics import rgb_psnr, rgb_ssim
 
-
 STAGES = ("degraded", "coarse", "final")
 QUALITY_METRICS = ("psnr", "ssim", "lpips_vgg", "dists")
 LOWER_IS_BETTER = frozenset(("lpips_vgg", "dists"))
@@ -129,11 +128,15 @@ def summarize_group(rows: list[dict]) -> dict[str, float | int]:
     return result
 
 
-def summarize_test_rows(rows: list[dict]) -> dict[str, dict]:
-    """Summarize by directed task, degradation pair, micro, and task macro."""
+def summarize_test_rows(
+    rows: list[dict], combination_group: str = "pair"
+) -> dict[str, dict]:
+    """Summarize by task, degradation combination, micro, and task macro."""
 
     if not rows:
         raise ValueError("Cannot summarize an empty selective-Difix test")
+    if combination_group not in ("pair", "triple"):
+        raise ValueError(f"Unknown combination group: {combination_group}")
     by_task: dict[str, list[dict]] = defaultdict(list)
     by_pair: dict[str, list[dict]] = defaultdict(list)
     for row in rows:
@@ -149,15 +152,23 @@ def summarize_test_rows(rows: list[dict]) -> dict[str, dict]:
         macro[field] = math.fsum(float(value[field]) for value in tasks.values()) / len(
             tasks
         )
-    return {"overall": {"micro": micro, "macro": macro}, "pairs": pairs, "tasks": tasks}
+    combination_key = "pairs" if combination_group == "pair" else "triples"
+    return {
+        "overall": {"micro": micro, "macro": macro},
+        combination_key: pairs,
+        "tasks": tasks,
+        "combination_group": combination_group,
+    }
 
 
 def summary_csv_rows(summary: dict[str, dict]) -> list[dict]:
     rows = []
     for condition, values in summary["tasks"].items():
         rows.append({"group": "directed_task", "condition": condition, **values})
-    for condition, values in summary["pairs"].items():
-        rows.append({"group": "pair", "condition": condition, **values})
+    combination_group = summary.get("combination_group", "pair")
+    combination_key = "pairs" if combination_group == "pair" else "triples"
+    for condition, values in summary[combination_key].items():
+        rows.append({"group": combination_group, "condition": condition, **values})
     for condition, values in summary["overall"].items():
         rows.append({"group": "overall", "condition": condition, **values})
     return rows

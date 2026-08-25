@@ -16,6 +16,7 @@ from difix3d_selective.evaluate import _resolve_device
 from difix3d_selective.loss import gram_matrix
 from difix3d_selective.main_view import select_main_view, select_main_view_skips
 from difix3d_selective.prepare import (
+    prepare_selective_triple_test_manifest,
     prepare_selective_manifests,
     prepare_selective_test_manifest,
     tiled_forward,
@@ -26,8 +27,11 @@ from difix3d_selective.protocol import (
     directed_tasks,
     expected_counts,
     expected_test_count,
+    expected_triple_test_count,
     make_scene_split,
     selected_pairs,
+    selected_triples,
+    triple_tasks,
 )
 
 
@@ -69,6 +73,27 @@ class TestSelectiveProtocol(unittest.TestCase):
             {"coarse": 3549, "train": 6390, "validation": 708},
         )
         self.assertEqual(expected_test_count([1, 3, 5]), 1200)
+
+    def test_triple_ood_tasks_and_prompt_templates(self):
+        self.assertEqual(
+            selected_triples([1, 2]),
+            [(1, "low_haze_rain"), (2, "low_haze_snow")],
+        )
+        preserve_first = triple_tasks(1, "preserve-first")
+        self.assertEqual(len(preserve_first), 3)
+        self.assertEqual(
+            preserve_first[0].prompt,
+            "preserve low light, remove haze and rain",
+        )
+        self.assertEqual(
+            preserve_first[1].prompt,
+            "preserve haze, remove low light and rain",
+        )
+        self.assertEqual(
+            triple_tasks(2, "remove-first")[2].prompt,
+            "remove low light and haze, preserve snow",
+        )
+        self.assertEqual(expected_triple_test_count([1, 2]), 1200)
 
 
 class TestTrainedInitializationComparison(unittest.TestCase):
@@ -121,6 +146,15 @@ class TestTrainedInitializationComparison(unittest.TestCase):
         overall = {row["metric"]: row for row in summary if row["group"] == "overall"}
         self.assertEqual(overall["psnr"]["conclusion"], "trained_better")
         self.assertGreater(overall["lpips_vgg"]["ci95_low"], 0)
+
+        triple_summary = summarize_comparison(
+            paired_rows(trained, initialization),
+            resamples=100,
+            seed=42,
+            combination_group="triple",
+        )
+        self.assertTrue(any(row["group"] == "triple" for row in triple_summary))
+        self.assertFalse(any(row["group"] == "pair" for row in triple_summary))
 
 
 class TestMainViewSelection(unittest.TestCase):
@@ -431,6 +465,54 @@ class TestDatasetAndPreparation(unittest.TestCase):
                     pair_ids=[1],
                 )
 
+    def test_triple_test_manifest_builds_three_preservation_tasks(self):
+        root = Path.cwd().resolve()
+        data_root = root / "fake-cdd11"
+        coarse_root = root / "fake-triple-coarse"
+        output_dir = root / "fake-triple-output"
+        scene_ids = ("000001", "000002")
+        written = {}
+
+        def fake_index_images(path):
+            path = Path(path)
+            suffix = ".png" if path.parent == coarse_root else ".jpg"
+            return {scene: path / f"{scene}{suffix}" for scene in scene_ids}
+
+        def capture_jsonl(path, records):
+            written[Path(path).name] = records
+
+        with (
+            patch(
+                "difix3d_selective.prepare.index_images", side_effect=fake_index_images
+            ),
+            patch("difix3d_selective.prepare._write_jsonl", side_effect=capture_jsonl),
+            patch("difix3d_selective.prepare.NUM_TEST_SCENES", 2),
+        ):
+            result = prepare_selective_triple_test_manifest(
+                data_root=data_root,
+                coarse_root=coarse_root,
+                output_dir=output_dir,
+                triple_ids=[1],
+                prompt_template="preserve-first",
+                require_coarse_metadata=False,
+            )
+
+        records = written["manifest.jsonl"]
+        self.assertEqual(result["test_samples"], 6)
+        self.assertEqual({record["task_family"] for record in records}, {"triple"})
+        self.assertEqual(
+            {record["prompt"] for record in records},
+            {
+                "preserve low light, remove haze and rain",
+                "preserve haze, remove low light and rain",
+                "preserve rain, remove low light and haze",
+            },
+        )
+        self.assertEqual(
+            {Path(record["target_image"]).parent.name for record in records},
+            {"low", "haze", "rain"},
+        )
+
 
 class TestSelectiveTestMetrics(unittest.TestCase):
     def test_perceptual_metrics_compare_final_to_coarse_with_positive_gain(self):
@@ -478,6 +560,11 @@ class TestSelectiveTestMetrics(unittest.TestCase):
             summary["overall"]["macro"]["improvement_lpips_vgg"],
             flattened["improvement_lpips_vgg"],
         )
+        triple_summary = summarize_test_rows(rows, combination_group="triple")
+        self.assertIn("triples", triple_summary)
+        self.assertNotIn("pairs", triple_summary)
+        with self.assertRaises(ValueError):
+            summarize_test_rows(rows, combination_group="quadruple")
 
     @unittest.skipIf(
         importlib.util.find_spec("torchvision") is None, "torchvision is not installed"

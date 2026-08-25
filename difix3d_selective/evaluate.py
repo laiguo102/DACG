@@ -23,7 +23,12 @@ from .metrics import (
     summarize_test_rows,
     summary_csv_rows,
 )
-from .protocol import expected_test_count, selected_pairs
+from .protocol import (
+    expected_test_count,
+    expected_triple_test_count,
+    selected_pairs,
+    selected_triples,
+)
 
 
 def _now() -> str:
@@ -161,28 +166,46 @@ def run(args: argparse.Namespace) -> None:
 
     from .data import SelectiveDifixDataset
     from .model import SelectiveDifix, load_model_checkpoint
-    from .prepare import prepare_selective_test_manifest
+    from .prepare import (
+        prepare_selective_test_manifest,
+        prepare_selective_triple_test_manifest,
+    )
     from .validation import comparison_image, stratified_indices
 
     model_source = getattr(args, "model_source", "trained")
+    triple_ids = getattr(args, "triple_combinations", None)
+    triple_mode = triple_ids is not None
+    prompt_template = getattr(args, "triple_prompt_template", "preserve-first")
     checkpoint = args.checkpoint.resolve() if args.checkpoint is not None else None
     if model_source == "trained":
         if checkpoint is None:
             raise ValueError("--checkpoint is required for --model-source trained")
         if not checkpoint.is_file():
             raise FileNotFoundError(checkpoint)
-        pair_ids = _infer_pair_ids(checkpoint, args.degradation_pairs)
-        default_output_dir = checkpoint.parent.parent / f"test_{checkpoint.stem}"
+        if triple_mode:
+            selection_ids = [triple_id for triple_id, _ in selected_triples(triple_ids)]
+            default_output_dir = (
+                checkpoint.parent.parent
+                / f"test_triple_{prompt_template}_{checkpoint.stem}"
+            )
+        else:
+            selection_ids = _infer_pair_ids(checkpoint, args.degradation_pairs)
+            default_output_dir = checkpoint.parent.parent / f"test_{checkpoint.stem}"
     else:
         if checkpoint is not None:
             raise ValueError(
                 "Do not pass --checkpoint with --model-source initialization"
             )
-        if not args.degradation_pairs:
-            raise ValueError(
-                "--degradation-pairs is required for initialization evaluation"
-            )
-        pair_ids = [pair_id for pair_id, _ in selected_pairs(args.degradation_pairs)]
+        if triple_mode:
+            selection_ids = [triple_id for triple_id, _ in selected_triples(triple_ids)]
+        else:
+            if not args.degradation_pairs:
+                raise ValueError(
+                    "--degradation-pairs is required for initialization evaluation"
+                )
+            selection_ids = [
+                pair_id for pair_id, _ in selected_pairs(args.degradation_pairs)
+            ]
         if args.output_dir is None:
             raise ValueError("--output-dir is required for initialization evaluation")
         default_output_dir = args.output_dir
@@ -193,14 +216,25 @@ def run(args: argparse.Namespace) -> None:
         )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    prepared = prepare_selective_test_manifest(
-        data_root=args.data_root,
-        coarse_root=args.test_coarse_root,
-        output_dir=output_dir,
-        pair_ids=pair_ids,
-        require_coarse_metadata=not args.allow_unverified_test_coarse,
-    )
-    total = expected_test_count(pair_ids)
+    if triple_mode:
+        prepared = prepare_selective_triple_test_manifest(
+            data_root=args.data_root,
+            coarse_root=args.test_coarse_root,
+            output_dir=output_dir,
+            triple_ids=selection_ids,
+            prompt_template=prompt_template,
+            require_coarse_metadata=not args.allow_unverified_test_coarse,
+        )
+        total = expected_triple_test_count(selection_ids)
+    else:
+        prepared = prepare_selective_test_manifest(
+            data_root=args.data_root,
+            coarse_root=args.test_coarse_root,
+            output_dir=output_dir,
+            pair_ids=selection_ids,
+            require_coarse_metadata=not args.allow_unverified_test_coarse,
+        )
+        total = expected_test_count(selection_ids)
     if prepared["test_samples"] != total:
         raise RuntimeError(
             f"Expected {total} directed test samples, got {prepared['test_samples']}"
@@ -210,7 +244,6 @@ def run(args: argparse.Namespace) -> None:
         "data_root": str(args.data_root.resolve()),
         "test_coarse_root": str(args.test_coarse_root.resolve()),
         "test_manifest_sha256": _file_sha256(prepared["manifest"]),
-        "degradation_pairs": pair_ids,
         "resolution": args.resolution,
         "lora_rank_vae": args.lora_rank_vae,
         "timestep": args.timestep,
@@ -224,6 +257,16 @@ def run(args: argparse.Namespace) -> None:
         "save_predictions": args.save_predictions,
         "coarse_metadata_verified": prepared["coarse_metadata_verified"],
     }
+    if triple_mode:
+        config.update(
+            {
+                "task_family": "triple",
+                "triple_combinations": selection_ids,
+                "triple_prompt_template": prompt_template,
+            }
+        )
+    else:
+        config["degradation_pairs"] = selection_ids
     if model_source == "trained":
         config["checkpoint"] = _checkpoint_identity(checkpoint)
     else:
@@ -378,6 +421,13 @@ def run(args: argparse.Namespace) -> None:
             "prediction_path": prediction_path,
             "gallery_path": gallery_path,
         }
+        if triple_mode:
+            row.update(
+                {
+                    "task_family": "triple",
+                    "prompt_template": prompt_template,
+                }
+            )
         _atomic_json(_record_path(records_dir, row), row)
         partial_rows[sample_id] = row
         progress.update(1)
@@ -392,9 +442,16 @@ def run(args: argparse.Namespace) -> None:
         missing = sorted(expected_ids - set(partial_rows))
         raise RuntimeError(f"Test is incomplete; missing {len(missing)} samples")
     rows = [partial_rows[record["id"]] for record in dataset.records]
-    summary = summarize_test_rows(rows)
+    summary = summarize_test_rows(
+        rows, combination_group="triple" if triple_mode else "pair"
+    )
     metadata = {
-        "protocol": "cdd11-selective-difix-test-v1",
+        "protocol": (
+            "cdd11-selective-difix-triple-ood-test-v1"
+            if triple_mode
+            else "cdd11-selective-difix-test-v1"
+        ),
+        "task_family": "triple" if triple_mode else "pair",
         "model_source": model_source,
         "global_step": global_step,
         "created_at_utc": _now(),
@@ -405,7 +462,11 @@ def run(args: argparse.Namespace) -> None:
         },
         "primary_reference": "single-degradation target to be preserved",
         "baselines": {
-            "degraded": "original double-degradation input",
+            "degraded": (
+                "original triple-degradation input"
+                if triple_mode
+                else "original double-degradation input"
+            ),
             "coarse": "DACG preliminary restoration",
             "final": (
                 "trained selective Difix output"
@@ -466,7 +527,8 @@ def run(args: argparse.Namespace) -> None:
         {"metadata": metadata, "summary": summary, "per_image_count": len(rows)},
     )
     print(
-        f"Completed {total} {model_source} samples at step {global_step}. "
+        f"Completed {total} {model_source} "
+        f"{'triple' if triple_mode else 'pair'} samples at step {global_step}. "
         f"PSNR={macro['final_psnr']:.4f}, SSIM={macro['final_ssim']:.6f}, "
         f"LPIPS-VGG={macro['final_lpips_vgg']:.6f}, "
         f"DISTS={macro['final_dists']:.6f}. Results: {output_dir}",
@@ -483,7 +545,16 @@ def parser() -> argparse.ArgumentParser:
     )
     value.add_argument("--checkpoint", type=Path)
     value.add_argument("--output-dir", type=Path)
-    value.add_argument("--degradation-pairs", nargs="+", type=int, choices=range(1, 6))
+    selection = value.add_mutually_exclusive_group()
+    selection.add_argument(
+        "--degradation-pairs", nargs="+", type=int, choices=range(1, 6)
+    )
+    selection.add_argument("--triple-combinations", nargs="+", type=int, choices=(1, 2))
+    value.add_argument(
+        "--triple-prompt-template",
+        choices=("preserve-first", "remove-first"),
+        default="preserve-first",
+    )
     value.add_argument("--resolution", type=int, default=512)
     value.add_argument("--lora-rank-vae", type=int, default=4)
     value.add_argument("--timestep", type=int, default=199)

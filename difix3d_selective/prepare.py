@@ -17,6 +17,8 @@ from .protocol import (
     directed_tasks,
     make_scene_split,
     selected_pairs,
+    selected_triples,
+    triple_tasks,
 )
 
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
@@ -237,6 +239,129 @@ def generate_cdd11_coarse(
     }
 
 
+def generate_cdd11_triple_test_coarse(
+    *,
+    data_root: str | Path,
+    dacg_checkpoint: str | Path,
+    coarse_root: str | Path,
+    triple_ids: list[int],
+    device: torch.device,
+    tile_size: int = 0,
+    tile_overlap: int = 64,
+) -> dict[str, Path | int]:
+    """Generate DACG coarse images for the CDD11 triple-degradation test set."""
+
+    data_root = Path(data_root).resolve()
+    coarse_root = Path(coarse_root).resolve()
+    test_root = data_root / "test"
+    triples = selected_triples(triple_ids)
+    clear = index_images(test_root / "clear")
+    if len(clear) != NUM_TEST_SCENES:
+        raise ValueError(
+            f"CDD11 test must contain {NUM_TEST_SCENES} clear scenes, got {len(clear)}"
+        )
+    all_scene_ids = set(clear)
+    source_images: dict[str, dict[str, Path]] = {}
+    for _, triple in triples:
+        source_images[triple] = index_images(test_root / triple)
+        if set(source_images[triple]) != all_scene_ids:
+            raise ValueError(f"CDD11 scene mismatch in test/{triple}")
+
+    metadata_path = coarse_root / "coarse_preparation.json"
+    metadata_triples = {triple_id: triple for triple_id, triple in triples}
+    checkpoint_path = Path(dacg_checkpoint).resolve()
+    if metadata_path.is_file():
+        existing = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if existing.get("task_family") != "triple" or existing.get("split") != "test":
+            raise ValueError(
+                f"{coarse_root} is not a CDD11 triple-test coarse directory"
+            )
+        if Path(existing.get("data_root", "")).resolve() != data_root:
+            raise ValueError(
+                f"{coarse_root} was prepared from {existing.get('data_root')}, "
+                f"not {data_root}"
+            )
+        if Path(existing.get("dacg_checkpoint", "")).resolve() != checkpoint_path:
+            raise ValueError(
+                f"{coarse_root} was prepared with a different DACG checkpoint"
+            )
+        for value in existing.get("triple_combinations", []):
+            metadata_triples[int(value["id"])] = str(value["name"])
+    elif any(
+        (coarse_root / triple).is_dir() and any((coarse_root / triple).iterdir())
+        for _, triple in triples
+    ):
+        raise ValueError(
+            "Refusing to label existing unverified files as triple-test coarse images; "
+            "use a new --coarse-root"
+        )
+
+    jobs: list[tuple[Path, Path]] = []
+    for _, triple in triples:
+        for scene_id, source in source_images[triple].items():
+            output = coarse_root / triple / f"{scene_id}.png"
+            if not output.is_file():
+                jobs.append((source, output))
+
+    info = {
+        "status": "preparing" if jobs else "completed",
+        "task_family": "triple",
+        "split": "test",
+        "data_root": str(data_root),
+        "dacg_checkpoint": str(checkpoint_path),
+        "coarse_root": str(coarse_root),
+        "triple_combinations": [
+            {"id": triple_id, "name": metadata_triples[triple_id]}
+            for triple_id in sorted(metadata_triples)
+        ],
+        "coarse_images": len(clear) * len(metadata_triples),
+    }
+    coarse_root.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(
+        json.dumps(info, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+
+    if jobs:
+        model, checkpoint = load_dacg_checkpoint(checkpoint_path, device)
+        del checkpoint
+        with torch.inference_mode():
+            for source, output in tqdm(jobs, desc="Generating triple-test DACG coarse"):
+                prediction = tiled_forward(
+                    model,
+                    image_tensor(source).to(device, non_blocking=True),
+                    tile_size,
+                    tile_overlap,
+                )[0]
+                save_tensor(prediction, output)
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    incomplete = []
+    for triple in metadata_triples.values():
+        directory = coarse_root / triple
+        if not directory.is_dir() or set(index_images(directory)) != all_scene_ids:
+            incomplete.append(triple)
+    if incomplete:
+        info["status"] = "preparing"
+        metadata_path.write_text(
+            json.dumps(info, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        raise RuntimeError(
+            "Triple coarse preparation remains incomplete for: "
+            + ", ".join(sorted(incomplete))
+        )
+
+    info["status"] = "completed"
+    metadata_path.write_text(
+        json.dumps(info, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    return {
+        "coarse_root": coarse_root,
+        "coarse_images": len(clear) * len(metadata_triples),
+    }
+
+
 def prepare_selective_manifests(
     *,
     data_root: str | Path,
@@ -405,6 +530,112 @@ def prepare_selective_test_manifest(
                         "prompt": task.prompt,
                         "image": str(coarse_images[pair][scene_id].resolve()),
                         "ref_image": str(source_images[pair][scene_id].resolve()),
+                        "target_image": str(
+                            target_images[task.preserve][scene_id].resolve()
+                        ),
+                        "clear_image": str(clear[scene_id].resolve()),
+                    }
+                )
+
+    manifest = output_dir / "manifest.jsonl"
+    _write_jsonl(manifest, records)
+    return {
+        "manifest": manifest,
+        "test_scenes": len(clear),
+        "test_samples": len(records),
+        "coarse_metadata_verified": require_coarse_metadata,
+    }
+
+
+def prepare_selective_triple_test_manifest(
+    *,
+    data_root: str | Path,
+    coarse_root: str | Path,
+    output_dir: str | Path,
+    triple_ids: list[int],
+    prompt_template: str = "preserve-first",
+    require_coarse_metadata: bool = True,
+) -> dict[str, Path | int | bool]:
+    """Build three-way selective-restoration records from CDD11/test."""
+
+    data_root = Path(data_root).resolve()
+    coarse_root = Path(coarse_root).resolve()
+    output_dir = Path(output_dir).resolve()
+    test_root = data_root / "test"
+    triples = selected_triples(triple_ids)
+
+    metadata_path = coarse_root / "coarse_preparation.json"
+    if require_coarse_metadata:
+        if not metadata_path.is_file():
+            raise FileNotFoundError(
+                f"Missing {metadata_path}. Generate triple test coarse images first."
+            )
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if (
+            metadata.get("task_family") != "triple"
+            or metadata.get("split") != "test"
+            or metadata.get("status") != "completed"
+        ):
+            raise ValueError(f"Invalid triple-test coarse metadata in {metadata_path}")
+        if Path(metadata.get("data_root", "")).resolve() != data_root:
+            raise ValueError(
+                f"Triple coarse metadata was prepared from "
+                f"{metadata.get('data_root')}, not {data_root}"
+            )
+        prepared_ids = {
+            int(value["id"]) for value in metadata.get("triple_combinations", [])
+        }
+        missing = sorted(set(triple_ids) - prepared_ids)
+        if missing:
+            raise ValueError(
+                f"Triple coarse metadata is missing combination IDs: {missing}"
+            )
+
+    clear = index_images(test_root / "clear")
+    if len(clear) != NUM_TEST_SCENES:
+        raise ValueError(
+            f"CDD11 test must contain {NUM_TEST_SCENES} clear scenes, got {len(clear)}"
+        )
+    all_scene_ids = set(clear)
+    source_images: dict[str, dict[str, Path]] = {}
+    coarse_images: dict[str, dict[str, Path]] = {}
+    target_images: dict[str, dict[str, Path]] = {}
+    for _, triple in triples:
+        source_images[triple] = index_images(test_root / triple)
+        coarse_images[triple] = index_images(coarse_root / triple)
+        if set(source_images[triple]) != all_scene_ids:
+            raise ValueError(f"CDD11 scene mismatch in test/{triple}")
+        if set(coarse_images[triple]) != all_scene_ids:
+            raise ValueError(
+                f"CDD11 triple coarse scene mismatch in {coarse_root / triple}"
+            )
+    for degradation in PROMPT_NAMES:
+        target_images[degradation] = index_images(test_root / degradation)
+        if set(target_images[degradation]) != all_scene_ids:
+            raise ValueError(f"CDD11 scene mismatch in test/{degradation}")
+
+    records: list[dict] = []
+    for triple_id, triple in triples:
+        for scene_id in sorted(all_scene_ids):
+            for task in triple_tasks(triple_id, prompt_template):
+                remove_label = "+".join(task.remove)
+                records.append(
+                    {
+                        "id": (
+                            f"test-triple/{prompt_template}/{triple}/{scene_id}/"
+                            f"preserve-{task.preserve}-remove-{remove_label}"
+                        ),
+                        "split": "test",
+                        "task_family": "triple",
+                        "prompt_template": prompt_template,
+                        "scene_id": scene_id,
+                        "pair_id": triple_id,
+                        "pair": triple,
+                        "remove": remove_label,
+                        "preserve": task.preserve,
+                        "prompt": task.prompt,
+                        "image": str(coarse_images[triple][scene_id].resolve()),
+                        "ref_image": str(source_images[triple][scene_id].resolve()),
                         "target_image": str(
                             target_images[task.preserve][scene_id].resolve()
                         ),

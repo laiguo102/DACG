@@ -344,3 +344,81 @@ python -u compare_cdd11_difix.py \
 若已有可信的 test coarse 但没有元数据，可显式传
 `--allow-unverified-test-coarse`；这会在结果配置中标记
 `coarse_metadata_verified=false`，不建议用于正式报告。
+
+### 8.4 双退化训练权重的三退化 OOD 测试
+
+CDD11 官方 test 还包含两种三退化组合：
+
+| ID | 目录 | 三个选择性任务示例 |
+|---:|---|---|
+| 1 | `low_haze_rain` | `preserve low light, remove haze and rain` |
+| 2 | `low_haze_snow` | `preserve snow, remove low light and haze` |
+
+该实验不修改或继续训练模型。每张三退化输入分别选择一个退化 `A` 保留，并以对应的
+单退化图作为参考目标；另外两个退化 `B、C` 同时移除。因此共有
+`200 scenes × 2 triples × 3 preservation tasks = 1200` 个样本。
+
+先用与双退化训练 coarse **完全相同**的 DACG checkpoint 生成 400 张三退化 coarse：
+
+```bash
+python -u prepare_cdd11_triple_coarse.py \
+  --data-root /path/to/CDD11 \
+  --dacg-checkpoint /path/to/cdd11-full-run/checkpoints/best_macro_psnr.pth \
+  --coarse-root /path/to/CDD11-DACG-coarse-test-triple \
+  --triple-combinations 1 2 \
+  --device cuda
+```
+
+再评估已经训练好的选择性 DiFix。主实验固定采用 `preserve A, remove B and C`：
+
+```bash
+python -u evaluate_cdd11_difix.py \
+  --data-root /path/to/CDD11 \
+  --test-coarse-root /path/to/CDD11-DACG-coarse-test-triple \
+  --checkpoint /path/to/difix-selective-run/checkpoints/best_psnr.pkl \
+  --output-dir /path/to/difix-selective-run/test_triple_preserve_first \
+  --triple-combinations 1 2 \
+  --triple-prompt-template preserve-first \
+  --resolution 512 \
+  --workers 4 \
+  --mixed-precision bf16 \
+  --seed 42 \
+  --enable-xformers-memory-efficient-attention
+```
+
+输出指标和断点续跑机制与 8.2 相同；`summary.csv` 分为 6 个选择性任务、2 个 triple、
+micro 和 task-macro。正式结论优先看 task-macro，并同时报告 `final` 相对 `coarse` 的
+提升和胜率。`final` 优于 `coarse` 说明选择性 DiFix 在 DACG 之后仍有增益；它并不
+等同于证明整个 DACG+DiFix 流水线都未见过三退化数据：如果 DACG 按 CDD11 全 11 类
+训练，三退化只对选择性 DiFix 阶段是 OOD。
+
+若要继续验证“训练本身”是否在三退化上产生收益，以完全相同的三退化输入和 prompt
+运行 seed-matched step-0 基线：
+
+```bash
+python -u evaluate_cdd11_difix.py \
+  --model-source initialization \
+  --data-root /path/to/CDD11 \
+  --test-coarse-root /path/to/CDD11-DACG-coarse-test-triple \
+  --output-dir /path/to/difix-selective-run/test_triple_initialization_seed42 \
+  --triple-combinations 1 2 \
+  --triple-prompt-template preserve-first \
+  --resolution 512 \
+  --workers 4 \
+  --mixed-precision bf16 \
+  --seed 42 \
+  --enable-xformers-memory-efficient-attention
+
+python -u compare_cdd11_difix.py \
+  --trained-dir /path/to/difix-selective-run/test_triple_preserve_first \
+  --initialization-dir /path/to/difix-selective-run/test_triple_initialization_seed42 \
+  --output-dir /path/to/difix-selective-run/compare_triple_trained_vs_initialization
+```
+
+这里最有力的训练有效性证据是：`trained_advantage` 的 scene-cluster bootstrap 95% CI
+下界大于 0，同时训练输出相对 DACG coarse 的 `improvement_*` 也为正。
+
+可选的提示词对照只需换一个全新的输出目录，并增加
+`--triple-prompt-template remove-first`。它生成训练格式更接近的
+`remove B and C, preserve A`，用于区分三元组合 OOD 与提示词顺序变化；不要在看到
+test 结果后选择表现更好的模板作为唯一主结果。
