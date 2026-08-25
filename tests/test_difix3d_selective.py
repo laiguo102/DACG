@@ -31,6 +31,7 @@ from difix3d_selective.protocol import (
     make_scene_split,
     selected_pairs,
     selected_triples,
+    triple_remove_one_tasks,
     triple_tasks,
 )
 
@@ -92,6 +93,19 @@ class TestSelectiveProtocol(unittest.TestCase):
         self.assertEqual(
             triple_tasks(2, "remove-first")[2].prompt,
             "remove low light and haze, preserve snow",
+        )
+        remove_one = triple_remove_one_tasks(1, "remove-first")
+        self.assertEqual(
+            remove_one[0].prompt, "remove low light, preserve haze and rain"
+        )
+        self.assertEqual(remove_one[0].target, "haze_rain")
+        self.assertEqual(
+            remove_one[1].prompt, "remove haze, preserve low light and rain"
+        )
+        self.assertEqual(remove_one[1].target, "low_rain")
+        self.assertEqual(
+            triple_remove_one_tasks(2, "preserve-first")[2].prompt,
+            "preserve low light and haze, remove snow",
         )
         self.assertEqual(expected_triple_test_count([1, 2]), 1200)
 
@@ -511,6 +525,57 @@ class TestDatasetAndPreparation(unittest.TestCase):
         self.assertEqual(
             {Path(record["target_image"]).parent.name for record in records},
             {"low", "haze", "rain"},
+        )
+
+    def test_triple_remove_one_manifest_uses_double_degradation_targets(self):
+        root = Path.cwd().resolve()
+        data_root = root / "fake-cdd11"
+        coarse_root = root / "fake-triple-coarse"
+        output_dir = root / "fake-triple-remove-one-output"
+        scene_ids = ("000001", "000002")
+        written = {}
+
+        def fake_index_images(path):
+            path = Path(path)
+            suffix = ".png" if path.parent == coarse_root else ".jpg"
+            return {scene: path / f"{scene}{suffix}" for scene in scene_ids}
+
+        def capture_jsonl(path, records):
+            written[Path(path).name] = records
+
+        with (
+            patch(
+                "difix3d_selective.prepare.index_images", side_effect=fake_index_images
+            ),
+            patch("difix3d_selective.prepare._write_jsonl", side_effect=capture_jsonl),
+            patch("difix3d_selective.prepare.NUM_TEST_SCENES", 2),
+        ):
+            result = prepare_selective_triple_test_manifest(
+                data_root=data_root,
+                coarse_root=coarse_root,
+                output_dir=output_dir,
+                triple_ids=[1],
+                prompt_template="remove-first",
+                task_mode="remove-one",
+                require_coarse_metadata=False,
+            )
+
+        records = written["manifest.jsonl"]
+        self.assertEqual(result["test_samples"], 6)
+        self.assertEqual(
+            {record["prompt"] for record in records},
+            {
+                "remove low light, preserve haze and rain",
+                "remove haze, preserve low light and rain",
+                "remove rain, preserve low light and haze",
+            },
+        )
+        self.assertEqual(
+            {Path(record["target_image"]).parent.name for record in records},
+            {"haze_rain", "low_rain", "low_haze"},
+        )
+        self.assertEqual(
+            {record["triple_task_mode"] for record in records}, {"remove-one"}
         )
 
 

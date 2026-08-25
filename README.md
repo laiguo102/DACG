@@ -286,6 +286,9 @@ CDD11's `low_haze_rain` and `low_haze_snow` test images with
 single-preservation tasks using the primary prompt template
 `preserve A, remove B and C`; an optional remove-first template and the step-0 paired
 baseline are available as controlled comparisons.
+Triple evaluation also supports `--triple-task-mode remove-one` with
+`remove A, preserve B and C`; it reuses the same triple coarse inputs and evaluates
+against the matching CDD11 double-degradation target.
 
 This component incorporates NVIDIA Difix3D under its non-commercial license; see
 [`difix3d_selective/LICENSE_DIFIX3D.txt`](difix3d_selective/LICENSE_DIFIX3D.txt).

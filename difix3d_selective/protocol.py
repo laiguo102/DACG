@@ -50,6 +50,16 @@ class TripleTask:
     prompt: str
 
 
+@dataclass(frozen=True)
+class TripleRemoveOneTask:
+    triple_id: int
+    triple: str
+    remove: str
+    preserve: tuple[str, str]
+    target: str
+    prompt: str
+
+
 def selected_pairs(pair_ids: list[int] | tuple[int, ...]) -> list[tuple[int, str]]:
     if not pair_ids:
         raise ValueError("At least one degradation pair must be selected")
@@ -106,6 +116,40 @@ def triple_tasks(
         else:
             prompt = f"remove {remove_text}, preserve {preserve_text}"
         tasks.append(TripleTask(triple_id, triple, remove, preserve, prompt))
+    return tuple(tasks)
+
+
+def triple_remove_one_tasks(
+    triple_id: int, prompt_template: str = "remove-first"
+) -> tuple[TripleRemoveOneTask, TripleRemoveOneTask, TripleRemoveOneTask]:
+    """Remove one degradation and preserve the other two from a CDD11 triple."""
+
+    triple = TRIPLE_FOLDERS[triple_id]
+    degradations = tuple(triple.split("_"))
+    if prompt_template not in ("preserve-first", "remove-first"):
+        raise ValueError(f"Unknown triple prompt template: {prompt_template}")
+    tasks = []
+    for remove in degradations:
+        preserve = tuple(value for value in degradations if value != remove)
+        target = "_".join(preserve)
+        if target not in PAIR_FOLDERS.values():
+            raise ValueError(f"CDD11 has no double-degradation target folder: {target}")
+        remove_text = PROMPT_NAMES[remove]
+        preserve_text = " and ".join(PROMPT_NAMES[value] for value in preserve)
+        if prompt_template == "preserve-first":
+            prompt = f"preserve {preserve_text}, remove {remove_text}"
+        else:
+            prompt = f"remove {remove_text}, preserve {preserve_text}"
+        tasks.append(
+            TripleRemoveOneTask(
+                triple_id,
+                triple,
+                remove,
+                preserve,
+                target,
+                prompt,
+            )
+        )
     return tuple(tasks)
 
 

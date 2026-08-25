@@ -18,6 +18,7 @@ from .protocol import (
     make_scene_split,
     selected_pairs,
     selected_triples,
+    triple_remove_one_tasks,
     triple_tasks,
 )
 
@@ -554,6 +555,7 @@ def prepare_selective_triple_test_manifest(
     output_dir: str | Path,
     triple_ids: list[int],
     prompt_template: str = "preserve-first",
+    task_mode: str = "preserve-one",
     require_coarse_metadata: bool = True,
 ) -> dict[str, Path | int | bool]:
     """Build three-way selective-restoration records from CDD11/test."""
@@ -563,6 +565,35 @@ def prepare_selective_triple_test_manifest(
     output_dir = Path(output_dir).resolve()
     test_root = data_root / "test"
     triples = selected_triples(triple_ids)
+    if task_mode not in ("preserve-one", "remove-one"):
+        raise ValueError(f"Unknown triple task mode: {task_mode}")
+
+    task_specs: dict[int, list[dict[str, str]]] = {}
+    required_targets: set[str] = set()
+    for triple_id, _ in triples:
+        specs = []
+        if task_mode == "preserve-one":
+            for task in triple_tasks(triple_id, prompt_template):
+                specs.append(
+                    {
+                        "remove": "+".join(task.remove),
+                        "preserve": task.preserve,
+                        "prompt": task.prompt,
+                        "target": task.preserve,
+                    }
+                )
+        else:
+            for task in triple_remove_one_tasks(triple_id, prompt_template):
+                specs.append(
+                    {
+                        "remove": task.remove,
+                        "preserve": "+".join(task.preserve),
+                        "prompt": task.prompt,
+                        "target": task.target,
+                    }
+                )
+        task_specs[triple_id] = specs
+        required_targets.update(spec["target"] for spec in specs)
 
     metadata_path = coarse_root / "coarse_preparation.json"
     if require_coarse_metadata:
@@ -609,39 +640,41 @@ def prepare_selective_triple_test_manifest(
             raise ValueError(
                 f"CDD11 triple coarse scene mismatch in {coarse_root / triple}"
             )
-    for degradation in PROMPT_NAMES:
-        target_images[degradation] = index_images(test_root / degradation)
-        if set(target_images[degradation]) != all_scene_ids:
-            raise ValueError(f"CDD11 scene mismatch in test/{degradation}")
+    for target_folder in sorted(required_targets):
+        target_images[target_folder] = index_images(test_root / target_folder)
+        if set(target_images[target_folder]) != all_scene_ids:
+            raise ValueError(f"CDD11 scene mismatch in test/{target_folder}")
 
     records: list[dict] = []
     for triple_id, triple in triples:
         for scene_id in sorted(all_scene_ids):
-            for task in triple_tasks(triple_id, prompt_template):
-                remove_label = "+".join(task.remove)
-                records.append(
-                    {
-                        "id": (
-                            f"test-triple/{prompt_template}/{triple}/{scene_id}/"
-                            f"preserve-{task.preserve}-remove-{remove_label}"
-                        ),
-                        "split": "test",
-                        "task_family": "triple",
-                        "prompt_template": prompt_template,
-                        "scene_id": scene_id,
-                        "pair_id": triple_id,
-                        "pair": triple,
-                        "remove": remove_label,
-                        "preserve": task.preserve,
-                        "prompt": task.prompt,
-                        "image": str(coarse_images[triple][scene_id].resolve()),
-                        "ref_image": str(source_images[triple][scene_id].resolve()),
-                        "target_image": str(
-                            target_images[task.preserve][scene_id].resolve()
-                        ),
-                        "clear_image": str(clear[scene_id].resolve()),
-                    }
-                )
+            for task in task_specs[triple_id]:
+                mode_prefix = "" if task_mode == "preserve-one" else "remove-one/"
+                record = {
+                    "id": (
+                        f"test-triple/{mode_prefix}{prompt_template}/{triple}/"
+                        f"{scene_id}/preserve-{task['preserve']}-"
+                        f"remove-{task['remove']}"
+                    ),
+                    "split": "test",
+                    "task_family": "triple",
+                    "prompt_template": prompt_template,
+                    "scene_id": scene_id,
+                    "pair_id": triple_id,
+                    "pair": triple,
+                    "remove": task["remove"],
+                    "preserve": task["preserve"],
+                    "prompt": task["prompt"],
+                    "image": str(coarse_images[triple][scene_id].resolve()),
+                    "ref_image": str(source_images[triple][scene_id].resolve()),
+                    "target_image": str(
+                        target_images[task["target"]][scene_id].resolve()
+                    ),
+                    "clear_image": str(clear[scene_id].resolve()),
+                }
+                if task_mode == "remove-one":
+                    record["triple_task_mode"] = task_mode
+                records.append(record)
 
     manifest = output_dir / "manifest.jsonl"
     _write_jsonl(manifest, records)

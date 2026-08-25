@@ -422,3 +422,39 @@ python -u compare_cdd11_difix.py \
 `--triple-prompt-template remove-first`。它生成训练格式更接近的
 `remove B and C, preserve A`，用于区分三元组合 OOD 与提示词顺序变化；不要在看到
 test 结果后选择表现更好的模板作为唯一主结果。
+
+### 8.5 三退化输入中只移除一种、保留另外两种
+
+第二种三退化协议固定使用 `remove A, preserve B and C`。输入、DACG coarse、模型
+checkpoint 和 200 个 test scene 均与 8.4 相同，但参考目标改为对应的双退化图。例如：
+
+| 三退化输入 | Prompt | 参考目标目录 |
+|---|---|---|
+| `low_haze_rain` | `remove low light, preserve haze and rain` | `test/haze_rain` |
+| `low_haze_rain` | `remove haze, preserve low light and rain` | `test/low_rain` |
+| `low_haze_snow` | `remove snow, preserve low light and haze` | `test/low_haze` |
+
+不需要重新生成 coarse。复用已完成的三退化 coarse，并使用新的输出目录：
+
+```bash
+python -u evaluate_cdd11_difix.py \
+  --data-root /path/to/CDD11 \
+  --test-coarse-root /path/to/CDD11-DACG-coarse-test-triple \
+  --checkpoint /path/to/difix-selective-run/checkpoints/best_psnr.pkl \
+  --output-dir /path/to/difix-selective-run/test_triple_remove_one_remove_first \
+  --triple-combinations 1 2 \
+  --triple-task-mode remove-one \
+  --triple-prompt-template remove-first \
+  --resolution 512 \
+  --workers 4 \
+  --mixed-precision bf16 \
+  --seed 42 \
+  --enable-xformers-memory-efficient-attention
+```
+
+仍然得到 `200 × 2 × 3 = 1200` 个任务，summary 按 6 个 remove-one 任务和 2 个
+triple 分组。该模式与训练时的 `remove A, preserve B` 句式顺序更接近，但目标包含
+两种退化，仍属于组合 OOD。不要直接用 preserve-one 与 remove-one 的绝对 PSNR/SSIM
+判定哪个任务更容易，因为两者参考目标不同；应分别报告 final 相对同任务 DACG coarse
+的 `improvement_*` 和胜率。若要证明训练贡献，仍需在相同 remove-one 协议下运行
+step-0 initialization 并做配对比较。

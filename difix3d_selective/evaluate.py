@@ -176,6 +176,9 @@ def run(args: argparse.Namespace) -> None:
     triple_ids = getattr(args, "triple_combinations", None)
     triple_mode = triple_ids is not None
     prompt_template = getattr(args, "triple_prompt_template", "preserve-first")
+    triple_task_mode = getattr(args, "triple_task_mode", "preserve-one")
+    if not triple_mode and triple_task_mode != "preserve-one":
+        raise ValueError("--triple-task-mode requires --triple-combinations")
     checkpoint = args.checkpoint.resolve() if args.checkpoint is not None else None
     if model_source == "trained":
         if checkpoint is None:
@@ -184,9 +187,12 @@ def run(args: argparse.Namespace) -> None:
             raise FileNotFoundError(checkpoint)
         if triple_mode:
             selection_ids = [triple_id for triple_id, _ in selected_triples(triple_ids)]
+            task_prefix = (
+                "" if triple_task_mode == "preserve-one" else f"{triple_task_mode}_"
+            )
             default_output_dir = (
                 checkpoint.parent.parent
-                / f"test_triple_{prompt_template}_{checkpoint.stem}"
+                / f"test_triple_{task_prefix}{prompt_template}_{checkpoint.stem}"
             )
         else:
             selection_ids = _infer_pair_ids(checkpoint, args.degradation_pairs)
@@ -223,6 +229,7 @@ def run(args: argparse.Namespace) -> None:
             output_dir=output_dir,
             triple_ids=selection_ids,
             prompt_template=prompt_template,
+            task_mode=triple_task_mode,
             require_coarse_metadata=not args.allow_unverified_test_coarse,
         )
         total = expected_triple_test_count(selection_ids)
@@ -265,6 +272,8 @@ def run(args: argparse.Namespace) -> None:
                 "triple_prompt_template": prompt_template,
             }
         )
+        if triple_task_mode == "remove-one":
+            config["triple_task_mode"] = triple_task_mode
     else:
         config["degradation_pairs"] = selection_ids
     if model_source == "trained":
@@ -428,6 +437,8 @@ def run(args: argparse.Namespace) -> None:
                     "prompt_template": prompt_template,
                 }
             )
+            if triple_task_mode == "remove-one":
+                row["triple_task_mode"] = triple_task_mode
         _atomic_json(_record_path(records_dir, row), row)
         partial_rows[sample_id] = row
         progress.update(1)
@@ -447,9 +458,13 @@ def run(args: argparse.Namespace) -> None:
     )
     metadata = {
         "protocol": (
-            "cdd11-selective-difix-triple-ood-test-v1"
-            if triple_mode
-            else "cdd11-selective-difix-test-v1"
+            "cdd11-selective-difix-triple-remove-one-ood-test-v1"
+            if triple_mode and triple_task_mode == "remove-one"
+            else (
+                "cdd11-selective-difix-triple-ood-test-v1"
+                if triple_mode
+                else "cdd11-selective-difix-test-v1"
+            )
         ),
         "task_family": "triple" if triple_mode else "pair",
         "model_source": model_source,
@@ -460,7 +475,11 @@ def run(args: argparse.Namespace) -> None:
             name: _package_version(name)
             for name in ("torch", "torchvision", "diffusers", "lpips", "piq")
         },
-        "primary_reference": "single-degradation target to be preserved",
+        "primary_reference": (
+            "double-degradation target containing both preserved degradations"
+            if triple_mode and triple_task_mode == "remove-one"
+            else "single-degradation target to be preserved"
+        ),
         "baselines": {
             "degraded": (
                 "original triple-degradation input"
@@ -499,6 +518,8 @@ def run(args: argparse.Namespace) -> None:
         "inference_time_scope": "Difix model forward only; excludes metrics and file I/O",
         "stages": list(STAGES),
     }
+    if triple_mode and triple_task_mode == "remove-one":
+        metadata["triple_task_mode"] = triple_task_mode
     per_image_fields = list(rows[0])
     _write_csv(output_dir / "per_image_metrics.csv", rows, per_image_fields)
     compact_rows = summary_csv_rows(summary)
@@ -528,7 +549,8 @@ def run(args: argparse.Namespace) -> None:
     )
     print(
         f"Completed {total} {model_source} "
-        f"{'triple' if triple_mode else 'pair'} samples at step {global_step}. "
+        f"{'triple ' + triple_task_mode if triple_mode else 'pair'} samples "
+        f"at step {global_step}. "
         f"PSNR={macro['final_psnr']:.4f}, SSIM={macro['final_ssim']:.6f}, "
         f"LPIPS-VGG={macro['final_lpips_vgg']:.6f}, "
         f"DISTS={macro['final_dists']:.6f}. Results: {output_dir}",
@@ -554,6 +576,11 @@ def parser() -> argparse.ArgumentParser:
         "--triple-prompt-template",
         choices=("preserve-first", "remove-first"),
         default="preserve-first",
+    )
+    value.add_argument(
+        "--triple-task-mode",
+        choices=("preserve-one", "remove-one"),
+        default="preserve-one",
     )
     value.add_argument("--resolution", type=int, default=512)
     value.add_argument("--lora-rank-vae", type=int, default=4)

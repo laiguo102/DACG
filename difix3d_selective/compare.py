@@ -269,6 +269,17 @@ def run(args: argparse.Namespace) -> None:
         )
     if trained_family not in ("pair", "triple"):
         raise ValueError(f"Unsupported task family: {trained_family}")
+    trained_task_mode = trained_metrics["metadata"].get(
+        "triple_task_mode", "preserve-one"
+    )
+    initialization_task_mode = initialization_metrics["metadata"].get(
+        "triple_task_mode", "preserve-one"
+    )
+    if trained_task_mode != initialization_task_mode:
+        raise ValueError(
+            "The trained and initialization results use different triple task modes: "
+            f"{trained_task_mode!r} != {initialization_task_mode!r}"
+        )
     paired = paired_rows(
         _read_csv(trained_dir / "per_image_metrics.csv"),
         _read_csv(initialization_dir / "per_image_metrics.csv"),
@@ -309,6 +320,8 @@ def run(args: argparse.Namespace) -> None:
             if row["group"] == "overall" and row["condition"] == "micro"
         ],
     }
+    if trained_family == "triple":
+        payload["triple_task_mode"] = trained_task_mode
     temporary = output_dir / "comparison.json.tmp"
     temporary.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
