@@ -1,0 +1,40 @@
+seed: 20260825
+
+paths:
+  clean_root: ../.tmp_onerestore_fixture/syn_data/data/clear
+  light_root: ../.tmp_onerestore_fixture/syn_data/data/light_map
+  depth_root: ../.tmp_onerestore_fixture/syn_data/data/depth_map
+  rain_mask_root: ../.tmp_onerestore_fixture/syn_data/data/rain_mask
+  snow_mask_root: ../.tmp_onerestore_fixture/syn_data/data/snow_mask
+  output_root: ../.tmp_cdd11_selective_smoke/output
+
+families_per_scene:
+  train: 1
+  val: 0
+  test: 0
+
+split:
+  file: null
+  train_ratio: 0.80
+  val_ratio: 0.05
+  test_ratio: 0.15
+
+mask_pool:
+  separate_train_val_test: false
+
+low:
+  gamma_min: 2.0
+  gamma_max: 3.0
+  noise_sigma_min: 0.03
+  noise_sigma_max: 0.08
+
+haze:
+  beta_min: 1.0
+  beta_max: 2.0
+  atmospheric_light_min: 0.6
+  atmospheric_light_max: 0.9
+
+output:
+  image_ext: png
+  save_meta: true
+  overwrite: false

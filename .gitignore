@@ -129,3 +129,12 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+
+# Local CDD-11 selective synthesis inputs, outputs, and environments
+.tmp_onerestore_fixture/
+.tmp_cdd11_selective_smoke/
+.tmp_pytest_cdd11_synthesis/
+.venv_cdd11_synthesis/
+local_data/cdd11_selective/
+local_data/cdd11_selective_source/
+local_outputs/cdd11_selective/

@@ -1,0 +1,40 @@
+seed: 20260825
+
+paths:
+  clean_root: ../local_data/cdd11_selective_source/clear
+  light_root: ../local_data/cdd11_selective_source/light_map
+  depth_root: ../local_data/cdd11_selective_source/depth_map
+  rain_mask_root: ../local_data/cdd11_selective_source/rain_mask
+  snow_mask_root: ../local_data/cdd11_selective_source/snow_mask
+  output_root: ../local_outputs/cdd11_selective
+
+families_per_scene:
+  train: 4
+  val: 1
+  test: 1
+
+split:
+  file: null
+  train_ratio: 0.80
+  val_ratio: 0.05
+  test_ratio: 0.15
+
+mask_pool:
+  separate_train_val_test: true
+
+low:
+  gamma_min: 2.0
+  gamma_max: 3.0
+  noise_sigma_min: 0.03
+  noise_sigma_max: 0.08
+
+haze:
+  beta_min: 1.0
+  beta_max: 2.0
+  atmospheric_light_min: 0.6
+  atmospheric_light_max: 0.9
+
+output:
+  image_ext: png
+  save_meta: true
+  overwrite: false
