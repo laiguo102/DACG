@@ -56,6 +56,47 @@ def _best_state(output_dir: Path) -> dict[str, float | int]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _experiment_metadata(args: argparse.Namespace) -> dict:
+    dataset_format = getattr(args, "dataset_format", "cdd11")
+    return {
+        "dataset": "CCDD-11" if dataset_format == "ccdd11" else "CDD-11",
+        "target": (
+            "native sub_data selective target"
+            if dataset_format == "ccdd11"
+            else "single-degradation preserve target"
+        ),
+        "seed": int(args.seed),
+        "pairs": list(args.degradation_pairs),
+    }
+
+
+def _prepare_manifests(args: argparse.Namespace, output_dir: Path) -> dict:
+    dataset_format = getattr(args, "dataset_format", "cdd11")
+    if dataset_format == "ccdd11":
+        from .ccdd_prepare import prepare_ccdd11_selective_manifests
+
+        prepare = prepare_ccdd11_selective_manifests
+    elif dataset_format == "cdd11":
+        from .prepare import prepare_selective_manifests
+
+        prepare = prepare_selective_manifests
+    else:
+        raise ValueError(f"Unsupported dataset format: {dataset_format}")
+    prepared = prepare(
+        data_root=args.data_root,
+        coarse_root=args.coarse_root,
+        output_dir=output_dir,
+        pair_ids=args.degradation_pairs,
+    )
+    print(
+        f"Indexed {prepared['coarse_images']} coarse images\n"
+        f"train samples = {prepared['train_samples']}\n"
+        f"validation samples = {prepared['validation_samples']}",
+        flush=True,
+    )
+    return prepared
+
+
 def _log_validation(
     accelerator,
     metrics: dict[str, float],
@@ -85,7 +126,6 @@ def run(args: argparse.Namespace) -> None:
 
     from .data import SelectiveDifixDataset
     from .model import SelectiveDifix, load_training_checkpoint, save_training_checkpoint
-    from .prepare import prepare_selective_manifests
     from .validation import stratified_indices, validate, wandb_images
 
     accelerator = Accelerator(
@@ -98,18 +138,7 @@ def run(args: argparse.Namespace) -> None:
     output_dir = args.output_dir.resolve()
     if accelerator.is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
-        prepared = prepare_selective_manifests(
-            data_root=args.data_root,
-            coarse_root=args.coarse_root,
-            output_dir=output_dir,
-            pair_ids=args.degradation_pairs,
-        )
-        print(
-            f"Indexed {prepared['coarse_images']} coarse images, "
-            f"wrote {prepared['train_samples']} train and "
-            f"{prepared['validation_samples']} validation samples",
-            flush=True,
-        )
+        _prepare_manifests(args, output_dir)
     accelerator.wait_for_everyone()
     train_manifest = output_dir / "prepared" / "manifests" / "train.jsonl"
     validation_manifest = output_dir / "prepared" / "manifests" / "validation.jsonl"
@@ -225,6 +254,7 @@ def run(args: argparse.Namespace) -> None:
             run_tracker.define_metric("validation_full/ssim", summary="max")
 
     best = _best_state(output_dir) if accelerator.is_main_process else None
+    experiment_metadata = _experiment_metadata(args)
     progress = tqdm(
         total=args.max_train_steps,
         initial=global_step,
@@ -277,6 +307,8 @@ def run(args: argparse.Namespace) -> None:
         logs = {
             "train/l2": float(loss_l2.detach()),
             "train/lpips": float(loss_lpips.detach()),
+            "train/loss_l2": float(loss_l2.detach()),
+            "train/loss_lpips": float(loss_lpips.detach()),
             "train/gram": float(loss_gram.detach()),
             "train/loss": float(loss.detach()),
             "train/learning_rate": lr_scheduler.get_last_lr()[0],
@@ -341,6 +373,7 @@ def run(args: argparse.Namespace) -> None:
                     save_training_checkpoint(
                         accelerator.unwrap_model(model), optimizer, lr_scheduler,
                         checkpoint_dir / "best_psnr.pkl", global_step,
+                        experiment_metadata,
                     )
                     _write_json(output_dir / "best_validation.json", best)
 
@@ -363,11 +396,13 @@ def run(args: argparse.Namespace) -> None:
                 save_training_checkpoint(
                     unwrapped, optimizer, lr_scheduler,
                     checkpoint_dir / "latest.pkl", global_step,
+                    experiment_metadata,
                 )
             if milestone_due:
                 save_training_checkpoint(
                     unwrapped, optimizer, lr_scheduler,
                     checkpoint_dir / f"model_{global_step:06d}.pkl", global_step,
+                    experiment_metadata,
                 )
 
     accelerator.wait_for_everyone()
@@ -375,15 +410,24 @@ def run(args: argparse.Namespace) -> None:
         save_training_checkpoint(
             accelerator.unwrap_model(model), optimizer, lr_scheduler,
             output_dir / "checkpoints" / "final.pkl", global_step,
+            experiment_metadata,
         )
     accelerator.end_training()
 
 
-def parser() -> argparse.ArgumentParser:
+def parser(default_dataset_format: str = "cdd11") -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description=__doc__)
     value.add_argument("--data-root", type=Path, required=True)
     value.add_argument("--coarse-root", type=Path, required=True)
     value.add_argument("--output-dir", type=Path, required=True)
+    value.add_argument(
+        "--dataset-format", choices=("cdd11", "ccdd11"),
+        default=default_dataset_format,
+    )
+    value.add_argument(
+        "--prepare-only", action="store_true",
+        help="Build and validate manifests without loading Difix or perceptual models.",
+    )
     value.add_argument(
         "--degradation-pairs", nargs="+", type=int, choices=range(1, 6), required=True
     )
@@ -429,8 +473,14 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
-def main() -> None:
-    run(parser().parse_args())
+def main(default_dataset_format: str = "cdd11") -> None:
+    args = parser(default_dataset_format).parse_args()
+    if args.prepare_only:
+        output_dir = args.output_dir.resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        _prepare_manifests(args, output_dir)
+        return
+    run(args)
 
 
 if __name__ == "__main__":

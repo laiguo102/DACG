@@ -235,6 +235,7 @@ def save_training_checkpoint(
     scheduler,
     path: str | Path,
     global_step: int,
+    experiment_metadata: dict | None = None,
 ) -> None:
     checkpoint = {
         "global_step": global_step,
@@ -250,6 +251,8 @@ def save_training_checkpoint(
         "optimizer": optimizer.state_dict(),
         "lr_scheduler": scheduler.state_dict(),
     }
+    if experiment_metadata is not None:
+        checkpoint["experiment_metadata"] = dict(experiment_metadata)
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(destination.name + ".tmp")

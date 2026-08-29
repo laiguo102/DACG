@@ -8,6 +8,7 @@ from typing import Any
 import torch
 
 from cdd11_full.metrics import rgb_psnr, rgb_ssim
+from .protocol import PAIR_FOLDERS, directed_tasks
 
 
 METRIC_NAMES = (
@@ -98,8 +99,7 @@ def validate(
             target_01 = target.float().add(1).mul(0.5).clamp(0, 1)
             ground_truth_01 = ground_truth.float().add(1).mul(0.5).clamp(0, 1)
             perceptual = lpips_model(prediction.float(), target.float()).mean()
-            row = prediction.new_tensor(
-                (
+            metric_values = (
                     rgb_psnr(prediction_01, target_01),
                     rgb_ssim(prediction_01, target_01),
                     perceptual.detach().item(),
@@ -107,14 +107,24 @@ def validate(
                     rgb_ssim(prediction_01, ground_truth_01),
                     rgb_psnr(coarse_01, target_01),
                     rgb_ssim(coarse_01, target_01),
-                ),
-                dtype=torch.float32,
+                )
+            pair_id = int(batch["pair_id"][0]) if "pair_id" in batch else -1
+            direction = -1
+            if pair_id in PAIR_FOLDERS and "remove" in batch:
+                remove = batch["remove"][0]
+                for task_index, task in enumerate(directed_tasks(pair_id)):
+                    if task.remove == remove:
+                        direction = task_index
+                        break
+            row = prediction.new_tensor(
+                (*metric_values, pair_id, direction), dtype=torch.float32
             )
             rows.append(row)
             if accelerator.is_main_process and len(visualizations) < visualization_limit:
                 caption = (
                     f"{batch['sample_id'][0]} | {batch['prompt'][0]} | "
-                    "left to right: degraded | DACG coarse | target | Difix final | clean GT"
+                    "left to right: degraded | DACG coarse | selective target | "
+                    "Difix final | clean GT"
                 )
                 visualizations.append(
                     (comparison_image(source, target, prediction, ground_truth), caption)
@@ -126,12 +136,24 @@ def validate(
     if not rows:
         raise ValueError("validation loader produced no samples")
     gathered = accelerator.gather_for_metrics(torch.stack(rows))
-    means = gathered.float().mean(0).cpu().tolist()
+    metric_rows = gathered[:, : len(METRIC_NAMES)].float()
+    means = metric_rows.mean(0).cpu().tolist()
     if len(METRIC_NAMES) != len(means):
         raise RuntimeError(
             f"Expected {len(METRIC_NAMES)} validation metrics, got {len(means)}"
         )
-    return dict(zip(METRIC_NAMES, means)), visualizations
+    metrics = dict(zip(METRIC_NAMES, means))
+    task_codes = gathered[:, len(METRIC_NAMES) : len(METRIC_NAMES) + 2].long()
+    for pair_id, pair in sorted(PAIR_FOLDERS.items()):
+        for direction, task in enumerate(directed_tasks(pair_id)):
+            mask = (task_codes[:, 0] == pair_id) & (task_codes[:, 1] == direction)
+            if not bool(mask.any()):
+                continue
+            task_means = metric_rows[mask].mean(0).cpu().tolist()
+            task_prefix = f"tasks/{pair}/remove_{task.remove}"
+            for name, value in zip(METRIC_NAMES, task_means):
+                metrics[f"{task_prefix}/{name}"] = value
+    return metrics, visualizations
 
 
 def wandb_images(visualizations: list[tuple[torch.Tensor, str]]) -> list[Any]:
