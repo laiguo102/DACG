@@ -21,14 +21,19 @@ from difix3d_selective.ccdd_prepare import (
 from difix3d_selective.protocol import NUM_SCENES, directed_tasks, make_scene_split, selected_pairs
 
 
-def _decode(path: Path) -> tuple[tuple[int, int], np.ndarray]:
+def _decode_size(path: Path) -> tuple[int, int]:
     try:
         with Image.open(path) as image:
             rgb = image.convert("RGB")
             rgb.load()
-            return rgb.size, np.asarray(rgb, dtype=np.uint8).copy()
+            return rgb.size
     except Exception as error:
         raise ValueError(f"PIL could not decode {path}: {error}") from error
+
+
+def _load_array(path: Path) -> np.ndarray:
+    with Image.open(path) as image:
+        return np.asarray(image.convert("RGB"), dtype=np.uint8).copy()
 
 
 def _psnr(first: np.ndarray, second: np.ndarray) -> float:
@@ -84,18 +89,19 @@ def audit(data_root: str | Path, pair_ids: list[int], audit_output: str | Path) 
         if set(images) != scene_ids:
             raise ValueError(f"CCDD-11 main_data/{component} scene mismatch")
 
-    decoded: dict[Path, tuple[tuple[int, int], np.ndarray]] = {}
+    decoded_sizes: dict[Path, tuple[int, int]] = {}
 
-    def decoded_image(path: Path):
+    def decoded_size(path: Path):
         resolved = path.resolve()
-        if resolved not in decoded:
-            decoded[resolved] = _decode(resolved)
-        return decoded[resolved]
+        if resolved not in decoded_sizes:
+            decoded_sizes[resolved] = _decode_size(resolved)
+        return decoded_sizes[resolved]
 
     pair_reports: dict[str, dict] = {}
     targets: dict[tuple[str, str, str], Path] = {}
     sources: dict[str, dict[str, Path]] = {}
     for pair_id, pair in pairs:
+        print(f"Auditing {pair}: {len(scene_ids)} scenes", flush=True)
         sources[pair] = strict_index_images(main_root / pair)
         if set(sources[pair]) != scene_ids:
             raise ValueError(f"CCDD-11 main_data/{pair} scene mismatch")
@@ -105,8 +111,8 @@ def audit(data_root: str | Path, pair_ids: list[int], audit_output: str | Path) 
         target_counts = {component: 0 for component in pair.split("_")}
         half_count = 0
         for scene_id in sorted(scene_ids):
-            source_size, _ = decoded_image(sources[pair][scene_id])
-            clear_size, _ = decoded_image(clear[scene_id])
+            source_size = decoded_size(sources[pair][scene_id])
+            clear_size = decoded_size(clear[scene_id])
             if clear_size != source_size:
                 raise ValueError(f"Image size mismatch for {pair}/{scene_id}: source={source_size}, clear={clear_size}")
             for task in directed_tasks(pair_id):
@@ -114,8 +120,8 @@ def audit(data_root: str | Path, pair_ids: list[int], audit_output: str | Path) 
                 if not target.is_file():
                     raise FileNotFoundError(target)
                 targets[(pair, scene_id, task.preserve)] = target
-                target_size, _ = decoded_image(target)
-                preserve_size, _ = decoded_image(main_components[task.preserve][scene_id])
+                target_size = decoded_size(target)
+                preserve_size = decoded_size(main_components[task.preserve][scene_id])
                 if target_size != source_size or preserve_size != source_size:
                     raise ValueError(
                         f"Image size mismatch for {pair}/{scene_id}/{task.preserve}: "
@@ -130,6 +136,11 @@ def audit(data_root: str | Path, pair_ids: list[int], audit_output: str | Path) 
             "targets": target_counts,
             "half": half_count,
         }
+        print(
+            f"Completed {pair}: source={len(sources[pair])}, "
+            f"targets={sum(target_counts.values())}, half={half_count}",
+            flush=True,
+        )
 
     montage_scene = random.Random(42).choice(sorted(scene_ids))
     semantic_rows = []
@@ -138,8 +149,8 @@ def audit(data_root: str | Path, pair_ids: list[int], audit_output: str | Path) 
         for task in directed_tasks(pair_id):
             target = targets[(pair, montage_scene, task.preserve)]
             preserve = main_components[task.preserve][montage_scene]
-            _, target_array = decoded_image(target)
-            _, preserve_array = decoded_image(preserve)
+            target_array = _load_array(target)
+            preserve_array = _load_array(preserve)
             diagnostic_psnr = _psnr(target_array, preserve_array)
             output = semantics_root / f"{pair}_remove-{task.remove}_preserve-{task.preserve}.png"
             header = (
@@ -175,7 +186,7 @@ def audit(data_root: str | Path, pair_ids: list[int], audit_output: str | Path) 
         "expected_coarse": len(clear) * len(pairs),
         "expected_train_records": len(splits["train"]) * len(pairs) * 2,
         "expected_validation_records": len(splits["validation"]) * len(pairs) * 2,
-        "decoded_required_images": len(decoded),
+        "decoded_required_images": len(decoded_sizes),
         "semantic_audit_scene": montage_scene,
         "target_semantics": semantic_rows,
     }
