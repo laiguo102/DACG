@@ -281,10 +281,31 @@ def _apply_model_checkpoint(model: SelectiveDifix, checkpoint: dict) -> int:
     return int(checkpoint["global_step"])
 
 
-def load_model_checkpoint(model: SelectiveDifix, path: str | Path) -> int:
+def load_model_checkpoint(
+    model: SelectiveDifix,
+    path: str | Path,
+    *,
+    expected_dataset: str | None = None,
+    expected_seed: int | None = None,
+) -> int:
     """Load model weights only, for validation/backfill without an optimizer."""
 
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if expected_dataset is not None or expected_seed is not None:
+        metadata = checkpoint.get("experiment_metadata")
+        if not isinstance(metadata, dict):
+            raise ValueError(
+                "Checkpoint lacks experiment_metadata required by the evaluation protocol"
+            )
+        if expected_dataset is not None and metadata.get("dataset") != expected_dataset:
+            raise ValueError(
+                f"Checkpoint dataset is {metadata.get('dataset')!r}, expected "
+                f"{expected_dataset!r}"
+            )
+        if expected_seed is not None and int(metadata.get("seed", -1)) != expected_seed:
+            raise ValueError(
+                f"Checkpoint seed is {metadata.get('seed')!r}, expected {expected_seed}"
+            )
     return _apply_model_checkpoint(model, checkpoint)
 
 

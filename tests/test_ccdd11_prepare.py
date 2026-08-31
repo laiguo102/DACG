@@ -12,10 +12,13 @@ from PIL import Image
 from difix3d_selective.ccdd_prepare import (
     DATASET_NAME,
     TARGET_KIND,
+    TEST_TARGET_KIND,
     prepare_ccdd11_selective_manifests,
+    prepare_ccdd11_selective_test_manifest,
     strict_index_images,
     validate_manifest_records,
 )
+from difix3d_selective.protocol import expected_test_count
 
 
 def _image(path: Path, value: int = 64):
@@ -49,6 +52,8 @@ def _fixture(tmp_path: Path, *, omit_target: tuple[str, str, str] | None = None)
         "source_root": str(main_root.resolve()),
         "pair_ids": [1],
         "expected_scenes": 2,
+        "dacg_checkpoint": "/checkpoints/best_macro_psnr.pth",
+        "dacg_checkpoint_sha256": "a" * 64,
     }
     coarse_root.mkdir(parents=True, exist_ok=True)
     (coarse_root / "coarse_preparation.json").write_text(json.dumps(metadata), encoding="utf-8")
@@ -73,6 +78,47 @@ def _prepare_miniature(tmp_path: Path, **fixture_kwargs):
     return result, data_root, coarse_root, output_dir
 
 
+def _test_fixture(tmp_path: Path, *, metadata_split: str = "half_test"):
+    data_root = tmp_path / "CCDD-11"
+    coarse_root = tmp_path / "coarse" / "half_test"
+    output_dir = tmp_path / "evaluation" / "prepared"
+    main_root = data_root / "half_test" / "main_data"
+    scenes = ("10001", "10002")
+    for scene in scenes:
+        _image(main_root / "clear" / f"{scene}.png", 128)
+        _image(main_root / "low_haze" / f"{scene}.png", 32)
+        _image(main_root / "low" / f"{scene}.png", 70)
+        _image(main_root / "haze" / f"{scene}.png", 90)
+        _image(coarse_root / "low_haze" / f"{scene}.png", 48)
+    metadata = {
+        "dataset": DATASET_NAME,
+        "status": "completed",
+        "split": metadata_split,
+        "data_root": str(data_root.resolve()),
+        "source_root": str(main_root.resolve()),
+        "pair_ids": [1],
+        "expected_scenes": 2,
+        "dacg_checkpoint": "/checkpoints/best_macro_psnr.pth",
+        "dacg_checkpoint_sha256": "a" * 64,
+    }
+    coarse_root.mkdir(parents=True, exist_ok=True)
+    (coarse_root / "coarse_preparation.json").write_text(
+        json.dumps(metadata), encoding="utf-8"
+    )
+    half_train_root = coarse_root.parent / "half_train"
+    half_train_root.mkdir(parents=True, exist_ok=True)
+    half_train_metadata = {
+        **metadata,
+        "split": "half_train",
+        "source_root": str((data_root / "half_train" / "main_data").resolve()),
+        "expected_scenes": 1183,
+    }
+    (half_train_root / "coarse_preparation.json").write_text(
+        json.dumps(half_train_metadata), encoding="utf-8"
+    )
+    return data_root, coarse_root, output_dir
+
+
 def test_miniature_records_have_counts_paths_and_no_leakage(tmp_path):
     result, data_root, coarse_root, output_dir = _prepare_miniature(tmp_path)
     assert result["coarse_images"] == 2
@@ -92,7 +138,7 @@ def test_miniature_records_have_counts_paths_and_no_leakage(tmp_path):
     assert all("half_train/main_data/low_haze" in row["ref_image"].replace("\\", "/") for row in train)
     assert all("half_train/sub_data/low_haze" in row["target_image"].replace("\\", "/") for row in train)
     assert all(Path(row["target_image"]).name == f"{row['scene_id']}_{row['preserve']}_.png" for row in train)
-    assert all("_half_" not in row["target_image"] for row in train + validation)
+    assert all("_half_" not in Path(row["target_image"]).name for row in train + validation)
     assert all("half_test" not in json.dumps(row) for row in train + validation)
     info = json.loads((output_dir / "prepared" / "split_and_preparation.json").read_text())
     assert info["target_rule"] == "target filename suffix equals preserve"
@@ -157,6 +203,72 @@ def test_record_validator_rejects_half_and_half_test():
         validate_manifest_records([leaked], [1])
 
 
+def test_half_test_old_style_manifest_uses_main_data_preserve_targets(tmp_path):
+    data_root, coarse_root, output_dir = _test_fixture(tmp_path)
+    with patch("difix3d_selective.ccdd_prepare.NUM_TEST_SCENES", 2):
+        result = prepare_ccdd11_selective_test_manifest(
+            data_root=data_root,
+            coarse_root=coarse_root,
+            output_dir=output_dir,
+            pair_ids=[1],
+        )
+    records = [
+        json.loads(line)
+        for line in Path(result["manifest"]).read_text(encoding="utf-8").splitlines()
+    ]
+    assert result["test_samples"] == 4
+    assert {row["split"] for row in records} == {"half_test"}
+    assert {row["target_kind"] for row in records} == {TEST_TARGET_KIND}
+    assert {row["dataset"] for row in records} == {DATASET_NAME}
+    assert all(Path(row["ref_image"]).parent.name == "low_haze" for row in records)
+    assert all(Path(row["target_image"]).parent.name == row["preserve"] for row in records)
+    assert all(Path(row["target_image"]).name == f"{row['scene_id']}.png" for row in records)
+    assert all("half_train" not in json.dumps(row) for row in records)
+    assert all("sub_data" not in json.dumps(row) for row in records)
+    assert all("_half_" not in Path(row["target_image"]).name for row in records)
+    info = json.loads((output_dir / "test_preparation.json").read_text(encoding="utf-8"))
+    assert info["split"] == "half_test"
+    assert info["target_kind"] == TEST_TARGET_KIND
+
+
+def test_half_test_rejects_half_train_coarse_metadata(tmp_path):
+    data_root, coarse_root, output_dir = _test_fixture(
+        tmp_path, metadata_split="half_train"
+    )
+    with (
+        patch("difix3d_selective.ccdd_prepare.NUM_TEST_SCENES", 2),
+        pytest.raises(ValueError, match="half_test coarse metadata"),
+    ):
+        prepare_ccdd11_selective_test_manifest(
+            data_root=data_root,
+            coarse_root=coarse_root,
+            output_dir=output_dir,
+            pair_ids=[1],
+        )
+
+
+def test_half_test_requires_same_dacg_checkpoint_as_half_train(tmp_path):
+    data_root, coarse_root, output_dir = _test_fixture(tmp_path)
+    metadata_path = coarse_root.parent / "half_train" / "coarse_preparation.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["dacg_checkpoint_sha256"] = "b" * 64
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    with (
+        patch("difix3d_selective.ccdd_prepare.NUM_TEST_SCENES", 2),
+        pytest.raises(ValueError, match="different dacg_checkpoint_sha256"),
+    ):
+        prepare_ccdd11_selective_test_manifest(
+            data_root=data_root,
+            coarse_root=coarse_root,
+            output_dir=output_dir,
+            pair_ids=[1],
+        )
+
+
+def test_ccdd_full_half_test_protocol_has_2000_records():
+    assert expected_test_count([1, 2, 3, 4, 5]) == 2000
+
+
 @pytest.mark.skipif(importlib.util.find_spec("torchvision") is None, reason="torchvision missing")
 def test_real_ccdd_manifest_dataset_tensor_contract(tmp_path):
     from difix3d_selective.data import SelectiveDifixDataset
@@ -184,6 +296,19 @@ def test_training_parser_defaults_keep_cdd11_and_ccdd_wrapper_can_override():
     assert cdd_defaults["dataset_format"] == "cdd11"
     assert ccdd_defaults["dataset_format"] == "ccdd11"
     assert cdd_defaults["prepare_only"] is False
+
+
+def test_evaluation_parser_defaults_keep_cdd11_and_ccdd_wrapper_can_override():
+    from difix3d_selective.evaluate import parser
+
+    cdd_defaults = {action.dest: action.default for action in parser()._actions}
+    ccdd_defaults = {action.dest: action.default for action in parser("ccdd11")._actions}
+    assert cdd_defaults["dataset_format"] == "cdd11"
+    assert ccdd_defaults["dataset_format"] == "ccdd11"
+    assert ccdd_defaults["resolution"] == 512
+    assert ccdd_defaults["lora_rank_vae"] == 4
+    assert ccdd_defaults["timestep"] == 199
+    assert ccdd_defaults["seed"] == 42
 
 
 def test_validation_reports_directed_task_metrics():

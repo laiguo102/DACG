@@ -27,6 +27,7 @@ from .protocol import (
 
 DATASET_NAME = "CCDD-11"
 TARGET_KIND = "native_selective_sub_data"
+TEST_TARGET_KIND = "main_data_single_degradation_test_reference"
 
 
 def _write_json(path: Path, value: dict) -> None:
@@ -174,13 +175,16 @@ def _load_and_validate_coarse_metadata(
     data_root: Path,
     source_root: Path,
     pairs: list[tuple[int, str]],
+    *,
+    split: str = "half_train",
+    expected_scenes: int = NUM_SCENES,
 ) -> dict:
     path = coarse_root / "coarse_preparation.json"
     if not path.is_file():
         raise FileNotFoundError(f"Missing CCDD-11 coarse metadata: {path}")
     metadata = json.loads(path.read_text(encoding="utf-8"))
-    if metadata.get("dataset") != DATASET_NAME or metadata.get("split") != "half_train":
-        raise ValueError(f"Not completed CCDD-11 half_train coarse metadata: {path}")
+    if metadata.get("dataset") != DATASET_NAME or metadata.get("split") != split:
+        raise ValueError(f"Not completed CCDD-11 {split} coarse metadata: {path}")
     if metadata.get("status") != "completed":
         raise ValueError(f"CCDD-11 coarse preparation is not completed: {path}")
     for key, expected in (("data_root", data_root), ("source_root", source_root)):
@@ -190,8 +194,18 @@ def _load_and_validate_coarse_metadata(
     requested_ids = {pair_id for pair_id, _ in pairs}
     if not requested_ids <= available_ids:
         raise ValueError(f"CCDD-11 coarse metadata lacks pair IDs {sorted(requested_ids - available_ids)}")
-    if int(metadata.get("expected_scenes", -1)) != NUM_SCENES:
+    if int(metadata.get("expected_scenes", -1)) != expected_scenes:
         raise ValueError(f"CCDD-11 coarse metadata expected_scenes mismatch in {path}")
+    checkpoint = metadata.get("dacg_checkpoint")
+    checkpoint_sha256 = metadata.get("dacg_checkpoint_sha256")
+    if not isinstance(checkpoint, str) or not checkpoint:
+        raise ValueError(f"CCDD-11 coarse metadata lacks dacg_checkpoint in {path}")
+    if not isinstance(checkpoint_sha256, str) or len(checkpoint_sha256) != 64 or any(
+        character not in "0123456789abcdefABCDEF" for character in checkpoint_sha256
+    ):
+        raise ValueError(
+            f"CCDD-11 coarse metadata has invalid dacg_checkpoint_sha256 in {path}"
+        )
     return metadata
 
 
@@ -216,7 +230,8 @@ def prepare_ccdd11_selective_manifests(
         raise RuntimeError("CCDD-11 train/validation scene leakage")
 
     coarse_metadata = _load_and_validate_coarse_metadata(
-        coarse_root, data_root, main_root.resolve(), pairs
+        coarse_root, data_root, main_root.resolve(), pairs,
+        split="half_train", expected_scenes=NUM_SCENES,
     )
     source_images: dict[str, dict[str, Path]] = {}
     coarse_images: dict[str, dict[str, Path]] = {}
@@ -272,6 +287,141 @@ def prepare_ccdd11_selective_manifests(
         "coarse_images": len(clear) * len(pairs),
         "train_samples": counts["train"],
         "validation_samples": counts["validation"],
+    }
+
+
+def prepare_ccdd11_selective_test_manifest(
+    *,
+    data_root: str | Path,
+    coarse_root: str | Path,
+    output_dir: str | Path,
+    pair_ids: list[int],
+    require_coarse_metadata: bool = True,
+) -> dict[str, Path | int | bool]:
+    """Build old-style selective records from CCDD-11 half_test/main_data."""
+
+    data_root = Path(data_root).resolve()
+    coarse_root = Path(coarse_root).resolve()
+    output_dir = Path(output_dir).resolve()
+    main_root = data_root / "half_test" / "main_data"
+    pairs = selected_pairs(pair_ids)
+    clear = strict_index_images(main_root / "clear")
+    if len(clear) != NUM_TEST_SCENES:
+        raise ValueError(
+            f"CCDD-11 half_test must contain {NUM_TEST_SCENES} clear scenes, "
+            f"got {len(clear)}"
+        )
+    all_scene_ids = set(clear)
+
+    if require_coarse_metadata:
+        coarse_metadata = _load_and_validate_coarse_metadata(
+            coarse_root,
+            data_root,
+            main_root.resolve(),
+            pairs,
+            split="half_test",
+            expected_scenes=NUM_TEST_SCENES,
+        )
+        half_train_metadata = _load_and_validate_coarse_metadata(
+            coarse_root.parent / "half_train",
+            data_root,
+            (data_root / "half_train" / "main_data").resolve(),
+            pairs,
+            split="half_train",
+            expected_scenes=NUM_SCENES,
+        )
+        for key in ("dacg_checkpoint", "dacg_checkpoint_sha256"):
+            if coarse_metadata.get(key) != half_train_metadata.get(key):
+                raise ValueError(
+                    f"CCDD-11 half_test and half_train coarse use different {key}"
+                )
+    else:
+        coarse_metadata = None
+        half_train_metadata = None
+
+    sources: dict[str, dict[str, Path]] = {}
+    coarse: dict[str, dict[str, Path]] = {}
+    targets: dict[str, dict[str, Path]] = {}
+    for _, pair in pairs:
+        sources[pair] = strict_index_images(main_root / pair)
+        coarse[pair] = strict_index_images(coarse_root / pair)
+        _assert_same_scenes(f"half_test/main_data/{pair}", sources[pair], all_scene_ids)
+        _assert_same_scenes(str(coarse_root / pair), coarse[pair], all_scene_ids)
+    for degradation in {value for _, pair in pairs for value in pair.split("_")}:
+        targets[degradation] = strict_index_images(main_root / degradation)
+        _assert_same_scenes(
+            f"half_test/main_data/{degradation}", targets[degradation], all_scene_ids
+        )
+
+    records: list[dict] = []
+    for pair_id, pair in pairs:
+        for scene_id in sorted(all_scene_ids):
+            for task in directed_tasks(pair_id):
+                target = targets[task.preserve][scene_id]
+                record = {
+                    "id": (
+                        f"half_test/{pair}/{scene_id}/"
+                        f"remove-{task.remove}-preserve-{task.preserve}"
+                    ),
+                    "split": "half_test",
+                    "scene_id": scene_id,
+                    "pair_id": pair_id,
+                    "pair": pair,
+                    "remove": task.remove,
+                    "preserve": task.preserve,
+                    "prompt": task.prompt,
+                    "image": str(coarse[pair][scene_id].resolve()),
+                    "ref_image": str(sources[pair][scene_id].resolve()),
+                    "target_image": str(target.resolve()),
+                    "clear_image": str(clear[scene_id].resolve()),
+                    "dataset": DATASET_NAME,
+                    "target_kind": TEST_TARGET_KIND,
+                }
+                for key in ("ref_image", "target_image", "clear_image"):
+                    path = Path(record[key])
+                    if "half_test" not in {part.casefold() for part in path.parts}:
+                        raise ValueError(f"CCDD-11 test record escaped half_test: {path}")
+                    if "sub_data" in {part.casefold() for part in path.parts}:
+                        raise ValueError(f"CCDD-11 old-style test may not use sub_data: {path}")
+                if "_half_" in Path(record["target_image"]).name:
+                    raise ValueError(f"CCDD-11 test may not use _half_: {record['target_image']}")
+                if "half_train" in {
+                    part.casefold() for part in Path(record["image"]).parts
+                }:
+                    raise ValueError(
+                        f"CCDD-11 test coarse may not come from half_train: {record['image']}"
+                    )
+                records.append(record)
+
+    expected = NUM_TEST_SCENES * len(pairs) * 2
+    if len(records) != expected:
+        raise RuntimeError(f"Expected {expected} CCDD-11 test records, got {len(records)}")
+    manifest = output_dir / "manifest.jsonl"
+    _write_jsonl(manifest, records)
+    _write_json(
+        output_dir / "test_preparation.json",
+        {
+            "dataset": DATASET_NAME,
+            "split": "half_test",
+            "target_kind": TEST_TARGET_KIND,
+            "data_root": str(data_root),
+            "source_root": str(main_root.resolve()),
+            "coarse_root": str(coarse_root),
+            "coarse_metadata_verified": require_coarse_metadata,
+            "coarse_metadata": coarse_metadata,
+            "half_train_coarse_metadata": half_train_metadata,
+            "degradation_pairs": [
+                {"id": pair_id, "name": pair} for pair_id, pair in pairs
+            ],
+            "test_scenes": len(clear),
+            "test_samples": len(records),
+        },
+    )
+    return {
+        "manifest": manifest,
+        "test_scenes": len(clear),
+        "test_samples": len(records),
+        "coarse_metadata_verified": require_coarse_metadata,
     }
 
 

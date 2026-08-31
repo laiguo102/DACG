@@ -145,6 +145,21 @@ class TestTrainedInitializationComparison(unittest.TestCase):
         self.assertAlmostEqual(row["trained_advantage_lpips_vgg"], 0.1)
         self.assertAlmostEqual(row["trained_advantage_dists"], 0.05)
 
+    def test_paired_comparison_rejects_different_target_path(self):
+        trained = self._row("001-a", 25, 0.8, 0.1, 0.05)
+        initialization = self._row("001-a", 20, 0.7, 0.2, 0.1)
+        for row in (trained, initialization):
+            row.update(
+                {
+                    "coarse_path": "/coarse/low_haze/001.png",
+                    "degraded_path": "/half_test/main_data/low_haze/001.png",
+                    "target_path": "/half_test/main_data/haze/001.png",
+                }
+            )
+        initialization["target_path"] = "/half_test/main_data/low/001.png"
+        with self.assertRaisesRegex(ValueError, "target_path"):
+            paired_rows([trained], [initialization])
+
     def test_scene_cluster_bootstrap_reports_trained_better(self):
         trained = [
             self._row(f"{scene}-a", 25, 0.8, 0.1, 0.05)

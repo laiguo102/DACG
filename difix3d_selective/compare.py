@@ -42,7 +42,17 @@ def _validate_protocol(
             f"missing initialization={missing_initialization[:3]}, "
             f"missing trained={missing_trained[:3]}"
         )
-    identity_fields = ("scene_id", "pair_id", "pair", "remove", "preserve", "prompt")
+    identity_fields = ["scene_id", "pair_id", "pair", "remove", "preserve", "prompt"]
+    path_fields = ("coarse_path", "degraded_path", "target_path")
+    if any(field in row for row in trained.values() for field in path_fields) or any(
+        field in row for row in initialization.values() for field in path_fields
+    ):
+        for field in path_fields:
+            if not all(field in row for row in trained.values()) or not all(
+                field in row for row in initialization.values()
+            ):
+                raise ValueError(f"Protocol path field is incomplete: {field}")
+        identity_fields.extend(path_fields)
     reference_fields = tuple(
         f"{stage}_{metric}"
         for stage in ("degraded", "coarse")
@@ -258,6 +268,25 @@ def run(args: argparse.Namespace) -> None:
     trained_step = int(trained_metrics["metadata"].get("global_step", 0))
     if trained_step <= 0:
         raise ValueError("The trained result must have global_step > 0")
+    trained_dataset = trained_metrics["metadata"].get("dataset", "CDD-11")
+    initialization_dataset = initialization_metrics["metadata"].get(
+        "dataset", "CDD-11"
+    )
+    if trained_dataset != initialization_dataset:
+        raise ValueError(
+            "The trained and initialization results use different datasets: "
+            f"{trained_dataset!r} != {initialization_dataset!r}"
+        )
+    if trained_dataset == "CCDD-11":
+        trained_config = trained_metrics["metadata"].get("config", {})
+        initialization_config = initialization_metrics["metadata"].get("config", {})
+        for field in ("test_manifest_sha256", "data_root", "test_coarse_root"):
+            if trained_config.get(field) != initialization_config.get(field):
+                raise ValueError(
+                    f"The CCDD-11 evaluations use different {field}: "
+                    f"{trained_config.get(field)!r} != "
+                    f"{initialization_config.get(field)!r}"
+                )
     trained_family = trained_metrics["metadata"].get("task_family", "pair")
     initialization_family = initialization_metrics["metadata"].get(
         "task_family", "pair"
@@ -297,8 +326,13 @@ def run(args: argparse.Namespace) -> None:
         "protocol": (
             "cdd11-selective-difix-triple-trained-vs-initialization-v1"
             if trained_family == "triple"
-            else "cdd11-selective-difix-trained-vs-initialization-v1"
+            else (
+                "ccdd11-old-style-trained-vs-initialization-v1"
+                if trained_dataset == "CCDD-11"
+                else "cdd11-selective-difix-trained-vs-initialization-v1"
+            )
         ),
+        "dataset": trained_dataset,
         "task_family": trained_family,
         "trained_dir": str(trained_dir),
         "initialization_dir": str(initialization_dir),

@@ -18,6 +18,7 @@ export CCDD_ROOT=/path/to/CCDD-11
 export CCDD_COARSE_ROOT=/path/to/CCDD11-DACG-coarse
 export DACG_CKPT=/path/to/dacg/checkpoints/final.pth
 export RUN_ROOT=/path/to/ccdd11-difix-runs
+export FORMAL_RUN="$RUN_ROOT/ccdd-all5-bs4-100k-lucid-seed42-v1"
 ```
 
 ## 2. 数据审计
@@ -173,7 +174,93 @@ accelerate launch --mixed_precision=bf16 train_ccdd11_difix.py \
 
 只有 audit、manifest、smoke 和 5k pilot 均通过并人工确认后才运行此命令。
 
-## 8. 兼容性和实验边界
+## 8. 100k 完成后的 half_test 旧式正式评估
+
+以下流程只能在 100k 正式训练完成后执行。先确认 `best_validation.json`，并记录仅由
+`half_train` 的 `validation_full/psnr` 选出的 checkpoint 身份：
+
+```bash
+cat "$FORMAL_RUN/best_validation.json"
+sha256sum "$FORMAL_RUN/checkpoints/best_psnr.pkl" \
+  | tee "$FORMAL_RUN/best_psnr.sha256"
+```
+
+不得用 half_test 比较 milestone、调整超参、选择 checkpoint 或继续训练。
+
+### 8.1 生成 1000 张 half_test DACG coarse
+
+必须使用与 half_train 完全相同的 `$DACG_CKPT`：
+
+```bash
+python -u prepare_ccdd11_coarse.py \
+  --data-root "$CCDD_ROOT" \
+  --split half_test \
+  --dacg-checkpoint "$DACG_CKPT" \
+  --coarse-root "$CCDD_COARSE_ROOT" \
+  --degradation-pairs 1 2 3 4 5 \
+  --device cuda
+```
+
+完成后 `$CCDD_COARSE_ROOT/half_test` 应含 5 × 200 = 1000 张图及状态为
+`completed` 的 `coarse_preparation.json`。生成器会拒绝混用 half_train、不同数据根或
+不同 DACG checkpoint 的断点目录。
+
+### 8.2 trained best 的 2000 条评估
+
+```bash
+python -u evaluate_ccdd11_difix.py \
+  --data-root "$CCDD_ROOT" \
+  --test-coarse-root "$CCDD_COARSE_ROOT/half_test" \
+  --checkpoint "$FORMAL_RUN/checkpoints/best_psnr.pkl" \
+  --output-dir "$FORMAL_RUN/half_test_best_psnr" \
+  --degradation-pairs 1 2 3 4 5 \
+  --resolution 512 \
+  --lora-rank-vae 4 \
+  --timestep 199 \
+  --workers 8 \
+  --mixed-precision bf16 \
+  --seed 42 \
+  --enable-xformers-memory-efficient-attention
+```
+
+target 固定为 `half_test/main_data/<preserve>/<scene>.png`；不会读取 `sub_data`、
+`_half_` 或 `half_train`。默认保存全部 prediction，并可从 `records/` 断点续跑。
+
+### 8.3 同协议 step-0 initialization
+
+```bash
+python -u evaluate_ccdd11_difix.py \
+  --model-source initialization \
+  --data-root "$CCDD_ROOT" \
+  --test-coarse-root "$CCDD_COARSE_ROOT/half_test" \
+  --output-dir "$FORMAL_RUN/half_test_initialization_seed42" \
+  --degradation-pairs 1 2 3 4 5 \
+  --resolution 512 \
+  --lora-rank-vae 4 \
+  --timestep 199 \
+  --workers 8 \
+  --mixed-precision bf16 \
+  --seed 42 \
+  --enable-xformers-memory-efficient-attention
+```
+
+### 8.4 逐图配对与 scene-cluster bootstrap
+
+```bash
+python -u compare_ccdd11_difix.py \
+  --trained-dir "$FORMAL_RUN/half_test_best_psnr" \
+  --initialization-dir "$FORMAL_RUN/half_test_initialization_seed42" \
+  --output-dir "$FORMAL_RUN/half_test_trained_vs_initialization" \
+  --bootstrap-resamples 10000 \
+  --bootstrap-seed 42
+```
+
+比较器会先校验 dataset、manifest SHA256、数据/coarse 根、sample ID、prompt、
+target/degraded/coarse 路径及 degraded/coarse 指标一致，再按 scene 聚类计算 95% CI。
+正式报告应包含 task-macro、10 个有向任务、final-vs-coarse 提升和胜率，以及
+trained-vs-initialization 的 bootstrap CI。
+
+## 9. 兼容性和实验边界
 
 `train_cdd11_difix.py` 的默认 `--dataset-format` 仍为 `cdd11`，target 仍来自
 `CDD11/train/<preserve>`。CCDD 入口默认 `ccdd11`，但模型、两路视觉输入、prompt、

@@ -1,4 +1,4 @@
-"""Evaluate trained or initialization-only selective Difix on CDD11 test."""
+"""Evaluate trained or initialization-only selective Difix on an official test split."""
 
 from __future__ import annotations
 
@@ -114,6 +114,26 @@ def _infer_pair_ids(checkpoint: Path, explicit: list[int] | None) -> list[int]:
     return pair_ids
 
 
+def _verify_training_dataset(checkpoint: Path, dataset_format: str) -> None:
+    """Reject using a CDD-trained checkpoint as the formal CCDD test model."""
+
+    if dataset_format != "ccdd11":
+        return
+    preparation = checkpoint.parent.parent / "prepared" / "split_and_preparation.json"
+    if not preparation.is_file():
+        raise ValueError(
+            "CCDD-11 evaluation requires the training split_and_preparation.json "
+            f"next to the checkpoint: {preparation}"
+        )
+    info = json.loads(preparation.read_text(encoding="utf-8"))
+    if info.get("dataset") != "CCDD-11" or info.get("target_kind") != (
+        "native_selective_sub_data"
+    ):
+        raise ValueError(
+            "The checkpoint run is not identified as CCDD-11 native selective training"
+        )
+
+
 def _autocast(device: torch.device, mixed_precision: str):
     if mixed_precision == "no" or device.type != "cuda":
         return nullcontext()
@@ -173,8 +193,29 @@ def run(args: argparse.Namespace) -> None:
     from .validation import comparison_image, stratified_indices
 
     model_source = getattr(args, "model_source", "trained")
+    dataset_format = getattr(args, "dataset_format", "cdd11")
     triple_ids = getattr(args, "triple_combinations", None)
     triple_mode = triple_ids is not None
+    if dataset_format == "ccdd11" and triple_mode:
+        raise ValueError("CCDD-11 half_test adapter currently supports pair tasks only")
+    if dataset_format == "ccdd11":
+        fixed_protocol = {
+            "resolution": 512,
+            "lora_rank_vae": 4,
+            "timestep": 199,
+            "seed": 42,
+        }
+        mismatches = {
+            key: (getattr(args, key), expected)
+            for key, expected in fixed_protocol.items()
+            if getattr(args, key) != expected
+        }
+        if mismatches:
+            details = ", ".join(
+                f"{key}={actual!r} (expected {expected!r})"
+                for key, (actual, expected) in mismatches.items()
+            )
+            raise ValueError(f"CCDD-11 official evaluation protocol mismatch: {details}")
     prompt_template = getattr(args, "triple_prompt_template", "preserve-first")
     triple_task_mode = getattr(args, "triple_task_mode", "preserve-one")
     if not triple_mode and triple_task_mode != "preserve-one":
@@ -185,6 +226,7 @@ def run(args: argparse.Namespace) -> None:
             raise ValueError("--checkpoint is required for --model-source trained")
         if not checkpoint.is_file():
             raise FileNotFoundError(checkpoint)
+        _verify_training_dataset(checkpoint, dataset_format)
         if triple_mode:
             selection_ids = [triple_id for triple_id, _ in selected_triples(triple_ids)]
             task_prefix = (
@@ -234,7 +276,13 @@ def run(args: argparse.Namespace) -> None:
         )
         total = expected_triple_test_count(selection_ids)
     else:
-        prepared = prepare_selective_test_manifest(
+        if dataset_format == "ccdd11":
+            from .ccdd_prepare import prepare_ccdd11_selective_test_manifest
+
+            prepare_test_manifest = prepare_ccdd11_selective_test_manifest
+        else:
+            prepare_test_manifest = prepare_selective_test_manifest
+        prepared = prepare_test_manifest(
             data_root=args.data_root,
             coarse_root=args.test_coarse_root,
             output_dir=output_dir,
@@ -246,8 +294,19 @@ def run(args: argparse.Namespace) -> None:
         raise RuntimeError(
             f"Expected {total} directed test samples, got {prepared['test_samples']}"
         )
+    manifest_records = {
+        str(record["id"]): record
+        for record in (
+            json.loads(line)
+            for line in Path(prepared["manifest"])
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        )
+    }
 
     config = {
+        "dataset_format": dataset_format,
         "data_root": str(args.data_root.resolve()),
         "test_coarse_root": str(args.test_coarse_root.resolve()),
         "test_manifest_sha256": _file_sha256(prepared["manifest"]),
@@ -321,9 +380,17 @@ def run(args: argparse.Namespace) -> None:
     )
     if args.enable_xformers_memory_efficient_attention:
         model.unet.enable_xformers_memory_efficient_attention()
-    global_step = (
-        load_model_checkpoint(model, checkpoint) if model_source == "trained" else 0
-    )
+    if model_source == "trained":
+        checkpoint_requirements = (
+            {"expected_dataset": "CCDD-11", "expected_seed": 42}
+            if dataset_format == "ccdd11"
+            else {}
+        )
+        global_step = load_model_checkpoint(
+            model, checkpoint, **checkpoint_requirements
+        )
+    else:
+        global_step = 0
     model.set_eval()
     metric_suite = FullReferenceMetricSuite(device)
 
@@ -424,6 +491,9 @@ def run(args: argparse.Namespace) -> None:
             "remove": remove,
             "preserve": preserve,
             "prompt": batch["prompt"][0],
+            "coarse_path": manifest_records[sample_id]["image"],
+            "degraded_path": manifest_records[sample_id]["ref_image"],
+            "target_path": manifest_records[sample_id]["target_image"],
             "inference_seed": inference_seed,
             **flatten_sample_metrics(stage_metrics),
             "inference_time_seconds": elapsed,
@@ -463,10 +533,15 @@ def run(args: argparse.Namespace) -> None:
             else (
                 "cdd11-selective-difix-triple-ood-test-v1"
                 if triple_mode
-                else "cdd11-selective-difix-test-v1"
+                else (
+                    "ccdd11-old-style-selective-difix-half-test-v1"
+                    if dataset_format == "ccdd11"
+                    else "cdd11-selective-difix-test-v1"
+                )
             )
         ),
         "task_family": "triple" if triple_mode else "pair",
+        "dataset": "CCDD-11" if dataset_format == "ccdd11" else "CDD-11",
         "model_source": model_source,
         "global_step": global_step,
         "created_at_utc": _now(),
@@ -558,7 +633,7 @@ def run(args: argparse.Namespace) -> None:
     )
 
 
-def parser() -> argparse.ArgumentParser:
+def parser(default_dataset_format: str = "cdd11") -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description=__doc__)
     value.add_argument("--data-root", type=Path, required=True)
     value.add_argument("--test-coarse-root", type=Path, required=True)
@@ -567,6 +642,10 @@ def parser() -> argparse.ArgumentParser:
     )
     value.add_argument("--checkpoint", type=Path)
     value.add_argument("--output-dir", type=Path)
+    value.add_argument(
+        "--dataset-format", choices=("cdd11", "ccdd11"),
+        default=default_dataset_format,
+    )
     selection = value.add_mutually_exclusive_group()
     selection.add_argument(
         "--degradation-pairs", nargs="+", type=int, choices=range(1, 6)
@@ -603,8 +682,8 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
-def main() -> None:
-    run(parser().parse_args())
+def main(default_dataset_format: str = "cdd11") -> None:
+    run(parser(default_dataset_format).parse_args())
 
 
 if __name__ == "__main__":
