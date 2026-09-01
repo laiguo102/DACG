@@ -21,6 +21,13 @@ METRIC_NAMES = (
     "coarse_ssim",
 )
 
+NEGATIVE_METRIC_NAMES = (
+    "psnr",
+    "ssim",
+    "lpips",
+    "mean_absolute_change",
+)
+
 
 def stratified_indices(records: list[dict], total: int) -> list[int]:
     """Round-robin fixed records across all directed degradation tasks."""
@@ -66,6 +73,26 @@ def comparison_image(
         display_image(target[0]),
         display_image(prediction[0]),
         display_image(ground_truth[0]),
+    )
+    return torch.cat(panels, dim=-1)
+
+
+def negative_comparison_image(
+    source: torch.Tensor,
+    coarse: torch.Tensor,
+    prediction: torch.Tensor,
+) -> torch.Tensor:
+    """Join degraded, DACG, signed texture, final output, and absolute change."""
+
+    degraded = display_image(source[0, 0])
+    final = display_image(prediction[0])
+    absolute_change = (final - degraded).abs()
+    panels = (
+        degraded,
+        display_image(coarse[0]),
+        display_image(source[0, 1]),
+        final,
+        absolute_change,
     )
     return torch.cat(panels, dim=-1)
 
@@ -153,6 +180,72 @@ def validate(
             task_prefix = f"tasks/{pair}/remove_{task.remove}"
             for name, value in zip(METRIC_NAMES, task_means):
                 metrics[f"{task_prefix}/{name}"] = value
+    return metrics, visualizations
+
+
+@torch.inference_mode()
+def validate_negative(
+    model: torch.nn.Module,
+    loader,
+    lpips_model: torch.nn.Module,
+    accelerator: Any,
+    *,
+    limit: int = 0,
+    visualization_limit: int = 0,
+) -> tuple[dict[str, float], list[tuple[torch.Tensor, str]]]:
+    """Evaluate deterministic preserve-both identity tasks separately."""
+
+    model.eval()
+    rows: list[torch.Tensor] = []
+    visualizations: list[tuple[torch.Tensor, str]] = []
+    try:
+        for index, batch in enumerate(loader):
+            if limit > 0 and index >= limit:
+                break
+            source = batch["conditioning_pixel_values"]
+            target = batch["output_pixel_values"]
+            coarse = batch["dacg_coarse_pixel_values"]
+            prediction = model(source, prompt_tokens=batch["input_ids"])
+
+            prediction_01 = prediction.float().add(1).mul(0.5).clamp(0, 1)
+            target_01 = target.float().add(1).mul(0.5).clamp(0, 1)
+            metric_values = (
+                rgb_psnr(prediction_01, target_01),
+                rgb_ssim(prediction_01, target_01),
+                lpips_model(prediction.float(), target.float()).mean().detach().item(),
+                (prediction_01 - target_01).abs().mean().detach().item(),
+            )
+            pair_id = int(batch["pair_id"][0])
+            rows.append(
+                prediction.new_tensor((*metric_values, pair_id), dtype=torch.float32)
+            )
+            if accelerator.is_main_process and len(visualizations) < visualization_limit:
+                caption = (
+                    f"{batch['sample_id'][0]} | {batch['prompt'][0]} | "
+                    "left to right: double degraded | DACG coarse | signed texture | "
+                    "Difix final | absolute change"
+                )
+                visualizations.append(
+                    (negative_comparison_image(source, coarse, prediction), caption)
+                )
+    finally:
+        model.train()
+        accelerator.unwrap_model(model).set_train()
+
+    if not rows:
+        raise ValueError("negative validation loader produced no samples")
+    gathered = accelerator.gather_for_metrics(torch.stack(rows))
+    metric_rows = gathered[:, : len(NEGATIVE_METRIC_NAMES)].float()
+    means = metric_rows.mean(0).cpu().tolist()
+    metrics = dict(zip(NEGATIVE_METRIC_NAMES, means))
+    pair_codes = gathered[:, len(NEGATIVE_METRIC_NAMES)].long()
+    for pair_id, pair in sorted(PAIR_FOLDERS.items()):
+        mask = pair_codes == pair_id
+        if not bool(mask.any()):
+            continue
+        pair_means = metric_rows[mask].mean(0).cpu().tolist()
+        for name, value in zip(NEGATIVE_METRIC_NAMES, pair_means):
+            metrics[f"pairs/{pair}/{name}"] = value
     return metrics, visualizations
 
 

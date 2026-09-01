@@ -86,6 +86,14 @@ def directed_tasks(pair_id: int) -> tuple[DirectedTask, DirectedTask]:
     )
 
 
+def preserve_pair_prompt(pair_id: int) -> str:
+    """Return the identity-task prompt that preserves both pair components."""
+
+    pair = PAIR_FOLDERS[pair_id]
+    first, second = pair.split("_")
+    return f"preserve {PROMPT_NAMES[first]}, preserve {PROMPT_NAMES[second]}"
+
+
 def selected_triples(
     triple_ids: list[int] | tuple[int, ...],
 ) -> list[tuple[int, str]]:

@@ -8,6 +8,12 @@ remove A, preserve B
 -> half_train/sub_data/A_B/<scene>/<scene>_B_.png
 ```
 
+训练读取每条有向记录时还会以 `--negative-train-probability` 动态切换到
+preserve-both 负样本，默认概率为 `0.2`。负样本使用
+`preserve A, preserve B`，两路 condition 为双退化原图及有符号
+`原图-DACG coarse` 纹理，target 为同一张双退化原图。该参数只属于
+`train_ccdd11_difix.py`；设为 `0` 可恢复原正样本训练行为。
+
 `_half_` 不参与监督，`half_test` 不参与训练或验证。第一阶段复用现有 CDD-trained
 full-restoration DACG checkpoint；不在本实验中重训 DACG。
 
@@ -79,6 +85,7 @@ accelerate launch --mixed_precision=bf16 train_ccdd11_difix.py \
   --coarse-root "$CCDD_COARSE_ROOT/half_train" \
   --output-dir "$RUN_ROOT/ccdd-selective-smoke" \
   --degradation-pairs 1 2 3 4 5 \
+  --negative-train-probability 0.2 \
   --resolution 512 \
   --max-train-steps 2 \
   --train-batch-size 4 \
@@ -101,7 +108,10 @@ accelerate launch --mixed_precision=bf16 train_ccdd11_difix.py \
 
 检查 overall 与 10 个 `validation[/_full]/tasks/...` 方向指标、五联图、`latest`、
 milestone 和 `best_psnr`。训练 loss 同时提供旧键 `train/l2`,`train/lpips` 和规范键
-`train/loss_l2`,`train/loss_lpips`。
+`train/loss_l2`,`train/loss_lpips`，并以 `train/negative_fraction` 记录实际负样本比例。
+另检查 `validation_negative[/_full]` 的 PSNR、SSIM、LPIPS、
+`mean_absolute_change`、五个 pair 分组指标及负样本五联图。负验证按 scene/pair
+去重为 590 条，不参与 `best_psnr` 选择。
 
 ## 6. 5000-step pilot 与恢复
 
@@ -111,6 +121,7 @@ accelerate launch --mixed_precision=bf16 train_ccdd11_difix.py \
   --coarse-root "$CCDD_COARSE_ROOT/half_train" \
   --output-dir "$RUN_ROOT/ccdd-all5-bs4-5k-lucid-seed42-v1" \
   --degradation-pairs 1 2 3 4 5 \
+  --negative-train-probability 0.2 \
   --resolution 512 \
   --max-train-steps 5000 \
   --train-batch-size 4 \
@@ -148,6 +159,7 @@ accelerate launch --mixed_precision=bf16 train_ccdd11_difix.py \
   --coarse-root "$CCDD_COARSE_ROOT/half_train" \
   --output-dir "$RUN_ROOT/ccdd-all5-bs4-100k-lucid-seed42-v1" \
   --degradation-pairs 1 2 3 4 5 \
+  --negative-train-probability 0.2 \
   --resolution 512 \
   --max-train-steps 100000 \
   --train-batch-size 4 \

@@ -1,3 +1,4 @@
+import argparse
 import importlib.util
 import json
 from pathlib import Path
@@ -287,15 +288,84 @@ def test_real_ccdd_manifest_dataset_tensor_contract(tmp_path):
     assert tuple(sample["ground_truth_pixel_values"].shape) == (3, 512, 512)
     assert torch.equal(sample["input_ids"], torch.tensor([1, 2, 3, 4]))
 
+    negative_validation = SelectiveDifixDataset(
+        result["validation_manifest"],
+        Tokenizer(),
+        resolution=512,
+        training_mode="negative",
+        deduplicate_negative=True,
+    )
+    assert len(negative_validation) == 1
+    negative = negative_validation[0]
+    assert negative["training_mode"] == "negative"
+    assert negative["prompt"] == "preserve low light, preserve haze"
+    assert torch.equal(
+        negative["conditioning_pixel_values"][0], negative["output_pixel_values"]
+    )
+
 
 def test_training_parser_defaults_keep_cdd11_and_ccdd_wrapper_can_override():
-    from difix3d_selective.train import parser
+    from difix3d_selective.train import parser, probability
 
     cdd_defaults = {action.dest: action.default for action in parser()._actions}
     ccdd_defaults = {action.dest: action.default for action in parser("ccdd11")._actions}
     assert cdd_defaults["dataset_format"] == "cdd11"
     assert ccdd_defaults["dataset_format"] == "ccdd11"
     assert cdd_defaults["prepare_only"] is False
+    assert "negative_train_probability" not in cdd_defaults
+    assert ccdd_defaults["negative_train_probability"] == 0.2
+    assert probability("0") == 0.0
+    assert probability("1") == 1.0
+    with pytest.raises(argparse.ArgumentTypeError, match=r"\[0, 1\]"):
+        probability("1.01")
+
+
+def test_ccdd_checkpoint_metadata_describes_negative_training_contract():
+    from difix3d_selective.train import _experiment_metadata
+
+    metadata = _experiment_metadata(
+        SimpleNamespace(
+            dataset_format="ccdd11",
+            seed=42,
+            degradation_pairs=[1, 2, 3, 4, 5],
+            negative_train_probability=0.2,
+        )
+    )
+    assert metadata["negative_train_probability"] == 0.2
+    assert metadata["training_mode_sampling"] == "dynamic_per_record_read"
+    assert metadata["negative_prompt"] == "preserve A, preserve B"
+    assert metadata["negative_condition"] == [
+        "original double-degradation image",
+        "signed original-minus-DACG texture",
+    ]
+
+
+def test_negative_validation_deduplicates_directions_to_590_records(tmp_path):
+    from difix3d_selective.data import SelectiveDifixDataset
+
+    records = []
+    for scene_index in range(118):
+        for pair_id in range(1, 6):
+            for direction in range(2):
+                records.append(
+                    {
+                        "scene_id": f"{scene_index:05d}",
+                        "pair_id": pair_id,
+                        "direction": direction,
+                    }
+                )
+    manifest = tmp_path / "validation.jsonl"
+    manifest.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    dataset = SelectiveDifixDataset(
+        manifest,
+        tokenizer=None,
+        training_mode="negative",
+        deduplicate_negative=True,
+    )
+    assert len(dataset) == 590
 
 
 def test_evaluation_parser_defaults_keep_cdd11_and_ccdd_wrapper_can_override():
@@ -350,6 +420,53 @@ def test_validation_reports_directed_task_metrics():
     assert "psnr" in metrics
     assert "tasks/low_haze/remove_low/psnr" in metrics
     assert "tasks/low_haze/remove_low/lpips" in metrics
+
+
+def test_negative_validation_reports_identity_metrics_and_visualization():
+    from difix3d_selective.validation import validate_negative
+
+    class Model(torch.nn.Module):
+        def forward(self, source, prompt_tokens):
+            return source[:, 0]
+
+        def set_train(self):
+            self.train()
+
+    class Lpips(torch.nn.Module):
+        def forward(self, prediction, target):
+            return (prediction - target).abs().mean((1, 2, 3), keepdim=True)
+
+    class Accelerator:
+        is_main_process = True
+
+        @staticmethod
+        def unwrap_model(model):
+            return model
+
+        @staticmethod
+        def gather_for_metrics(value):
+            return value
+
+    source = torch.zeros(1, 2, 3, 12, 12)
+    source[:, 0].fill_(-0.5)
+    source[:, 1].fill_(0.25)
+    batch = {
+        "conditioning_pixel_values": source,
+        "output_pixel_values": source[:, 0].clone(),
+        "dacg_coarse_pixel_values": torch.full((1, 3, 12, 12), -0.75),
+        "input_ids": torch.ones(1, 4, dtype=torch.long),
+        "sample_id": ["validation/low_haze/00001/negative"],
+        "prompt": ["preserve low light, preserve haze"],
+        "pair_id": torch.tensor([1]),
+    }
+    metrics, visualizations = validate_negative(
+        Model(), [batch], Lpips(), Accelerator(), visualization_limit=1
+    )
+    assert metrics["mean_absolute_change"] == 0.0
+    assert metrics["lpips"] == 0.0
+    assert "pairs/low_haze/psnr" in metrics
+    assert len(visualizations) == 1
+    assert tuple(visualizations[0][0].shape) == (3, 12, 60)
 
 
 def test_audit_decodes_data_counts_half_and_renders_semantic_montages(tmp_path):

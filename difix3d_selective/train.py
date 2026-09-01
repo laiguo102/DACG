@@ -15,6 +15,9 @@ from .loss import gram_loss
 
 
 VISUALIZATION_KEY = "validation/degraded_coarse_target_final_gt"
+NEGATIVE_VISUALIZATION_KEY = (
+    "validation_negative/double_degraded_dacg_signed_texture_final_abs_error"
+)
 
 
 def trigger_schedule(step: int, max_steps: int, frequency: int) -> bool:
@@ -27,6 +30,18 @@ def gram_is_enabled(weight: float, step: int, warmup_steps: int) -> bool:
     """Match released Difix3D: enable Gram only after its warmup phase."""
 
     return weight > 0 and step >= warmup_steps
+
+
+def probability(value: str) -> float:
+    """Parse a closed-interval probability for argparse."""
+
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("probability must be a number") from error
+    if not 0.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError("probability must be in [0, 1]")
+    return parsed
 
 
 def _make_loader(dataset, *, batch_size: int, shuffle: bool, workers: int):
@@ -58,7 +73,7 @@ def _best_state(output_dir: Path) -> dict[str, float | int]:
 
 def _experiment_metadata(args: argparse.Namespace) -> dict:
     dataset_format = getattr(args, "dataset_format", "cdd11")
-    return {
+    metadata = {
         "dataset": "CCDD-11" if dataset_format == "ccdd11" else "CDD-11",
         "target": (
             "native sub_data selective target"
@@ -68,6 +83,22 @@ def _experiment_metadata(args: argparse.Namespace) -> dict:
         "seed": int(args.seed),
         "pairs": list(args.degradation_pairs),
     }
+    if dataset_format == "ccdd11":
+        metadata.update(
+            {
+                "negative_train_probability": float(
+                    getattr(args, "negative_train_probability", 0.0)
+                ),
+                "training_mode_sampling": "dynamic_per_record_read",
+                "negative_prompt": "preserve A, preserve B",
+                "negative_condition": [
+                    "original double-degradation image",
+                    "signed original-minus-DACG texture",
+                ],
+                "negative_target": "original double-degradation image",
+            }
+        )
+    return metadata
 
 
 def _prepare_manifests(args: argparse.Namespace, output_dir: Path) -> dict:
@@ -104,12 +135,13 @@ def _log_validation(
     prefix: str,
     step: int,
     visualizations=None,
+    visualization_key: str = VISUALIZATION_KEY,
 ) -> None:
     from .validation import wandb_images
 
     payload = {f"{prefix}/{key}": value for key, value in metrics.items()}
     if visualizations and accelerator.is_main_process:
-        payload[VISUALIZATION_KEY] = wandb_images(visualizations)
+        payload[visualization_key] = wandb_images(visualizations)
     accelerator.log(payload, step=step)
 
 
@@ -126,7 +158,12 @@ def run(args: argparse.Namespace) -> None:
 
     from .data import SelectiveDifixDataset
     from .model import SelectiveDifix, load_training_checkpoint, save_training_checkpoint
-    from .validation import stratified_indices, validate, wandb_images
+    from .validation import (
+        stratified_indices,
+        validate,
+        validate_negative,
+        wandb_images,
+    )
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -183,11 +220,24 @@ def run(args: argparse.Namespace) -> None:
             model, optimizer, lr_scheduler, args.resume.resolve()
         )
 
+    negative_validation_enabled = (
+        args.dataset_format == "ccdd11"
+        and hasattr(args, "negative_train_probability")
+    )
+    negative_train_probability = (
+        float(args.negative_train_probability) if negative_validation_enabled else 0.0
+    )
     train_dataset = SelectiveDifixDataset(
-        train_manifest, model.tokenizer, resolution=args.resolution
+        train_manifest,
+        model.tokenizer,
+        resolution=args.resolution,
+        negative_probability=negative_train_probability,
     )
     validation_dataset = SelectiveDifixDataset(
-        validation_manifest, model.tokenizer, resolution=args.resolution
+        validation_manifest,
+        model.tokenizer,
+        resolution=args.resolution,
+        training_mode="positive",
     )
     fast_indices = stratified_indices(
         validation_dataset.records, args.num_validation_samples
@@ -214,23 +264,84 @@ def run(args: argparse.Namespace) -> None:
         workers=min(args.dataloader_num_workers, 4),
     )
 
-    (
-        model,
-        optimizer,
-        train_loader,
-        fast_validation_loader,
-        full_validation_loader,
-        visualization_loader,
-        lr_scheduler,
-    ) = accelerator.prepare(
-        model,
-        optimizer,
-        train_loader,
-        fast_validation_loader,
-        full_validation_loader,
-        visualization_loader,
-        lr_scheduler,
-    )
+    negative_fast_validation_loader = None
+    negative_full_validation_loader = None
+    negative_visualization_loader = None
+    if negative_validation_enabled:
+        negative_validation_dataset = SelectiveDifixDataset(
+            validation_manifest,
+            model.tokenizer,
+            resolution=args.resolution,
+            training_mode="negative",
+            deduplicate_negative=True,
+        )
+        negative_fast_indices = stratified_indices(
+            negative_validation_dataset.records, args.num_validation_samples
+        )
+        negative_visualization_indices = stratified_indices(
+            negative_validation_dataset.records, args.num_validation_visualizations
+        )
+        negative_fast_validation_loader = _make_loader(
+            Subset(negative_validation_dataset, negative_fast_indices),
+            batch_size=1,
+            shuffle=False,
+            workers=min(args.dataloader_num_workers, 4),
+        )
+        negative_full_validation_loader = _make_loader(
+            negative_validation_dataset,
+            batch_size=1,
+            shuffle=False,
+            workers=min(args.dataloader_num_workers, 4),
+        )
+        negative_visualization_loader = _make_loader(
+            Subset(negative_validation_dataset, negative_visualization_indices),
+            batch_size=1,
+            shuffle=False,
+            workers=min(args.dataloader_num_workers, 4),
+        )
+
+    if negative_validation_enabled:
+        (
+            model,
+            optimizer,
+            train_loader,
+            fast_validation_loader,
+            full_validation_loader,
+            visualization_loader,
+            negative_fast_validation_loader,
+            negative_full_validation_loader,
+            negative_visualization_loader,
+            lr_scheduler,
+        ) = accelerator.prepare(
+            model,
+            optimizer,
+            train_loader,
+            fast_validation_loader,
+            full_validation_loader,
+            visualization_loader,
+            negative_fast_validation_loader,
+            negative_full_validation_loader,
+            negative_visualization_loader,
+            lr_scheduler,
+        )
+    else:
+        (
+            model,
+            optimizer,
+            train_loader,
+            fast_validation_loader,
+            full_validation_loader,
+            visualization_loader,
+            lr_scheduler,
+        ) = accelerator.prepare(
+            model,
+            optimizer,
+            train_loader,
+            fast_validation_loader,
+            full_validation_loader,
+            visualization_loader,
+            lr_scheduler,
+        )
     perceptual_model = perceptual_model.to(accelerator.device)
     if vgg is not None:
         vgg = vgg.to(accelerator.device)
@@ -252,6 +363,16 @@ def run(args: argparse.Namespace) -> None:
             run_tracker = accelerator.get_tracker("wandb", unwrap=True)
             run_tracker.define_metric("validation_full/psnr", summary="max")
             run_tracker.define_metric("validation_full/ssim", summary="max")
+            if negative_validation_enabled:
+                run_tracker.define_metric(
+                    "validation_negative_full/psnr", summary="max"
+                )
+                run_tracker.define_metric(
+                    "validation_negative_full/ssim", summary="max"
+                )
+                run_tracker.define_metric(
+                    "validation_negative_full/mean_absolute_change", summary="min"
+                )
 
     best = _best_state(output_dir) if accelerator.is_main_process else None
     experiment_metadata = _experiment_metadata(args)
@@ -262,6 +383,8 @@ def run(args: argparse.Namespace) -> None:
         disable=not accelerator.is_local_main_process,
     )
     train_iterator = iter(train_loader)
+    negative_samples_since_sync = 0
+    training_samples_since_sync = 0
     while global_step < args.max_train_steps:
         try:
             batch = next(train_iterator)
@@ -271,6 +394,8 @@ def run(args: argparse.Namespace) -> None:
 
         source = batch["conditioning_pixel_values"]
         target = batch["output_pixel_values"]
+        negative_samples_since_sync += int(batch["is_negative"].sum().item())
+        training_samples_since_sync += int(batch["is_negative"].numel())
         with accelerator.accumulate(model):
             prediction = model(source, prompt_tokens=batch["input_ids"])
             loss_l2 = F.mse_loss(prediction.float(), target.float()) * args.lambda_l2
@@ -304,6 +429,17 @@ def run(args: argparse.Namespace) -> None:
             continue
         global_step += 1
         progress.update(1)
+        local_mode_counts = torch.tensor(
+            [negative_samples_since_sync, training_samples_since_sync],
+            device=accelerator.device,
+            dtype=torch.long,
+        )
+        global_mode_counts = accelerator.gather(local_mode_counts).reshape(-1, 2).sum(0)
+        realized_negative_fraction = float(
+            global_mode_counts[0].float().div(global_mode_counts[1]).item()
+        )
+        negative_samples_since_sync = 0
+        training_samples_since_sync = 0
         logs = {
             "train/l2": float(loss_l2.detach()),
             "train/lpips": float(loss_lpips.detach()),
@@ -312,6 +448,7 @@ def run(args: argparse.Namespace) -> None:
             "train/gram": float(loss_gram.detach()),
             "train/loss": float(loss.detach()),
             "train/learning_rate": lr_scheduler.get_last_lr()[0],
+            "train/negative_fraction": realized_negative_fraction,
         }
         progress.set_postfix(loss=logs["train/loss"])
         if args.report_to != "none":
@@ -321,6 +458,7 @@ def run(args: argparse.Namespace) -> None:
         full_due = trigger_schedule(global_step, args.max_train_steps, args.full_eval_freq)
         visualization_due = trigger_schedule(global_step, args.max_train_steps, args.viz_freq)
         visualizations = []
+        negative_visualizations = []
         if fast_due:
             fast_metrics, visualizations = validate(
                 model,
@@ -340,6 +478,30 @@ def run(args: argparse.Namespace) -> None:
             )
             if accelerator.is_main_process:
                 print(f"validation step={global_step}: {fast_metrics}", flush=True)
+            if negative_validation_enabled:
+                negative_fast_metrics, negative_visualizations = validate_negative(
+                    model,
+                    negative_fast_validation_loader,
+                    perceptual_model,
+                    accelerator,
+                    visualization_limit=(
+                        args.num_validation_visualizations if visualization_due else 0
+                    ),
+                )
+                _log_validation(
+                    accelerator,
+                    negative_fast_metrics,
+                    prefix="validation_negative",
+                    step=global_step,
+                    visualizations=negative_visualizations,
+                    visualization_key=NEGATIVE_VISUALIZATION_KEY,
+                )
+                if accelerator.is_main_process:
+                    print(
+                        f"negative validation step={global_step}: "
+                        f"{negative_fast_metrics}",
+                        flush=True,
+                    )
 
         if visualization_due and not visualizations:
             _, visualizations = validate(
@@ -352,6 +514,28 @@ def run(args: argparse.Namespace) -> None:
             if args.report_to != "none" and accelerator.is_main_process:
                 accelerator.log(
                     {VISUALIZATION_KEY: wandb_images(visualizations)}, step=global_step
+                )
+
+        if (
+            negative_validation_enabled
+            and visualization_due
+            and not negative_visualizations
+        ):
+            _, negative_visualizations = validate_negative(
+                model,
+                negative_visualization_loader,
+                perceptual_model,
+                accelerator,
+                visualization_limit=args.num_validation_visualizations,
+            )
+            if args.report_to != "none" and accelerator.is_main_process:
+                accelerator.log(
+                    {
+                        NEGATIVE_VISUALIZATION_KEY: wandb_images(
+                            negative_visualizations
+                        )
+                    },
+                    step=global_step,
                 )
 
         if full_due:
@@ -376,6 +560,25 @@ def run(args: argparse.Namespace) -> None:
                         experiment_metadata,
                     )
                     _write_json(output_dir / "best_validation.json", best)
+            if negative_validation_enabled:
+                negative_full_metrics, _ = validate_negative(
+                    model,
+                    negative_full_validation_loader,
+                    perceptual_model,
+                    accelerator,
+                )
+                _log_validation(
+                    accelerator,
+                    negative_full_metrics,
+                    prefix="validation_negative_full",
+                    step=global_step,
+                )
+                if accelerator.is_main_process:
+                    print(
+                        f"negative full validation step={global_step}: "
+                        f"{negative_full_metrics}",
+                        flush=True,
+                    )
 
         if fast_due or full_due or visualization_due:
             gc.collect()
@@ -431,6 +634,16 @@ def parser(default_dataset_format: str = "cdd11") -> argparse.ArgumentParser:
     value.add_argument(
         "--degradation-pairs", nargs="+", type=int, choices=range(1, 6), required=True
     )
+    if default_dataset_format == "ccdd11":
+        value.add_argument(
+            "--negative-train-probability",
+            type=probability,
+            default=0.2,
+            help=(
+                "Probability of dynamically replacing a directed positive CCDD-11 "
+                "record with a preserve-both negative record on each read."
+            ),
+        )
     value.add_argument("--resolution", type=int, default=512)
     value.add_argument("--max-train-steps", type=int, default=100_000)
     value.add_argument("--train-batch-size", type=int, default=4)

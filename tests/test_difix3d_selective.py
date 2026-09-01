@@ -29,6 +29,7 @@ from difix3d_selective.protocol import (
     expected_test_count,
     expected_triple_test_count,
     make_scene_split,
+    preserve_pair_prompt,
     selected_pairs,
     selected_triples,
     triple_remove_one_tasks,
@@ -74,6 +75,16 @@ class TestSelectiveProtocol(unittest.TestCase):
             {"coarse": 3549, "train": 6390, "validation": 708},
         )
         self.assertEqual(expected_test_count([1, 3, 5]), 1200)
+        self.assertEqual(
+            [preserve_pair_prompt(pair_id) for pair_id in range(1, 6)],
+            [
+                "preserve low light, preserve haze",
+                "preserve low light, preserve rain",
+                "preserve low light, preserve snow",
+                "preserve haze, preserve rain",
+                "preserve haze, preserve snow",
+            ],
+        )
 
     def test_triple_ood_tasks_and_prompt_templates(self):
         self.assertEqual(
@@ -325,6 +336,9 @@ class TestDatasetAndPreparation(unittest.TestCase):
                 json.dumps(
                     {
                         "id": "train/low_haze/000001/remove-low-preserve-haze",
+                        "scene_id": "000001",
+                        "pair_id": 1,
+                        "pair": "low_haze",
                         "prompt": "remove low light, preserve haze",
                         "image": str(main),
                         "ref_image": str(reference),
@@ -348,6 +362,47 @@ class TestDatasetAndPreparation(unittest.TestCase):
             )
             self.assertLess(float(sample["conditioning_pixel_values"][0].mean()), -0.99)
             self.assertGreater(float(sample["output_pixel_values"][1].mean()), 0.99)
+            self.assertEqual(sample["training_mode"], "positive")
+            self.assertFalse(sample["is_negative"])
+
+            negative = SelectiveDifixDataset(
+                manifest,
+                FakeTokenizer(),
+                resolution=8,
+                negative_probability=1.0,
+            )[0]
+            self.assertEqual(negative["training_mode"], "negative")
+            self.assertTrue(negative["is_negative"])
+            self.assertEqual(
+                negative["prompt"], "preserve low light, preserve haze"
+            )
+            self.assertTrue(
+                torch.equal(
+                    negative["conditioning_pixel_values"][0],
+                    negative["output_pixel_values"],
+                )
+            )
+            texture_means = negative["conditioning_pixel_values"][1].mean((1, 2))
+            self.assertTrue(
+                torch.allclose(texture_means, torch.tensor([1.0, 0.0, 0.0]))
+            )
+
+            dynamic = SelectiveDifixDataset(
+                manifest,
+                FakeTokenizer(),
+                resolution=8,
+                negative_probability=0.2,
+            )
+            with patch("torch.rand", return_value=torch.tensor(0.1)):
+                self.assertEqual(dynamic[0]["training_mode"], "negative")
+            with patch("torch.rand", return_value=torch.tensor(0.9)):
+                self.assertEqual(dynamic[0]["training_mode"], "positive")
+            with self.assertRaisesRegex(ValueError, r"\[0, 1\]"):
+                SelectiveDifixDataset(
+                    manifest,
+                    FakeTokenizer(),
+                    negative_probability=1.1,
+                )
 
     def test_tiled_dacg_forward_reconstructs_full_shape(self):
         class Double(torch.nn.Module):
