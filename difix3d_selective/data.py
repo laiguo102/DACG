@@ -33,6 +33,23 @@ def _image_tensor(path: str, resolution: int) -> torch.Tensor:
     return TF.normalize(tensor, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 
 
+def negative_conditioning(
+    coarse: torch.Tensor, degraded: torch.Tensor
+) -> torch.Tensor:
+    """Build the preserve-both condition used by negative CCDD-11 samples."""
+
+    if coarse.shape != degraded.shape:
+        raise ValueError(
+            "coarse/degraded shape mismatch: "
+            f"coarse={tuple(coarse.shape)}, degraded={tuple(degraded.shape)}"
+        )
+    # Inputs are normalized to [-1, 1]. Multiplying their difference by 0.5
+    # converts it to the signed [0, 1]-space texture used during training.
+    degradation_texture = ((degraded - coarse) * 0.5).clamp(-1, 1)
+    stack_dimension = 1 if coarse.ndim == 4 else 0
+    return torch.stack([degraded, degradation_texture], dim=stack_dimension)
+
+
 class SelectiveDifixDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -86,11 +103,7 @@ class SelectiveDifixDataset(torch.utils.data.Dataset):
         degraded = _image_tensor(record["ref_image"], self.resolution)
         is_negative = self._is_negative()
         if is_negative:
-            # Convert the normalized tensors back to their [0, 1] difference.
-            # The resulting signed texture already occupies the VAE's [-1, 1]
-            # numeric input range, with zero degradation represented by 0.
-            degradation_texture = ((degraded - coarse) * 0.5).clamp(-1, 1)
-            conditioning = torch.stack([degraded, degradation_texture])
+            conditioning = negative_conditioning(coarse, degraded)
             target = degraded
             prompt = preserve_pair_prompt(int(record["pair_id"]))
             mode = "negative"

@@ -1,0 +1,312 @@
+import importlib.util
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
+
+import torch
+from PIL import Image
+
+from difix3d_selective.cfg_evaluate import (
+    CFG_METRIC_FIELDS,
+    CfgMetricSuite,
+    normalize_betas,
+    save_contact_sheet,
+    summarize_cfg_rows,
+    validate_full_manifest,
+)
+from difix3d_selective.data import negative_conditioning
+
+
+class MeanDistance(torch.nn.Module):
+    def forward(self, prediction, target):
+        return (prediction - target).abs().mean((1, 2, 3), keepdim=True)
+
+
+class TestCfgInputs(unittest.TestCase):
+    def test_negative_conditioning_matches_training_definition(self):
+        coarse = torch.full((2, 3, 4, 5), -0.5)
+        degraded = torch.full_like(coarse, 0.5)
+        result = negative_conditioning(coarse, degraded)
+        self.assertEqual(tuple(result.shape), (2, 2, 3, 4, 5))
+        self.assertTrue(torch.equal(result[:, 0], degraded))
+        self.assertTrue(torch.equal(result[:, 1], torch.full_like(coarse, 0.5)))
+
+    def test_beta_grid_is_sorted_unique_and_non_negative(self):
+        self.assertEqual(normalize_betas([1.2, 0, 1, 0.25]), [0, 0.25, 1, 1.2])
+        with self.assertRaisesRegex(ValueError, "unique"):
+            normalize_betas([0, 0])
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            normalize_betas([-0.1, 1])
+
+    @unittest.skipIf(
+        importlib.util.find_spec("diffusers") is None, "diffusers is not installed"
+    )
+    def test_latent_cfg_endpoints_and_extrapolation(self):
+        from difix3d_selective.model import blend_cfg_latents
+
+        positive = torch.tensor([[[[3.0]]]])
+        negative = torch.tensor([[[[1.0]]]])
+        self.assertTrue(torch.equal(blend_cfg_latents(positive, negative, 0), negative))
+        self.assertTrue(torch.equal(blend_cfg_latents(positive, negative, 1), positive))
+        self.assertAlmostEqual(float(blend_cfg_latents(positive, negative, 1.2)), 3.4)
+        with self.assertRaisesRegex(ValueError, "shape mismatch"):
+            blend_cfg_latents(positive, negative.expand(2, -1, -1, -1), 1)
+
+
+class TestCfgMetrics(unittest.TestCase):
+    def test_metric_suite_reports_all_three_references_and_training_objective(self):
+        prediction = torch.zeros(1, 3, 12, 12)
+        references = {
+            "positive_target": torch.full_like(prediction, 0.2),
+            "negative_identity": torch.full_like(prediction, -0.2),
+            "clean_gt": torch.full_like(prediction, 0.4),
+        }
+        suite = CfgMetricSuite(
+            torch.device("cpu"),
+            lpips_model=MeanDistance(),
+            dists_model=MeanDistance(),
+        )
+        result = suite(prediction, references)
+        self.assertEqual(set(result), set(CFG_METRIC_FIELDS))
+        self.assertAlmostEqual(result["positive_target_mse_l2"], 0.04, places=6)
+        self.assertAlmostEqual(result["positive_target_lpips_vgg"], 0.2, places=6)
+        self.assertAlmostEqual(
+            result["positive_target_objective_l2_lpips"], 0.24, places=6
+        )
+
+    @staticmethod
+    def _row(beta, remove, positive_objective, negative_objective, psnr):
+        row = {
+            "beta": beta,
+            "pair": "low_haze",
+            "remove": remove,
+            "preserve": "haze" if remove == "low" else "low",
+            "branch_inference_time_seconds": 1.0,
+            "decode_time_seconds": 0.5,
+        }
+        for field in CFG_METRIC_FIELDS:
+            row[field] = 0.1
+        row["positive_target_objective_l2_lpips"] = positive_objective
+        row["negative_identity_objective_l2_lpips"] = negative_objective
+        row["positive_target_psnr"] = psnr
+        return row
+
+    def test_summary_selects_positive_optima_and_reports_pareto_betas(self):
+        rows = []
+        for remove in ("low", "haze"):
+            rows.append(self._row(0.0, remove, 2.0, 0.0, 10.0))
+            rows.append(self._row(1.0, remove, 0.0, 2.0, 30.0))
+            rows.append(self._row(1.2, remove, 1.0, 3.0, 20.0))
+        summary = summarize_cfg_rows(rows)
+        self.assertEqual(
+            summary["selection"]["best_positive_target_psnr_beta"], 1.0
+        )
+        self.assertEqual(
+            summary["selection"]["best_positive_target_objective_beta"], 1.0
+        )
+        self.assertEqual(
+            summary["selection"]["positive_identity_objective_pareto_betas"],
+            [0.0, 1.0],
+        )
+        self.assertEqual(summary["betas"]["1"]["overall"]["macro"]["tasks"], 2)
+
+    def test_contact_sheet_contains_references_and_all_beta_outputs(self):
+        references = {
+            "negative_identity": torch.zeros(1, 3, 8, 10),
+            "coarse": torch.full((1, 3, 8, 10), 0.1),
+            "positive_target": torch.full((1, 3, 8, 10), 0.2),
+            "clean_gt": torch.full((1, 3, 8, 10), 0.3),
+        }
+        predictions = {
+            beta: torch.full((1, 3, 8, 10), beta / 2)
+            for beta in (0, 0.25, 0.5, 0.75, 1, 1.05, 1.1, 1.2)
+        }
+        with patch.object(Image.Image, "save", autospec=True) as save:
+            save_contact_sheet(references, predictions, Path("sheet.png"))
+        self.assertEqual(save.call_args.args[0].size, (40, 96))
+
+
+class TestCfgManifest(unittest.TestCase):
+    def test_full_manifest_requires_ten_balanced_directed_tasks(self):
+        records = []
+        pairs = {
+            1: ("low", "haze"),
+            2: ("low", "rain"),
+            3: ("low", "snow"),
+            4: ("haze", "rain"),
+            5: ("haze", "snow"),
+        }
+        for scene in range(118):
+            for pair_id, (first, second) in pairs.items():
+                pair = f"{first}_{second}"
+                for remove, preserve in ((first, second), (second, first)):
+                    records.append(
+                        {
+                            "id": f"validation/{pair}/{scene}/remove-{remove}",
+                            "split": "validation",
+                            "pair_id": pair_id,
+                            "remove": remove,
+                            "preserve": preserve,
+                        }
+                    )
+        validate_full_manifest(records)
+        with self.assertRaisesRegex(ValueError, "1180"):
+            validate_full_manifest(records[:-1])
+
+    def test_cfg_evaluator_writes_resumable_validation_outputs(self):
+        from difix3d_selective.cfg_evaluate import run
+        from difix3d_selective.protocol import PAIR_FOLDERS, directed_tasks
+
+        class Tokenizer:
+            model_max_length = 4
+
+            def __call__(self, prompts, **kwargs):
+                return SimpleNamespace(input_ids=torch.ones(len(prompts), 4, dtype=torch.long))
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self, **kwargs):
+                super().__init__()
+                self.anchor = torch.nn.Parameter(torch.zeros(()))
+                self.tokenizer = Tokenizer()
+
+            def set_eval(self):
+                self.eval().requires_grad_(False)
+
+            def cfg_latents(
+                self,
+                positive_source,
+                negative_source,
+                positive_prompt_tokens,
+                negative_prompt_tokens,
+            ):
+                return positive_source[:, 0], negative_source[:, 0], []
+
+            def decode_main_latent(self, latent, skips):
+                return latent
+
+        class FakeMetricSuite:
+            def __call__(self, prediction, references):
+                value = float(prediction.float().mean())
+                return {field: value for field in CFG_METRIC_FIELDS}
+
+        with tempfile.TemporaryDirectory(dir=".") as directory:
+            root = Path(directory).resolve()
+            run_dir = root / "run"
+            prepared = run_dir / "prepared"
+            manifests = prepared / "manifests"
+            checkpoints = run_dir / "checkpoints"
+            manifests.mkdir(parents=True)
+            checkpoints.mkdir(parents=True)
+            images = {}
+            for name, value in (
+                ("coarse", 64),
+                ("degraded", 32),
+                ("target", 96),
+                ("clean", 128),
+            ):
+                path = root / f"{name}.png"
+                Image.new("RGB", (12, 12), (value, value, value)).save(path)
+                images[name] = path
+            records = []
+            for scene in range(118):
+                for pair_id, pair in PAIR_FOLDERS.items():
+                    for task in directed_tasks(pair_id):
+                        records.append(
+                            {
+                                "id": (
+                                    f"validation/{pair}/{scene:06d}/"
+                                    f"remove-{task.remove}-preserve-{task.preserve}"
+                                ),
+                                "split": "validation",
+                                "scene_id": f"{scene:06d}",
+                                "pair_id": pair_id,
+                                "pair": pair,
+                                "remove": task.remove,
+                                "preserve": task.preserve,
+                                "prompt": task.prompt,
+                                "image": str(images["coarse"]),
+                                "ref_image": str(images["degraded"]),
+                                "target_image": str(images["target"]),
+                                "clear_image": str(images["clean"]),
+                            }
+                        )
+            manifest = manifests / "validation.jsonl"
+            manifest.write_text(
+                "\n".join(json.dumps(record) for record in records) + "\n",
+                encoding="utf-8",
+            )
+            preparation = {
+                "dataset": "CCDD-11",
+                "target_kind": "native_selective_sub_data",
+                "degradation_pairs": [
+                    {"id": pair_id, "name": pair}
+                    for pair_id, pair in PAIR_FOLDERS.items()
+                ],
+            }
+            (prepared / "split_and_preparation.json").write_text(
+                json.dumps(preparation), encoding="utf-8"
+            )
+            checkpoint = checkpoints / "best_psnr.pkl"
+            torch.save(
+                {
+                    "experiment_metadata": {
+                        "dataset": "CCDD-11",
+                        "seed": 42,
+                        "negative_train_probability": 0.2,
+                    }
+                },
+                checkpoint,
+            )
+            output_dir = root / "cfg-output"
+            args = SimpleNamespace(
+                checkpoint=checkpoint,
+                output_dir=output_dir,
+                betas=[0, 1, 1.2],
+                num_gallery_samples=2,
+                max_samples=2,
+                resolution=512,
+                lora_rank_vae=4,
+                timestep=199,
+                workers=0,
+                device="cpu",
+                mixed_precision="no",
+                seed=42,
+                enable_xformers_memory_efficient_attention=False,
+                report_to="none",
+                wandb_entity="unused",
+                wandb_project="unused",
+                wandb_run_name="unused",
+            )
+            fake_model_module = ModuleType("difix3d_selective.model")
+            fake_model_module.SelectiveDifix = FakeModel
+            fake_model_module.blend_cfg_latents = (
+                lambda positive, negative, beta: negative
+                + beta * (positive - negative)
+            )
+            fake_model_module.load_model_checkpoint = lambda *args, **kwargs: 100000
+            with (
+                patch.dict(sys.modules, {"difix3d_selective.model": fake_model_module}),
+                patch(
+                    "difix3d_selective.cfg_evaluate.CfgMetricSuite",
+                    return_value=FakeMetricSuite(),
+                ),
+            ):
+                run(args)
+
+            state = json.loads((output_dir / "state.json").read_text(encoding="utf-8"))
+            metrics = json.loads(
+                (output_dir / "metrics.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(state["status"], "completed")
+            self.assertEqual(metrics["validation_sample_count"], 2)
+            self.assertEqual(metrics["per_image_count"], 6)
+            self.assertEqual(len(list((output_dir / "records").rglob("*.json"))), 2)
+            self.assertEqual(len(list((output_dir / "gallery").rglob("contact_sheet.png"))), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -18,6 +18,19 @@ from .main_view import select_main_view, select_main_view_skips
 SD_TURBO = "stabilityai/sd-turbo"
 
 
+def blend_cfg_latents(
+    z_positive: torch.Tensor, z_negative: torch.Tensor, beta: float
+) -> torch.Tensor:
+    """Apply LUCID-style positive/negative guidance in denoised latent space."""
+
+    if z_positive.shape != z_negative.shape:
+        raise ValueError(
+            "positive/negative latent shape mismatch: "
+            f"positive={tuple(z_positive.shape)}, negative={tuple(z_negative.shape)}"
+        )
+    return z_negative + float(beta) * (z_positive - z_negative)
+
+
 def make_1step_scheduler() -> DDPMScheduler:
     scheduler = DDPMScheduler.from_pretrained(SD_TURBO, subfolder="scheduler")
     scheduler.set_timesteps(1)
@@ -150,23 +163,15 @@ class SelectiveDifix(torch.nn.Module):
     def trainable_parameters(self) -> list[torch.nn.Parameter]:
         return [parameter for parameter in self.parameters() if parameter.requires_grad]
 
-    def forward(
+    def _prompt_embeddings(
         self,
         images: torch.Tensor,
         *,
-        prompt: list[str] | str | None = None,
-        prompt_tokens: torch.Tensor | None = None,
-        timesteps: torch.Tensor | None = None,
+        prompt: list[str] | str | None,
+        prompt_tokens: torch.Tensor | None,
     ) -> torch.Tensor:
         if (prompt is None) == (prompt_tokens is None):
             raise ValueError("Provide exactly one of prompt or prompt_tokens")
-        batch_size, num_views = images.shape[:2]
-        if num_views != 2:
-            raise ValueError(f"Selective Difix requires two views, got {num_views}")
-        flat_images = rearrange(images, "b v c h w -> (b v) c h w")
-        latents = self.vae.encode(flat_images).latent_dist.sample()
-        latents = latents * self.vae.config.scaling_factor
-
         if prompt is not None:
             tokens = self.tokenizer(
                 prompt,
@@ -177,9 +182,32 @@ class SelectiveDifix(torch.nn.Module):
             ).input_ids.to(images.device)
         else:
             tokens = prompt_tokens.to(images.device)
-        text = self.text_encoder(tokens)[0]
-        text = repeat(text, "b n c -> (b v) n c", v=num_views)
+        return self.text_encoder(tokens)[0]
 
+    def denoised_main_latent(
+        self,
+        images: torch.Tensor,
+        *,
+        prompt: list[str] | str | None = None,
+        prompt_tokens: torch.Tensor | None = None,
+        timesteps: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Return the denoised primary-view latent and its encoder skips."""
+
+        batch_size, num_views = images.shape[:2]
+        if num_views != 2:
+            raise ValueError(f"Selective Difix requires two views, got {num_views}")
+        flat_images = rearrange(images, "b v c h w -> (b v) c h w")
+        latents = self.vae.encode(flat_images).latent_dist.sample()
+        latents = latents * self.vae.config.scaling_factor
+        main_skips = select_main_view_skips(
+            self.vae.encoder.current_down_blocks, batch_size, num_views
+        )
+
+        text = self._prompt_embeddings(
+            images, prompt=prompt, prompt_tokens=prompt_tokens
+        )
+        text = repeat(text, "b n c -> (b v) n c", v=num_views)
         current_timesteps = self.timesteps if timesteps is None else timesteps
         model_prediction = self.unet(
             latents,
@@ -193,15 +221,55 @@ class SelectiveDifix(torch.nn.Module):
             latents,
             return_dict=True,
         ).prev_sample
+        return select_main_view(denoised, batch_size, num_views), main_skips
 
-        main_latent = select_main_view(denoised, batch_size, num_views)
-        self.vae.decoder.incoming_skip_acts = select_main_view_skips(
-            self.vae.encoder.current_down_blocks,
-            batch_size,
-            num_views,
-        )
-        output = self.vae.decode(main_latent / self.vae.config.scaling_factor).sample
+    def decode_main_latent(
+        self, latent: torch.Tensor, encoder_skips: list[torch.Tensor]
+    ) -> torch.Tensor:
+        """Decode one primary-view latent using explicitly captured VAE skips."""
+
+        self.vae.decoder.incoming_skip_acts = encoder_skips
+        output = self.vae.decode(latent / self.vae.config.scaling_factor).sample
         return output.clamp(-1, 1)
+
+    def cfg_latents(
+        self,
+        positive_images: torch.Tensor,
+        negative_images: torch.Tensor,
+        *,
+        positive_prompt_tokens: torch.Tensor,
+        negative_prompt_tokens: torch.Tensor,
+        timesteps: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
+        """Compute both CCDD modes once and retain positive-branch VAE skips."""
+
+        z_positive, positive_skips = self.denoised_main_latent(
+            positive_images,
+            prompt_tokens=positive_prompt_tokens,
+            timesteps=timesteps,
+        )
+        z_negative, _ = self.denoised_main_latent(
+            negative_images,
+            prompt_tokens=negative_prompt_tokens,
+            timesteps=timesteps,
+        )
+        return z_positive, z_negative, positive_skips
+
+    def forward(
+        self,
+        images: torch.Tensor,
+        *,
+        prompt: list[str] | str | None = None,
+        prompt_tokens: torch.Tensor | None = None,
+        timesteps: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        main_latent, main_skips = self.denoised_main_latent(
+            images,
+            prompt=prompt,
+            prompt_tokens=prompt_tokens,
+            timesteps=timesteps,
+        )
+        return self.decode_main_latent(main_latent, main_skips)
 
     @torch.inference_mode()
     def sample(

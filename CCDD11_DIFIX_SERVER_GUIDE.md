@@ -188,6 +188,64 @@ accelerate launch --mixed_precision=bf16 train_ccdd11_difix.py \
 
 ## 8. 100k 完成后的 half_test 旧式正式评估
 
+### 8.0 在 validation 上扫描正负潜变量 CFG
+
+在读取 `half_test` 前，可先对训练时冻结的 1180 条 validation 记录扫描 LUCID 风格
+CFG。每个样本只计算一次 positive/negative 分支，然后在 VAE 解码前使用：
+
+```text
+z_cfg = z_negative + beta * (z_positive - z_negative)
+```
+
+`beta=0` 是 preserve-both negative 分支，`beta=1` 是选择性去除 positive 分支，
+`beta>1` 是远离 negative 分支的外插。所有 beta 均使用 positive 分支的 VAE skip
+features 解码。评估输出同时以选择性 target、原双退化图和 clean GT 为参照计算
+L2、LPIPS-VGG、L2+LPIPS、PSNR、SSIM 和 DISTS。
+
+先把 `FORMAL_RUN` 指向实际完成的 100k CFG 训练目录：
+
+```bash
+export FORMAL_RUN="$RUN_ROOT/ccdd-all5-bs4-100k-cfg-p020-seed42-v1"
+```
+
+```bash
+python -u evaluate_ccdd11_cfg.py \
+  --checkpoint "$FORMAL_RUN/checkpoints/best_psnr.pkl" \
+  --output-dir "$FORMAL_RUN/cfg_validation_best_psnr_beta_sweep_v1" \
+  --betas 0 0.25 0.5 0.75 1.0 1.05 1.1 1.2 \
+  --num-gallery-samples 20 \
+  --workers 8 \
+  --device cuda \
+  --mixed-precision bf16 \
+  --seed 42 \
+  --enable-xformers-memory-efficient-attention \
+  --report-to wandb \
+  --wandb-entity c14150591-sjtu \
+  --wandb-project difix-ccdd11-selective \
+  --wandb-run-name ccdd-all5-100k-best-cfg-validation-beta-sweep-v1
+```
+
+正式运行前可用独立输出目录做两个分层样本的 GPU smoke：
+
+```bash
+python -u evaluate_ccdd11_cfg.py \
+  --checkpoint "$FORMAL_RUN/checkpoints/best_psnr.pkl" \
+  --output-dir "$FORMAL_RUN/cfg_validation_smoke" \
+  --betas 0 1 1.2 \
+  --num-gallery-samples 2 \
+  --max-samples 2 \
+  --workers 0 \
+  --device cuda \
+  --mixed-precision bf16 \
+  --seed 42 \
+  --enable-xformers-memory-efficient-attention \
+  --report-to none
+```
+
+结果包含 `per_image_metrics.csv`、`summary.csv`、`metrics.json`、可恢复的
+`records/` 与 `state.json`，以及 20 组带 beta 标签的 `gallery/` 对比图。完整扫描
+不会读取或写入 `half_test`。
+
 以下流程只能在 100k 正式训练完成后执行。先确认 `best_validation.json`，并记录仅由
 `half_train` 的 `validation_full/psnr` 选出的 checkpoint 身份：
 
