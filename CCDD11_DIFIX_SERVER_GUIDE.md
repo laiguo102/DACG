@@ -195,23 +195,25 @@ CFG。每个样本只计算一次 positive/negative 分支，然后在 VAE 解�
 
 ```text
 z_cfg = z_negative + beta * (z_positive - z_negative)
+skip_cfg[i] = skip_negative[i] + beta * (skip_positive[i] - skip_negative[i])
 ```
 
 `beta=0` 是 preserve-both negative 分支，`beta=1` 是选择性去除 positive 分支，
-`beta>1` 是远离 negative 分支的外插。所有 beta 均使用 positive 分支的 VAE skip
-features 解码。评估输出同时以选择性 target、原双退化图和 clean GT 为参照计算
+`beta>1` 是远离 negative 分支的外插。潜变量和四层 VAE skip features 使用相同 beta
+同步插值，因此两个端点分别严格等于完整 negative/positive mode。评估输出同时以
+选择性 target、原双退化图和 clean GT 为参照计算
 L2、LPIPS-VGG、L2+LPIPS、PSNR、SSIM 和 DISTS。
 
 先把 `FORMAL_RUN` 指向实际完成的 100k CFG 训练目录：
 
 ```bash
-export FORMAL_RUN="$RUN_ROOT/ccdd-all5-bs4-100k-cfg-p020-seed42-v1"
+export FORMAL_RUN="$RUN_ROOT/ccdd-all5-bs4-100k-lucid-seed42-v1"
 ```
 
 ```bash
 python -u evaluate_ccdd11_cfg.py \
   --checkpoint "$FORMAL_RUN/checkpoints/best_psnr.pkl" \
-  --output-dir "$FORMAL_RUN/cfg_validation_best_psnr_beta_sweep_v1" \
+  --output-dir "$FORMAL_RUN/cfg_validation_best_psnr_state_beta_sweep_v2" \
   --betas 0 0.25 0.5 0.75 1.0 1.05 1.1 1.2 \
   --num-gallery-samples 20 \
   --workers 8 \
@@ -222,7 +224,7 @@ python -u evaluate_ccdd11_cfg.py \
   --report-to wandb \
   --wandb-entity c14150591-sjtu \
   --wandb-project difix-ccdd11-selective \
-  --wandb-run-name ccdd-all5-100k-best-cfg-validation-beta-sweep-v1
+  --wandb-run-name ccdd-all5-100k-best-state-cfg-validation-beta-sweep-v2
 ```
 
 正式运行前可用独立输出目录做两个分层样本的 GPU smoke：
@@ -230,7 +232,7 @@ python -u evaluate_ccdd11_cfg.py \
 ```bash
 python -u evaluate_ccdd11_cfg.py \
   --checkpoint "$FORMAL_RUN/checkpoints/best_psnr.pkl" \
-  --output-dir "$FORMAL_RUN/cfg_validation_smoke" \
+  --output-dir "$FORMAL_RUN/cfg_validation_state_smoke_v2" \
   --betas 0 1 1.2 \
   --num-gallery-samples 2 \
   --max-samples 2 \

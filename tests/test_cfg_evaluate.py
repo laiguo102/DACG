@@ -1,4 +1,3 @@
-import importlib.util
 import json
 import sys
 import tempfile
@@ -10,6 +9,7 @@ from unittest.mock import patch
 import torch
 from PIL import Image
 
+from difix3d_selective.cfg import blend_cfg_latents, blend_cfg_skips
 from difix3d_selective.cfg_evaluate import (
     CFG_METRIC_FIELDS,
     CfgMetricSuite,
@@ -42,19 +42,29 @@ class TestCfgInputs(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-negative"):
             normalize_betas([-0.1, 1])
 
-    @unittest.skipIf(
-        importlib.util.find_spec("diffusers") is None, "diffusers is not installed"
-    )
     def test_latent_cfg_endpoints_and_extrapolation(self):
-        from difix3d_selective.model import blend_cfg_latents
-
         positive = torch.tensor([[[[3.0]]]])
         negative = torch.tensor([[[[1.0]]]])
-        self.assertTrue(torch.equal(blend_cfg_latents(positive, negative, 0), negative))
-        self.assertTrue(torch.equal(blend_cfg_latents(positive, negative, 1), positive))
-        self.assertAlmostEqual(float(blend_cfg_latents(positive, negative, 1.2)), 3.4)
+        self.assertIs(blend_cfg_latents(positive, negative, 0), negative)
+        self.assertIs(blend_cfg_latents(positive, negative, 1), positive)
+        self.assertAlmostEqual(
+            float(blend_cfg_latents(positive, negative, 1.2)), 3.4, places=6
+        )
         with self.assertRaisesRegex(ValueError, "shape mismatch"):
             blend_cfg_latents(positive, negative.expand(2, -1, -1, -1), 1)
+
+        positive_skips = [positive, positive + 2]
+        negative_skips = [negative, negative + 1]
+        blended_zero = blend_cfg_skips(positive_skips, negative_skips, 0)
+        blended_one = blend_cfg_skips(positive_skips, negative_skips, 1)
+        self.assertTrue(
+            all(a is b for a, b in zip(blended_zero, negative_skips))
+        )
+        self.assertTrue(
+            all(a is b for a, b in zip(blended_one, positive_skips))
+        )
+        with self.assertRaisesRegex(ValueError, "skip count mismatch"):
+            blend_cfg_skips(positive_skips, negative_skips[:1], 0.5)
 
 
 class TestCfgMetrics(unittest.TestCase):
@@ -183,10 +193,12 @@ class TestCfgManifest(unittest.TestCase):
                 positive_prompt_tokens,
                 negative_prompt_tokens,
             ):
-                return positive_source[:, 0], negative_source[:, 0], []
+                positive = positive_source[:, 0]
+                negative = negative_source[:, 0]
+                return positive, negative, [positive], [negative]
 
             def decode_main_latent(self, latent, skips):
-                return latent
+                return (latent + skips[0]) * 0.5
 
         class FakeMetricSuite:
             def __call__(self, prediction, references):
@@ -283,10 +295,6 @@ class TestCfgManifest(unittest.TestCase):
             )
             fake_model_module = ModuleType("difix3d_selective.model")
             fake_model_module.SelectiveDifix = FakeModel
-            fake_model_module.blend_cfg_latents = (
-                lambda positive, negative, beta: negative
-                + beta * (positive - negative)
-            )
             fake_model_module.load_model_checkpoint = lambda *args, **kwargs: 100000
             with (
                 patch.dict(sys.modules, {"difix3d_selective.model": fake_model_module}),
@@ -304,8 +312,23 @@ class TestCfgManifest(unittest.TestCase):
             self.assertEqual(state["status"], "completed")
             self.assertEqual(metrics["validation_sample_count"], 2)
             self.assertEqual(metrics["per_image_count"], 6)
+            self.assertEqual(
+                state["config"]["protocol"],
+                "ccdd11-endpoint-correct-state-cfg-validation-v2",
+            )
             self.assertEqual(len(list((output_dir / "records").rglob("*.json"))), 2)
             self.assertEqual(len(list((output_dir / "gallery").rglob("contact_sheet.png"))), 2)
+            first_record_path = next((output_dir / "records").rglob("*.json"))
+            first_record = json.loads(first_record_path.read_text(encoding="utf-8"))
+            by_beta = {float(row["beta"]): row for row in first_record["results"]}
+            self.assertAlmostEqual(
+                by_beta[0.0]["positive_target_mse_l2"], 2 * 32 / 255 - 1,
+                places=5,
+            )
+            self.assertAlmostEqual(
+                by_beta[1.0]["positive_target_mse_l2"], 2 * 64 / 255 - 1,
+                places=5,
+            )
 
 
 if __name__ == "__main__":

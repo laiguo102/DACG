@@ -18,19 +18,6 @@ from .main_view import select_main_view, select_main_view_skips
 SD_TURBO = "stabilityai/sd-turbo"
 
 
-def blend_cfg_latents(
-    z_positive: torch.Tensor, z_negative: torch.Tensor, beta: float
-) -> torch.Tensor:
-    """Apply LUCID-style positive/negative guidance in denoised latent space."""
-
-    if z_positive.shape != z_negative.shape:
-        raise ValueError(
-            "positive/negative latent shape mismatch: "
-            f"positive={tuple(z_positive.shape)}, negative={tuple(z_negative.shape)}"
-        )
-    return z_negative + float(beta) * (z_positive - z_negative)
-
-
 def make_1step_scheduler() -> DDPMScheduler:
     scheduler = DDPMScheduler.from_pretrained(SD_TURBO, subfolder="scheduler")
     scheduler.set_timesteps(1)
@@ -240,20 +227,25 @@ class SelectiveDifix(torch.nn.Module):
         positive_prompt_tokens: torch.Tensor,
         negative_prompt_tokens: torch.Tensor,
         timesteps: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
-        """Compute both CCDD modes once and retain positive-branch VAE skips."""
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        list[torch.Tensor],
+        list[torch.Tensor],
+    ]:
+        """Compute denoised latents and VAE skips for both complete CCDD modes."""
 
         z_positive, positive_skips = self.denoised_main_latent(
             positive_images,
             prompt_tokens=positive_prompt_tokens,
             timesteps=timesteps,
         )
-        z_negative, _ = self.denoised_main_latent(
+        z_negative, negative_skips = self.denoised_main_latent(
             negative_images,
             prompt_tokens=negative_prompt_tokens,
             timesteps=timesteps,
         )
-        return z_positive, z_negative, positive_skips
+        return z_positive, z_negative, positive_skips, negative_skips
 
     def forward(
         self,

@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 
 from cdd11_full.metrics import rgb_psnr, rgb_ssim
+from .cfg import blend_cfg_latents, blend_cfg_skips
 from .data import load_records, negative_conditioning
 from .evaluate import (
     _atomic_json,
@@ -499,7 +500,7 @@ def run(args: argparse.Namespace) -> None:
     from tqdm.auto import tqdm
 
     from .data import SelectiveDifixDataset
-    from .model import SelectiveDifix, blend_cfg_latents, load_model_checkpoint
+    from .model import SelectiveDifix, load_model_checkpoint
 
     args.betas = normalize_betas(list(args.betas))
     fixed_protocol = {
@@ -538,7 +539,7 @@ def run(args: argparse.Namespace) -> None:
     expected_ids = {str(record["id"]) for record in selected_records}
     output_dir = (
         args.output_dir
-        or run_dir / f"cfg_validation_{checkpoint.stem}_beta_sweep_v1"
+        or run_dir / f"cfg_validation_{checkpoint.stem}_state_beta_sweep_v2"
     ).resolve()
     args.output_dir = output_dir
     if (output_dir / "metrics.json").is_file():
@@ -554,7 +555,7 @@ def run(args: argparse.Namespace) -> None:
     del checkpoint_payload
 
     config = {
-        "protocol": "ccdd11-lucid-latent-cfg-validation-v1",
+        "protocol": "ccdd11-endpoint-correct-state-cfg-validation-v2",
         "checkpoint": {
             **_checkpoint_identity(checkpoint),
             "sha256": _file_sha256(checkpoint),
@@ -576,7 +577,9 @@ def run(args: argparse.Namespace) -> None:
         "validation_samples": len(selected_records),
         "negative_train_probability": experiment_metadata["negative_train_probability"],
         "latent_formula": "z_negative + beta * (z_positive - z_negative)",
-        "decoder_skips": "positive_branch",
+        "decoder_skip_formula": (
+            "skip_negative + beta * (skip_positive - skip_negative)"
+        ),
     }
     state_path = output_dir / "state.json"
     records_dir = output_dir / "records"
@@ -676,7 +679,12 @@ def run(args: argparse.Namespace) -> None:
         with torch.random.fork_rng(devices=devices):
             torch.manual_seed(inference_seed)
             with torch.inference_mode(), _autocast(device, args.mixed_precision):
-                z_positive, z_negative, positive_skips = model.cfg_latents(
+                (
+                    z_positive,
+                    z_negative,
+                    positive_skips,
+                    negative_skips,
+                ) = model.cfg_latents(
                     positive_source,
                     negative_source,
                     positive_prompt_tokens=batch["input_ids"].to(device),
@@ -698,7 +706,8 @@ def run(args: argparse.Namespace) -> None:
             decode_started = time.perf_counter()
             with torch.inference_mode(), _autocast(device, args.mixed_precision):
                 prediction = model.decode_main_latent(
-                    blend_cfg_latents(z_positive, z_negative, beta), positive_skips
+                    blend_cfg_latents(z_positive, z_negative, beta),
+                    blend_cfg_skips(positive_skips, negative_skips, beta),
                 )
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
@@ -782,7 +791,7 @@ def run(args: argparse.Namespace) -> None:
                     "updated_at_utc": _now(),
                 },
             )
-        del z_positive, z_negative, positive_skips
+        del z_positive, z_negative, positive_skips, negative_skips
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -895,7 +904,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--wandb-project", default="difix-ccdd11-selective")
     value.add_argument(
         "--wandb-run-name",
-        default="ccdd-all5-100k-best-cfg-validation-beta-sweep-v1",
+        default="ccdd-all5-100k-best-state-cfg-validation-beta-sweep-v2",
     )
     return value
 
