@@ -258,27 +258,44 @@ I_pixel = clip(I_negative + beta * (I_positive - I_negative), 0, 1)
 ```
 
 因此输入图、样本和 beta 均与 latent/skip CFG 严格相同，且不需要再次运行模型。
-默认处理 gallery 中全部示例并沿用原 CFG 的 beta 网格：
+程序会从 `records/` 和 `gallery/` 自动确认两个完整 scene；每个 scene 必须同时具有
+5 类双退化的两个去除方向，共生成 2 × 5 × 2 = 20 张对比拼图。每张拼图和 CFG
+gallery 一样，第一行是 4 张参考图，后两行是 8 个 beta 输出。
+
+新开终端后先恢复路径：
+
+```bash
+cd /path/to/DACG
+export RUN_ROOT=/path/to/ccdd11-difix-runs
+export FORMAL_RUN="$RUN_ROOT/ccdd-all5-bs4-100k-lucid-seed42-v1"
+export CFG_DIR="$FORMAL_RUN/cfg_validation_best_psnr_state_beta_sweep_v2"
+```
+
+默认自动识别两个完整 scene，并在同一 W&B project 新建独立对比 run：
 
 ```bash
 python -u compare_ccdd11_pixel_cfg.py \
-  --cfg-dir "$FORMAL_RUN/cfg_validation_best_psnr_state_beta_sweep_v2"
+  --cfg-dir "$CFG_DIR" \
+  --report-to wandb \
+  --wandb-entity c14150591-sjtu \
+  --wandb-project difix-ccdd11-selective \
+  --wandb-run-name ccdd-all5-100k-best-state-pixel-beta-comparison-v2
 ```
 
-如只对比指定的两个 gallery 示例，可重复传入目录名（即将 manifest ID 中 `/`
-替换成 `__` 后的名称）：
+W&B 的 `pixel_cfg/gallery` 表固定为 20 行；每行包含 scene、pair、remove、preserve，
+以及并排的原 CFG 拼图和像素级拼图。若 gallery 中不止两个完整 scene，必须显式指定
+两个 scene ID：
 
 ```bash
 python -u compare_ccdd11_pixel_cfg.py \
-  --cfg-dir "$FORMAL_RUN/cfg_validation_best_psnr_state_beta_sweep_v2" \
-  --sample-id "validation__low_haze__000001__remove-low-preserve-haze" \
-  --sample-id "validation__haze_rain__000002__remove-rain-preserve-haze"
+  --cfg-dir "$CFG_DIR" \
+  --scene-ids 000001 000002 \
+  --report-to wandb
 ```
 
-输出位于 CFG 目录下的 `pixel_beta_comparison/`，包括每个样本的像素混合图、
-放大 4 倍的绝对差值图、逐 beta 三列对比拼图，以及汇总的 `comparison.csv` 和
-`comparison.json`。其中 MAE/MSE/PSNR/max-absolute 均比较像素混合结果与已有 CFG
-结果；`beta=0` 和 `beta=1` 直接复用同一端点图，差异应严格为零。
+输出位于 `$CFG_DIR/pixel_beta_comparison/`，包括每个任务的 8 张独立像素混合图、
+`pixel_contact_sheet.png`、记录所选 scene 和全部图片路径的 `comparison.json`，以及
+可检查完成状态的 `state.json`。本程序只生成视觉对照，不重复计算定量指标。
 
 以下流程只能在 100k 正式训练完成后执行。先确认 `best_validation.json`，并记录仅由
 `half_train` 的 `validation_full/psnr` 选出的 checkpoint 身份：
