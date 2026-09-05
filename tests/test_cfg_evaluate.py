@@ -9,7 +9,11 @@ from unittest.mock import patch
 import torch
 from PIL import Image
 
-from difix3d_selective.cfg import blend_cfg_latents, blend_cfg_skips
+from difix3d_selective.cfg import (
+    blend_cfg_latents,
+    blend_cfg_pixels,
+    blend_cfg_skips,
+)
 from difix3d_selective.cfg_evaluate import (
     CFG_METRIC_FIELDS,
     CfgMetricSuite,
@@ -65,6 +69,18 @@ class TestCfgInputs(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "skip count mismatch"):
             blend_cfg_skips(positive_skips, negative_skips[:1], 0.5)
+
+    def test_pixel_cfg_endpoints_interpolation_and_clipped_extrapolation(self):
+        import numpy as np
+
+        negative = np.full((2, 3, 3), 0.2, dtype=np.float32)
+        positive = np.full((2, 3, 3), 0.8, dtype=np.float32)
+        self.assertIs(blend_cfg_pixels(positive, negative, 0), negative)
+        self.assertIs(blend_cfg_pixels(positive, negative, 1), positive)
+        np.testing.assert_allclose(blend_cfg_pixels(positive, negative, 0.5), 0.5)
+        np.testing.assert_allclose(blend_cfg_pixels(positive, negative, 2), 1.0)
+        with self.assertRaisesRegex(ValueError, "shape mismatch"):
+            blend_cfg_pixels(positive, negative[:1], 0.5)
 
 
 class TestCfgMetrics(unittest.TestCase):

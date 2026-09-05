@@ -248,6 +248,38 @@ python -u evaluate_ccdd11_cfg.py \
 `records/` 与 `state.json`，以及 20 组带 beta 标签的 `gallery/` 对比图。完整扫描
 不会读取或写入 `half_test`。
 
+#### 8.0.1 与像素级 beta 加权做同图对照
+
+以下程序直接读取上一节 CFG gallery 中同一样本的两张端点图：`beta_0.png`
+（negative mode）与 `beta_1.png`（positive mode），然后在 RGB `[0,1]` 像素域使用
+
+```text
+I_pixel = clip(I_negative + beta * (I_positive - I_negative), 0, 1)
+```
+
+因此输入图、样本和 beta 均与 latent/skip CFG 严格相同，且不需要再次运行模型。
+默认处理 gallery 中全部示例并沿用原 CFG 的 beta 网格：
+
+```bash
+python -u compare_ccdd11_pixel_cfg.py \
+  --cfg-dir "$FORMAL_RUN/cfg_validation_best_psnr_state_beta_sweep_v2"
+```
+
+如只对比指定的两个 gallery 示例，可重复传入目录名（即将 manifest ID 中 `/`
+替换成 `__` 后的名称）：
+
+```bash
+python -u compare_ccdd11_pixel_cfg.py \
+  --cfg-dir "$FORMAL_RUN/cfg_validation_best_psnr_state_beta_sweep_v2" \
+  --sample-id "validation__low_haze__000001__remove-low-preserve-haze" \
+  --sample-id "validation__haze_rain__000002__remove-rain-preserve-haze"
+```
+
+输出位于 CFG 目录下的 `pixel_beta_comparison/`，包括每个样本的像素混合图、
+放大 4 倍的绝对差值图、逐 beta 三列对比拼图，以及汇总的 `comparison.csv` 和
+`comparison.json`。其中 MAE/MSE/PSNR/max-absolute 均比较像素混合结果与已有 CFG
+结果；`beta=0` 和 `beta=1` 直接复用同一端点图，差异应严格为零。
+
 以下流程只能在 100k 正式训练完成后执行。先确认 `best_validation.json`，并记录仅由
 `half_train` 的 `validation_full/psnr` 选出的 checkpoint 身份：
 
