@@ -248,6 +248,18 @@ python -u evaluate_ccdd11_cfg.py \
 `records/` 与 `state.json`，以及 20 组带 beta 标签的 `gallery/` 对比图。完整扫描
 不会读取或写入 `half_test`。
 
+W&B 的 task-macro 和 micro 标量曲线显式使用 `cfg/beta` 作为横轴；此外
+`cfg/task_curves/` 下为 18 个质量指标各生成一张多线图，每张图包含 10 条有向任务
+曲线。已有完整结果无需重新推理，可创建一个新 W&B run：
+
+```bash
+python -u upload_ccdd11_cfg_wandb.py \
+  --results-dir "$FORMAL_RUN/cfg_validation_best_psnr_state_beta_sweep_v2" \
+  --wandb-entity c14150591-sjtu \
+  --wandb-project difix-ccdd11-selective \
+  --wandb-run-name ccdd-all5-100k-best-step90000-cfg-task-curves
+```
+
 #### 8.0.1 与像素级 beta 加权做同图对照
 
 以下程序直接读取上一节 CFG gallery 中同一样本的两张端点图：`beta_0.png`

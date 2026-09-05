@@ -424,6 +424,36 @@ def _flatten_records(records: list[dict]) -> list[dict]:
     return rows
 
 
+def wandb_task_curves(summary: dict) -> dict[str, dict]:
+    """Build beta-indexed multi-line data for all ten directed tasks."""
+
+    beta_summaries = sorted(
+        summary["betas"].values(), key=lambda value: float(value["beta"])
+    )
+    if not beta_summaries:
+        raise ValueError("Cannot build W&B task curves without beta summaries")
+    task_names = sorted(beta_summaries[0]["tasks"])
+    expected_tasks = set(task_names)
+    for beta_summary in beta_summaries:
+        if set(beta_summary["tasks"]) != expected_tasks:
+            raise ValueError("Directed task set differs between beta summaries")
+    betas = [float(value["beta"]) for value in beta_summaries]
+    return {
+        field: {
+            "betas": betas,
+            "tasks": task_names,
+            "values": [
+                [
+                    float(beta_summary["tasks"][task][field])
+                    for beta_summary in beta_summaries
+                ]
+                for task in task_names
+            ],
+        }
+        for field in CFG_METRIC_FIELDS
+    }
+
+
 def _log_wandb(
     args: argparse.Namespace, config: dict, summary: dict, records: list[dict]
 ) -> None:
@@ -438,12 +468,12 @@ def _log_wandb(
         project=args.wandb_project,
         name=args.wandb_run_name,
         dir=str(args.output_dir),
-        config=config,
+        config={**config, "wandb_schema": "beta-axis-task-curves-v1"},
         job_type="cfg-validation",
     )
     run.define_metric("cfg/beta")
-    run.define_metric("cfg/*", step_metric="cfg/beta")
     summary_rows = summary_csv_rows(summary)
+    scalar_payloads = []
     for beta_summary in summary["betas"].values():
         beta = float(beta_summary["beta"])
         macro = beta_summary["overall"]["macro"]
@@ -453,7 +483,30 @@ def _log_wandb(
             {f"cfg/task_macro/{key}": value for key, value in macro.items()}
         )
         payload.update({f"cfg/micro/{key}": value for key, value in micro.items()})
+        scalar_payloads.append(payload)
+    scalar_metric_names = sorted(
+        {
+            name
+            for payload in scalar_payloads
+            for name in payload
+            if name != "cfg/beta"
+        }
+    )
+    for name in scalar_metric_names:
+        run.define_metric(name, step_metric="cfg/beta")
+    for payload in scalar_payloads:
         run.log(payload)
+
+    task_plots = {}
+    for field, curve in wandb_task_curves(summary).items():
+        task_plots[f"cfg/task_curves/{field}"] = wandb.plot.line_series(
+            xs=curve["betas"],
+            ys=curve["values"],
+            keys=curve["tasks"],
+            title=f"{field.replace('_', ' ')} by directed task",
+            xname="beta",
+        )
+    run.log(task_plots)
     table_fields = list(dict.fromkeys(key for row in summary_rows for key in row))
     run.log(
         {
@@ -493,6 +546,38 @@ def _log_wandb(
     for key, value in summary["selection"].items():
         run.summary[f"cfg/{key}"] = value
     run.finish()
+
+
+def upload_wandb_results(args: argparse.Namespace) -> None:
+    """Create a new W&B run from completed local CFG results, without inference."""
+
+    results_dir = args.results_dir.resolve()
+    metrics_path = results_dir / "metrics.json"
+    records_dir = results_dir / "records"
+    if not metrics_path.is_file():
+        raise FileNotFoundError(metrics_path)
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metadata = metrics.get("metadata")
+    summary = metrics.get("summary")
+    if not isinstance(metadata, dict) or not isinstance(summary, dict):
+        raise ValueError("metrics.json lacks metadata or summary")
+    config = metadata.get("config")
+    if not isinstance(config, dict):
+        raise ValueError("metrics.json lacks metadata.config")
+    records_by_id = _load_partial_records(records_dir)
+    expected = int(metrics.get("validation_sample_count", -1))
+    if len(records_by_id) != expected:
+        raise ValueError(
+            f"Expected {expected} sample records, found {len(records_by_id)}"
+        )
+    args.output_dir = results_dir
+    args.report_to = "wandb"
+    records = [records_by_id[key] for key in sorted(records_by_id)]
+    _log_wandb(args, config, summary, records)
+    print(
+        f"Uploaded {expected} completed CFG samples to W&B from {results_dir}",
+        flush=True,
+    )
 
 
 def run(args: argparse.Namespace) -> None:

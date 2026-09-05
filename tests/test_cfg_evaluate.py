@@ -17,10 +17,13 @@ from difix3d_selective.cfg import (
 from difix3d_selective.cfg_evaluate import (
     CFG_METRIC_FIELDS,
     CfgMetricSuite,
+    _log_wandb,
     normalize_betas,
     save_contact_sheet,
     summarize_cfg_rows,
+    upload_wandb_results,
     validate_full_manifest,
+    wandb_task_curves,
 )
 from difix3d_selective.data import negative_conditioning
 
@@ -139,6 +142,78 @@ class TestCfgMetrics(unittest.TestCase):
             [0.0, 1.0],
         )
         self.assertEqual(summary["betas"]["1"]["overall"]["macro"]["tasks"], 2)
+
+    def test_wandb_curves_use_beta_and_compare_every_directed_task(self):
+        rows = []
+        for pair_index in range(1, 6):
+            for remove in ("low", "haze"):
+                for beta, values in (
+                    (0.0, (2.0, 0.0, 10.0)),
+                    (1.0, (0.0, 2.0, 30.0)),
+                ):
+                    row = self._row(beta, remove, *values)
+                    row["pair"] = f"pair_{pair_index}"
+                    rows.append(row)
+        summary = summarize_cfg_rows(rows)
+        curves = wandb_task_curves(summary)
+        self.assertEqual(set(curves), set(CFG_METRIC_FIELDS))
+        self.assertEqual(curves["positive_target_psnr"]["betas"], [0.0, 1.0])
+        self.assertEqual(len(curves["positive_target_psnr"]["tasks"]), 10)
+        self.assertEqual(len(curves["positive_target_psnr"]["values"]), 10)
+
+        class FakeRun:
+            def __init__(self):
+                self.defined = []
+                self.logged = []
+                self.summary = {}
+                self.finished = False
+
+            def define_metric(self, name, **kwargs):
+                self.defined.append((name, kwargs))
+
+            def log(self, payload):
+                self.logged.append(payload)
+
+            def finish(self):
+                self.finished = True
+
+        fake_run = FakeRun()
+        line_series_calls = []
+        fake_wandb = ModuleType("wandb")
+        fake_wandb.init = lambda **kwargs: fake_run
+        fake_wandb.Table = lambda **kwargs: ("table", kwargs)
+        fake_wandb.Image = lambda path: ("image", path)
+
+        def line_series(**kwargs):
+            line_series_calls.append(kwargs)
+            return ("line_series", kwargs)
+
+        fake_wandb.plot = SimpleNamespace(line_series=line_series)
+        args = SimpleNamespace(
+            report_to="wandb",
+            wandb_entity="entity",
+            wandb_project="project",
+            wandb_run_name="run",
+            output_dir=Path("output"),
+        )
+        with patch.dict(sys.modules, {"wandb": fake_wandb}):
+            _log_wandb(args, {"protocol": "test"}, summary, [])
+
+        scalar_definitions = {
+            name: kwargs for name, kwargs in fake_run.defined if name != "cfg/beta"
+        }
+        self.assertTrue(scalar_definitions)
+        self.assertTrue(
+            all(
+                kwargs == {"step_metric": "cfg/beta"}
+                for kwargs in scalar_definitions.values()
+            )
+        )
+        self.assertEqual(len(line_series_calls), len(CFG_METRIC_FIELDS))
+        self.assertTrue(all(call["xname"] == "beta" for call in line_series_calls))
+        self.assertTrue(all(call["xs"] == [0.0, 1.0] for call in line_series_calls))
+        self.assertTrue(all(len(call["keys"]) == 10 for call in line_series_calls))
+        self.assertTrue(fake_run.finished)
 
     def test_contact_sheet_contains_references_and_all_beta_outputs(self):
         references = {
@@ -345,6 +420,38 @@ class TestCfgManifest(unittest.TestCase):
                 by_beta[1.0]["positive_target_mse_l2"], 2 * 64 / 255 - 1,
                 places=5,
             )
+
+    def test_completed_results_can_be_uploaded_without_inference(self):
+        with tempfile.TemporaryDirectory(dir=".") as directory:
+            results_dir = Path(directory).resolve()
+            record = {"sample_id": "validation/task/scene"}
+            records_dir = results_dir / "records"
+            records_dir.mkdir()
+            (records_dir / "sample.json").write_text(
+                json.dumps(record), encoding="utf-8"
+            )
+            metrics = {
+                "metadata": {"config": {"protocol": "test"}},
+                "summary": {"betas": {}, "selection": {}},
+                "validation_sample_count": 1,
+            }
+            (results_dir / "metrics.json").write_text(
+                json.dumps(metrics), encoding="utf-8"
+            )
+            args = SimpleNamespace(
+                results_dir=results_dir,
+                wandb_entity="entity",
+                wandb_project="project",
+                wandb_run_name="run",
+            )
+            with patch(
+                "difix3d_selective.cfg_evaluate._log_wandb"
+            ) as log_wandb:
+                upload_wandb_results(args)
+            self.assertEqual(args.output_dir, results_dir)
+            self.assertEqual(args.report_to, "wandb")
+            self.assertEqual(log_wandb.call_args.args[1], {"protocol": "test"})
+            self.assertEqual(log_wandb.call_args.args[3], [record])
 
 
 if __name__ == "__main__":
