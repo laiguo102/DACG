@@ -7,6 +7,7 @@ import csv
 import hashlib
 import importlib.metadata
 import json
+import os
 import time
 from contextlib import nullcontext
 from datetime import datetime, timezone
@@ -45,9 +46,11 @@ def _package_version(distribution: str) -> str:
 def _atomic_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(
-        json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-    )
+    payload = json.dumps(value, indent=2, ensure_ascii=False) + "\n"
+    with temporary.open("w", encoding="utf-8") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
     temporary.replace(path)
 
 
