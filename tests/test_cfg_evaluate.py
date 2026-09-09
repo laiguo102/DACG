@@ -26,6 +26,7 @@ from difix3d_selective.cfg_evaluate import (
     wandb_task_curves,
 )
 from difix3d_selective.data import negative_conditioning
+from difix3d_selective.evaluate import _atomic_json
 
 
 class MeanDistance(torch.nn.Module):
@@ -34,6 +35,24 @@ class MeanDistance(torch.nn.Module):
 
 
 class TestCfgInputs(unittest.TestCase):
+    def test_atomic_json_repairs_empty_destination_after_replace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "record.json"
+            original_replace = Path.replace
+
+            def replace_then_expose_empty(source, target):
+                result = original_replace(source, target)
+                Path(target).write_bytes(b"")
+                return result
+
+            with patch.object(Path, "replace", new=replace_then_expose_empty):
+                _atomic_json(destination, {"sample_id": "validation/example"})
+
+            self.assertEqual(
+                json.loads(destination.read_text(encoding="utf-8")),
+                {"sample_id": "validation/example"},
+            )
+
     def test_negative_conditioning_matches_training_definition(self):
         coarse = torch.full((2, 3, 4, 5), -0.5)
         degraded = torch.full_like(coarse, 0.5)

@@ -46,12 +46,44 @@ def _package_version(distribution: str) -> str:
 def _atomic_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
-    payload = json.dumps(value, indent=2, ensure_ascii=False) + "\n"
-    with temporary.open("w", encoding="utf-8") as stream:
+    payload = (json.dumps(value, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    with temporary.open("wb") as stream:
         stream.write(payload)
         stream.flush()
         os.fsync(stream.fileno())
     temporary.replace(path)
+
+    # Some distributed mounts expose the renamed directory entry before the
+    # file data is visible, so an immediate reader can observe a zero-byte JSON
+    # file even though the temporary file was fsynced. Sync the directory when
+    # supported and verify the destination. A direct, fsynced rewrite is a
+    # compatibility fallback for filesystems whose rename is not coherently
+    # visible to the process that performed it.
+    directory_fd = None
+    try:
+        directory_fd = os.open(str(path.parent), os.O_RDONLY)
+        os.fsync(directory_fd)
+    except OSError:
+        pass
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+    for delay_seconds in (0.0, 0.01, 0.05):
+        if delay_seconds:
+            time.sleep(delay_seconds)
+        try:
+            if path.read_bytes() == payload:
+                return
+        except OSError:
+            pass
+
+    with path.open("wb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+    if path.read_bytes() != payload:
+        raise OSError(f"JSON write verification failed for {path}")
 
 
 def _write_csv(path: Path, rows: list[dict], fieldnames: list[str]) -> None:
