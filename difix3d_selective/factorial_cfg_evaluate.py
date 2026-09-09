@@ -35,6 +35,7 @@ from .evaluate import (
     _file_sha256,
     _now,
     _package_version,
+    _read_json,
     _resolve_device,
     _safe_id,
     _save_image,
@@ -658,7 +659,7 @@ def _load_conditions(
     path = args.screening_results.resolve()
     if not path.is_file():
         raise FileNotFoundError(path)
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = _read_json(path)
     _validate_screening_payload(
         payload,
         checkpoint_sha256=checkpoint_sha256,
@@ -893,7 +894,7 @@ def run(args: argparse.Namespace) -> None:
     records_dir = output_dir / "records"
     partial = _load_partial_records(records_dir)
     if state_path.is_file():
-        previous = json.loads(state_path.read_text(encoding="utf-8"))
+        previous = _read_json(state_path)
         if previous.get("config") != config:
             raise RuntimeError("Existing partial factorial state uses a different configuration")
     elif partial:

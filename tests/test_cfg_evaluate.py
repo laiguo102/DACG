@@ -26,7 +26,7 @@ from difix3d_selective.cfg_evaluate import (
     wandb_task_curves,
 )
 from difix3d_selective.data import negative_conditioning
-from difix3d_selective.evaluate import _atomic_json
+from difix3d_selective.evaluate import _atomic_json, _read_json
 
 
 class MeanDistance(torch.nn.Module):
@@ -35,6 +35,17 @@ class MeanDistance(torch.nn.Module):
 
 
 class TestCfgInputs(unittest.TestCase):
+    def test_read_json_retries_transient_empty_file(self):
+        destination = Path("transient-record.json")
+        payload = json.dumps({"sample_id": "validation/example"}).encode("utf-8")
+        with (
+            patch.object(Path, "read_bytes", side_effect=[b"", payload]),
+            patch("difix3d_selective.evaluate.time.sleep"),
+        ):
+            self.assertEqual(
+                _read_json(destination), {"sample_id": "validation/example"}
+            )
+
     def test_atomic_json_repairs_empty_destination_after_replace(self):
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "record.json"

@@ -86,6 +86,21 @@ def _atomic_json(path: Path, value: dict) -> None:
         raise OSError(f"JSON write verification failed for {path}")
 
 
+def _read_json(path: Path):
+    """Read JSON defensively on mounts with delayed close-to-open visibility."""
+
+    last_error: Exception | None = None
+    for delay_seconds in (0.0, 0.01, 0.05, 0.2, 0.5, 1.0):
+        if delay_seconds:
+            time.sleep(delay_seconds)
+        try:
+            return json.loads(path.read_bytes())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            last_error = error
+    assert last_error is not None
+    raise last_error
+
+
 def _write_csv(path: Path, rows: list[dict], fieldnames: list[str]) -> None:
     temporary = path.with_name(path.name + ".tmp")
     with temporary.open("w", encoding="utf-8", newline="") as stream:
@@ -143,7 +158,7 @@ def _infer_pair_ids(checkpoint: Path, explicit: list[int] | None) -> list[int]:
         raise ValueError(
             "Cannot infer training degradation pairs. Pass --degradation-pairs explicitly."
         )
-    info = json.loads(preparation.read_text(encoding="utf-8"))
+    info = _read_json(preparation)
     pair_ids = [int(value["id"]) for value in info["degradation_pairs"]]
     selected_pairs(pair_ids)
     return pair_ids
@@ -160,7 +175,7 @@ def _verify_training_dataset(checkpoint: Path, dataset_format: str) -> None:
             "CCDD-11 evaluation requires the training split_and_preparation.json "
             f"next to the checkpoint: {preparation}"
         )
-    info = json.loads(preparation.read_text(encoding="utf-8"))
+    info = _read_json(preparation)
     if info.get("dataset") != "CCDD-11" or info.get("target_kind") != (
         "native_selective_sub_data"
     ):
@@ -189,7 +204,7 @@ def _load_partial_rows(records_dir: Path) -> dict[str, dict]:
     if not records_dir.is_dir():
         return rows
     for path in sorted(records_dir.rglob("*.json")):
-        row = json.loads(path.read_text(encoding="utf-8"))
+        row = _read_json(path)
         sample_id = str(row["sample_id"])
         if sample_id in rows:
             raise ValueError(f"Duplicate partial test row for {sample_id}")
@@ -384,7 +399,7 @@ def run(args: argparse.Namespace) -> None:
     records_dir = output_dir / "records"
     partial_rows = _load_partial_rows(records_dir)
     if state_path.is_file():
-        previous_state = json.loads(state_path.read_text(encoding="utf-8"))
+        previous_state = _read_json(state_path)
         if previous_state.get("config") != config:
             raise RuntimeError(
                 "Existing partial test state uses a different configuration; "

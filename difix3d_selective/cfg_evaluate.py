@@ -27,6 +27,7 @@ from .evaluate import (
     _file_sha256,
     _now,
     _package_version,
+    _read_json,
     _resolve_device,
     _safe_id,
     _save_image,
@@ -339,7 +340,7 @@ def _load_partial_records(records_dir: Path) -> dict[str, dict]:
     if not records_dir.is_dir():
         return result
     for path in sorted(records_dir.rglob("*.json")):
-        record = json.loads(path.read_text(encoding="utf-8"))
+        record = _read_json(path)
         sample_id = str(record["sample_id"])
         if sample_id in result:
             raise ValueError(f"Duplicate CFG record for {sample_id}")
@@ -357,7 +358,7 @@ def _validate_training_run(checkpoint: Path) -> tuple[Path, Path, dict]:
         raise FileNotFoundError(preparation_path)
     if not manifest.is_file():
         raise FileNotFoundError(manifest)
-    preparation = json.loads(preparation_path.read_text(encoding="utf-8"))
+    preparation = _read_json(preparation_path)
     if preparation.get("dataset") != "CCDD-11":
         raise ValueError("CFG validation requires a CCDD-11 training run")
     if preparation.get("target_kind") != "native_selective_sub_data":
@@ -556,7 +557,7 @@ def upload_wandb_results(args: argparse.Namespace) -> None:
     records_dir = results_dir / "records"
     if not metrics_path.is_file():
         raise FileNotFoundError(metrics_path)
-    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics = _read_json(metrics_path)
     metadata = metrics.get("metadata")
     summary = metrics.get("summary")
     if not isinstance(metadata, dict) or not isinstance(summary, dict):
@@ -670,7 +671,7 @@ def run(args: argparse.Namespace) -> None:
     records_dir = output_dir / "records"
     partial_records = _load_partial_records(records_dir)
     if state_path.is_file():
-        previous = json.loads(state_path.read_text(encoding="utf-8"))
+        previous = _read_json(state_path)
         if previous.get("config") != config:
             raise RuntimeError("Existing partial CFG state uses a different configuration")
     elif partial_records:
