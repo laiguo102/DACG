@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 from pathlib import Path
 
 import torch
@@ -197,6 +198,18 @@ class SelectiveDifix(torch.nn.Module):
     def trainable_parameters(self) -> list[torch.nn.Parameter]:
         return [parameter for parameter in self.parameters() if parameter.requires_grad]
 
+    def detail_config(self) -> dict[str, bool | int]:
+        return {
+            "enabled": self.detail_enabled,
+            "num_naf_blocks": self.detail_num_blocks,
+            "gate_reduction": self.detail_gate_reduction,
+            "prompt_condition": self.detail_gate_use_prompt,
+            "prompt_proj_dim": self.detail_prompt_proj_dim,
+        }
+
+    def detail_state_dict(self) -> dict[str, torch.Tensor]:
+        return self.vae.decoder.detail_blocks.state_dict()
+
     def _prompt_embeddings(
         self,
         images: torch.Tensor,
@@ -367,8 +380,10 @@ def save_training_checkpoint(
         "state_dict_vae": {
             key: value
             for key, value in model.vae.state_dict().items()
-            if "lora" in key or "skip" in key
+            if "lora" in key or "skip_conv" in key
         },
+        "state_dict_detail": model.detail_state_dict(),
+        "detail_config": model.detail_config(),
         "optimizer": optimizer.state_dict(),
         "lr_scheduler": scheduler.state_dict(),
     }
@@ -399,6 +414,35 @@ def _apply_model_checkpoint(model: SelectiveDifix, checkpoint: dict) -> int:
     vae_state = model.vae.state_dict()
     vae_state.update(checkpoint["state_dict_vae"])
     model.vae.load_state_dict(vae_state, strict=True)
+    saved_detail_config = checkpoint.get("detail_config")
+    saved_detail_state = checkpoint.get("state_dict_detail")
+    if saved_detail_config is None and saved_detail_state is None:
+        if model.detail_enabled:
+            warnings.warn(
+                "Loading a legacy SelectiveDifix checkpoint; DAEM-lite modules "
+                "remain freshly initialized.",
+                stacklevel=2,
+            )
+    elif not isinstance(saved_detail_config, dict) or not isinstance(
+        saved_detail_state, dict
+    ):
+        raise ValueError(
+            "Checkpoint must contain both detail_config and state_dict_detail"
+        )
+    else:
+        current_detail_config = model.detail_config()
+        mismatches = {
+            key: (saved_detail_config.get(key), current_detail_config[key])
+            for key in current_detail_config
+            if saved_detail_config.get(key) != current_detail_config[key]
+        }
+        if mismatches:
+            raise ValueError(
+                f"Checkpoint DAEM-lite configuration mismatch: {mismatches}"
+            )
+        model.vae.decoder.detail_blocks.load_state_dict(
+            saved_detail_state, strict=True
+        )
     return int(checkpoint["global_step"])
 
 
