@@ -326,7 +326,7 @@ class TestCfgManifest(unittest.TestCase):
                 value = float(prediction.float().mean())
                 return {field: value for field in CFG_METRIC_FIELDS}
 
-        with tempfile.TemporaryDirectory(dir=".") as directory:
+        with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             run_dir = root / "run"
             prepared = run_dir / "prepared"
@@ -452,7 +452,7 @@ class TestCfgManifest(unittest.TestCase):
             )
 
     def test_completed_results_can_be_uploaded_without_inference(self):
-        with tempfile.TemporaryDirectory(dir=".") as directory:
+        with tempfile.TemporaryDirectory() as directory:
             results_dir = Path(directory).resolve()
             record = {"sample_id": "validation/task/scene"}
             records_dir = results_dir / "records"

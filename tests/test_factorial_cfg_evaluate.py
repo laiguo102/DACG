@@ -216,7 +216,7 @@ class TestSmokeIntegration(unittest.TestCase):
                 value = float(prediction.mean())
                 return {field: value for field in CFG_METRIC_FIELDS}
 
-        with tempfile.TemporaryDirectory(dir=".") as directory:
+        with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             run_dir = root / "run"
             manifests = run_dir / "prepared" / "manifests"
