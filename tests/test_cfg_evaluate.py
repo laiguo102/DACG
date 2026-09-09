@@ -457,17 +457,13 @@ class TestCfgManifest(unittest.TestCase):
             record = {"sample_id": "validation/task/scene"}
             records_dir = results_dir / "records"
             records_dir.mkdir()
-            (records_dir / "sample.json").write_text(
-                json.dumps(record), encoding="utf-8"
-            )
+            _atomic_json(records_dir / "sample.json", record)
             metrics = {
                 "metadata": {"config": {"protocol": "test"}},
                 "summary": {"betas": {}, "selection": {}},
                 "validation_sample_count": 1,
             }
-            (results_dir / "metrics.json").write_text(
-                json.dumps(metrics), encoding="utf-8"
-            )
+            _atomic_json(results_dir / "metrics.json", metrics)
             args = SimpleNamespace(
                 results_dir=results_dir,
                 wandb_entity="entity",
