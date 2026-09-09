@@ -52,6 +52,8 @@ class _TinySelectiveDifix(nn.Module):
     detail_config = model_module.SelectiveDifix.detail_config
     detail_state_dict = model_module.SelectiveDifix.detail_state_dict
     detail_parameters = model_module.SelectiveDifix.detail_parameters
+    detail_diagnostics = model_module.SelectiveDifix.detail_diagnostics
+    parameter_counts = model_module.SelectiveDifix.parameter_counts
     set_train = model_module.SelectiveDifix.set_train
     trainable_parameters = model_module.SelectiveDifix.trainable_parameters
     vae_adaptation_parameters = model_module.SelectiveDifix.vae_adaptation_parameters
@@ -242,3 +244,25 @@ def test_optimizer_groups_keep_baseline_single_group_and_split_detail_learning_r
     assert _parameter_ids(all_groups[2]["params"]) == _parameter_ids(
         detail.detail_parameters()
     )
+
+def test_parameter_counts_and_detail_diagnostics():
+    model = _TinySelectiveDifix()
+    model.set_train("detail")
+    block = model.vae.decoder.detail_blocks[0]
+    decoder = torch.randn(1, 4, 5, 5)
+    block(decoder, torch.randn_like(decoder))
+
+    counts = model.parameter_counts()
+    assert counts["total"] == counts["baseline_total"] + counts["detail"]
+    assert counts["trainable"] == counts["detail"]
+    diagnostics = model.detail_diagnostics()
+    assert set(diagnostics) == {
+        "train/detail/l0/gate_mean",
+        "train/detail/l0/gate_std",
+        "train/detail/l0/gate_min",
+        "train/detail/l0/gate_max",
+        "train/detail/l0/alpha",
+        "train/detail/l0/residual_ratio",
+    }
+    assert diagnostics["train/detail/l0/gate_mean"] == 0.5
+    assert diagnostics["train/detail/l0/residual_ratio"] == 0.0

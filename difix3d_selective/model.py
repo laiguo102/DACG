@@ -212,6 +212,47 @@ class SelectiveDifix(torch.nn.Module):
             or name.startswith("decoder.skip_conv_")
         ]
 
+    def parameter_counts(self) -> dict[str, int]:
+        detail = sum(parameter.numel() for parameter in self.detail_parameters())
+        vae_adaptation = sum(
+            parameter.numel() for parameter in self.vae_adaptation_parameters()
+        )
+        total = sum(parameter.numel() for parameter in self.parameters())
+        return {
+            "total": total,
+            "baseline_total": total - detail,
+            "detail": detail,
+            "vae_adaptation": vae_adaptation,
+            "unet": sum(parameter.numel() for parameter in self.unet.parameters()),
+            "trainable": sum(
+                parameter.numel()
+                for parameter in self.parameters()
+                if parameter.requires_grad
+            ),
+        }
+
+    def detail_diagnostics(self, prefix: str = "train/detail") -> dict[str, float]:
+        if not self.detail_enabled:
+            return {}
+        values = {}
+        for index, block in enumerate(self.vae.decoder.detail_blocks):
+            if block.last_gate_mean is None:
+                continue
+            layer_prefix = f"{prefix}/l{index}"
+            values.update(
+                {
+                    f"{layer_prefix}/gate_mean": float(block.last_gate_mean),
+                    f"{layer_prefix}/gate_std": float(block.last_gate_std),
+                    f"{layer_prefix}/gate_min": float(block.last_gate_min),
+                    f"{layer_prefix}/gate_max": float(block.last_gate_max),
+                    f"{layer_prefix}/alpha": float(block.alpha.detach()),
+                    f"{layer_prefix}/residual_ratio": float(
+                        block.last_residual_ratio
+                    ),
+                }
+            )
+        return values
+
     def detail_config(self) -> dict[str, bool | int]:
         return {
             "enabled": self.detail_enabled,

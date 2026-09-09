@@ -6,6 +6,7 @@ import argparse
 import gc
 import json
 import random
+import time
 from datetime import timedelta
 from pathlib import Path
 
@@ -252,6 +253,7 @@ def run(args: argparse.Namespace) -> None:
             expected_seed=args.seed,
         )
     trainable_parameters = model.trainable_parameters()
+    parameter_counts = model.parameter_counts()
     optimizer = torch.optim.AdamW(
         _optimizer_parameter_groups(model, args),
         lr=args.learning_rate,
@@ -425,8 +427,22 @@ def run(args: argparse.Namespace) -> None:
                     "validation_negative_full/mean_absolute_change", summary="min"
                 )
 
+    if accelerator.is_main_process:
+        print(f"Parameter counts: {parameter_counts}", flush=True)
+    if args.report_to != "none":
+        accelerator.log(
+            {
+                f"model/parameters/{key}": value
+                for key, value in parameter_counts.items()
+            },
+            step=0,
+        )
+    if accelerator.device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(accelerator.device)
+
     best = _best_state(output_dir) if accelerator.is_main_process else None
     experiment_metadata = _experiment_metadata(args)
+    experiment_metadata["parameter_counts"] = parameter_counts
     progress = tqdm(
         total=args.max_train_steps,
         initial=global_step,
@@ -436,7 +452,10 @@ def run(args: argparse.Namespace) -> None:
     train_iterator = iter(train_loader)
     negative_samples_since_sync = 0
     training_samples_since_sync = 0
+    step_started = 0.0
     while global_step < args.max_train_steps:
+        if training_samples_since_sync == 0:
+            step_started = time.perf_counter()
         try:
             batch = next(train_iterator)
         except StopIteration:
@@ -500,7 +519,18 @@ def run(args: argparse.Namespace) -> None:
             "train/loss": float(loss.detach()),
             "train/learning_rate": lr_scheduler.get_last_lr()[0],
             "train/negative_fraction": realized_negative_fraction,
+            "train/step_time_seconds": time.perf_counter() - step_started,
         }
+        logs["train/images_per_second"] = (
+            float(global_mode_counts[1].item()) / logs["train/step_time_seconds"]
+        )
+        if accelerator.device.type == "cuda":
+            logs["train/peak_cuda_memory_gb"] = (
+                torch.cuda.max_memory_allocated(accelerator.device) / (1024**3)
+            )
+        logs.update(
+            accelerator.unwrap_model(model).detail_diagnostics(prefix="train/detail")
+        )
         progress.set_postfix(loss=logs["train/loss"])
         if args.report_to != "none":
             accelerator.log(logs, step=global_step)
