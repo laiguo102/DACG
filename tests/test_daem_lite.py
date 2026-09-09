@@ -1,5 +1,11 @@
+import importlib
+import sys
+from types import ModuleType
+from unittest.mock import patch
+
 import pytest
 import torch
+from torch import nn
 
 from difix3d_selective.daem_lite import (
     GatedDetailSkip,
@@ -7,6 +13,34 @@ from difix3d_selective.daem_lite import (
     NAFBlockLite,
     SimpleGate,
 )
+
+
+class _PassthroughBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.dummy = nn.Parameter(torch.zeros(()))
+
+    def forward(self, value, latent_embeds=None):
+        return value + self.dummy * 0
+
+
+class _Decoder:
+    def __init__(self, channels: int, *, detail_enabled: bool):
+        self.conv_in = nn.Identity()
+        self.mid_block = _PassthroughBlock()
+        self.up_blocks = nn.ModuleList([_PassthroughBlock()])
+        self.conv_norm_out = nn.Identity()
+        self.conv_act = nn.Identity()
+        self.conv_out = nn.Identity()
+        self.skip_conv_1 = nn.Identity()
+        self.skip_conv_2 = nn.Identity()
+        self.skip_conv_3 = nn.Identity()
+        self.skip_conv_4 = nn.Identity()
+        self.incoming_skip_acts = [torch.randn(1, channels, 5, 6)]
+        self.incoming_detail_condition = None
+        self.detail_enabled = detail_enabled
+        self.detail_blocks = nn.ModuleList([GatedDetailSkip(channels)])
+        self.gamma = 1
 
 
 def test_layer_norm_and_simple_gate_shapes():
@@ -79,3 +113,41 @@ def test_shape_mismatch_is_rejected():
     with pytest.raises(ValueError, match="same shape"):
         block(torch.randn(1, 32, 8, 8), torch.randn(1, 32, 4, 4))
 
+
+def test_decoder_detail_disabled_and_zero_initialized_enabled_match_baseline():
+    try:
+        model_module = importlib.import_module("difix3d_selective.model")
+    except ModuleNotFoundError:
+        diffusers = ModuleType("diffusers")
+        diffusers.AutoencoderKL = object
+        diffusers.DDPMScheduler = object
+        peft = ModuleType("peft")
+        peft.LoraConfig = object
+        transformers = ModuleType("transformers")
+        transformers.AutoTokenizer = object
+        transformers.CLIPTextModel = object
+        torchvision = ModuleType("torchvision")
+        torchvision.transforms = ModuleType("torchvision.transforms")
+        with patch.dict(
+            sys.modules,
+            {
+                "diffusers": diffusers,
+                "peft": peft,
+                "transformers": transformers,
+                "torchvision": torchvision,
+                "torchvision.transforms": torchvision.transforms,
+            },
+        ):
+            model_module = importlib.import_module("difix3d_selective.model")
+    vae_decoder_forward = model_module.vae_decoder_forward
+    sample = torch.randn(1, 8, 5, 6)
+    baseline_decoder = _Decoder(8, detail_enabled=False)
+    detail_decoder = _Decoder(8, detail_enabled=True)
+    detail_decoder.incoming_skip_acts = baseline_decoder.incoming_skip_acts
+
+    baseline = vae_decoder_forward(baseline_decoder, sample)
+    with_detail = vae_decoder_forward(detail_decoder, sample)
+
+    expected = sample + baseline_decoder.incoming_skip_acts[0]
+    torch.testing.assert_close(baseline, expected, atol=0, rtol=0)
+    torch.testing.assert_close(with_detail, baseline, atol=1e-7, rtol=1e-6)

@@ -13,6 +13,7 @@ from PIL import Image
 from torchvision import transforms
 from transformers import AutoTokenizer, CLIPTextModel
 
+from .daem_lite import GatedDetailSkip
 from .main_view import select_main_view, select_main_view_skips
 
 SD_TURBO = "stabilityai/sd-turbo"
@@ -50,6 +51,12 @@ def vae_decoder_forward(self, sample, latent_embeds=None):
     ]
     for index, up_block in enumerate(self.up_blocks):
         skip = skip_convs[index](self.incoming_skip_acts[::-1][index] * self.gamma)
+        if self.detail_enabled:
+            skip = self.detail_blocks[index](
+                decoder_feature=sample,
+                projected_skip=skip,
+                prompt_condition=self.incoming_detail_condition,
+            )
         sample = up_block(sample + skip, latent_embeds)
     if latent_embeds is None:
         sample = self.conv_norm_out(sample)
@@ -59,7 +66,18 @@ def vae_decoder_forward(self, sample, latent_embeds=None):
 
 
 class SelectiveDifix(torch.nn.Module):
-    def __init__(self, lora_rank_vae: int = 4, timestep: int = 199):
+    def __init__(
+        self,
+        lora_rank_vae: int = 4,
+        timestep: int = 199,
+        *,
+        detail_enabled: bool = False,
+        detail_num_blocks: int = 1,
+        detail_gate_reduction: int = 4,
+        detail_alpha_init: float = 0.1,
+        detail_gate_use_prompt: bool = False,
+        detail_prompt_proj_dim: int = 32,
+    ):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(SD_TURBO, subfolder="tokenizer")
         self.text_encoder = CLIPTextModel.from_pretrained(
@@ -119,6 +137,35 @@ class SelectiveDifix(torch.nn.Module):
             adapter_name="vae_skip",
         )
 
+        detail_blocks = []
+        if detail_enabled:
+            prompt_dim = (
+                int(self.text_encoder.config.hidden_size)
+                if detail_gate_use_prompt
+                else None
+            )
+            detail_blocks = [
+                GatedDetailSkip(
+                    channels,
+                    num_naf_blocks=detail_num_blocks,
+                    gate_reduction=detail_gate_reduction,
+                    alpha_init=detail_alpha_init,
+                    prompt_dim=prompt_dim,
+                    prompt_proj_dim=detail_prompt_proj_dim,
+                )
+                for channels in (512, 512, 512, 256)
+            ]
+        vae.decoder.detail_blocks = torch.nn.ModuleList(detail_blocks)
+        vae.decoder.detail_enabled = bool(detail_enabled)
+        vae.decoder.incoming_detail_condition = None
+        self.detail_enabled = bool(detail_enabled)
+        self.detail_num_blocks = int(detail_num_blocks)
+        self.detail_gate_reduction = int(detail_gate_reduction)
+        self.detail_alpha_init = float(detail_alpha_init)
+        self.detail_gate_use_prompt = bool(detail_gate_use_prompt)
+        self.detail_prompt_proj_dim = int(detail_prompt_proj_dim)
+        self._last_detail_condition = None
+
         from .mv_unet import UNet2DConditionModel
 
         self.unet = UNet2DConditionModel.from_pretrained(SD_TURBO, subfolder="unet")
@@ -169,7 +216,12 @@ class SelectiveDifix(torch.nn.Module):
             ).input_ids.to(images.device)
         else:
             tokens = prompt_tokens.to(images.device)
-        return self.text_encoder(tokens)[0]
+        if not self.detail_gate_use_prompt:
+            self._last_detail_condition = None
+            return self.text_encoder(tokens)[0]
+        text_output = self.text_encoder(tokens, return_dict=True)
+        self._last_detail_condition = text_output.pooler_output
+        return text_output.last_hidden_state
 
     def denoised_main_latent(
         self,
@@ -211,11 +263,16 @@ class SelectiveDifix(torch.nn.Module):
         return select_main_view(denoised, batch_size, num_views), main_skips
 
     def decode_main_latent(
-        self, latent: torch.Tensor, encoder_skips: list[torch.Tensor]
+        self,
+        latent: torch.Tensor,
+        encoder_skips: list[torch.Tensor],
+        *,
+        prompt_condition: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Decode one primary-view latent using explicitly captured VAE skips."""
 
         self.vae.decoder.incoming_skip_acts = encoder_skips
+        self.vae.decoder.incoming_detail_condition = prompt_condition
         output = self.vae.decode(latent / self.vae.config.scaling_factor).sample
         return output.clamp(-1, 1)
 
@@ -261,7 +318,11 @@ class SelectiveDifix(torch.nn.Module):
             prompt_tokens=prompt_tokens,
             timesteps=timesteps,
         )
-        return self.decode_main_latent(main_latent, main_skips)
+        return self.decode_main_latent(
+            main_latent,
+            main_skips,
+            prompt_condition=self._last_detail_condition,
+        )
 
     @torch.inference_mode()
     def sample(
