@@ -458,3 +458,34 @@ triple 分组。该模式与训练时的 `remove A, preserve B` 句式顺序更�
 判定哪个任务更容易，因为两者参考目标不同；应分别报告 final 相对同任务 DACG coarse
 的 `improvement_*` 和胜率。若要证明训练贡献，仍需在相同 remove-one 协议下运行
 step-0 initialization 并做配对比较。
+
+## 9. DAEM-lite stage-2
+
+在已完成的 baseline 上做首个两步 detail-only smoke：
+
+```bash
+accelerate launch --mixed_precision=bf16 train_cdd11_difix.py \
+  --data-root /path/to/CDD11 \
+  --coarse-root /path/to/CDD11-DACG-coarse \
+  --output-dir /path/to/difix-daem-lite/detail-only-smoke \
+  --degradation-pairs 1 2 3 4 5 \
+  --resolution 512 --max-train-steps 2 --train-batch-size 4 \
+  --dataloader-num-workers 0 \
+  --detail-enabled --detail-num-blocks 1 \
+  --detail-gate-reduction 4 --detail-alpha-init 0.1 \
+  --train-scope detail --detail-learning-rate 1e-4 \
+  --init-checkpoint /path/to/baseline/checkpoints/best_psnr.pkl \
+  --lr-scheduler linear --lr-warmup-steps 0 \
+  --lambda-l2 1 --lambda-lpips 1 --lambda-gram 0 \
+  --eval-freq 1 --full-eval-freq 2 --viz-freq 1 \
+  --num-validation-samples 2 --num-validation-visualizations 2 \
+  --latest-checkpointing-steps 2 --milestone-steps 2 \
+  --seed 42 --report-to wandb \
+  --tracker-project-name difix-cdd11-selective-daem \
+  --tracker-run-name daem-lite-detail-only-smoke
+```
+
+`--init-checkpoint` 只载入 baseline 权重并从 step 0 建立新 optimizer；同一新实验中断后才
+改用 `--resume`。完整的结构说明、10k 命令、训练范围与兼容性见
+[`SELECTIVE_DIFIX_DAEM_LITE.md`](SELECTIVE_DIFIX_DAEM_LITE.md)。不增加
+`--detail-enabled` 的旧命令继续使用原 decoder 路径。

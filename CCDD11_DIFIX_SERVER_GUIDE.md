@@ -452,3 +452,38 @@ trained-vs-initialization 的 bootstrap CI。
 `CDD11/train/<preserve>`。CCDD 入口默认 `ccdd11`，但模型、两路视觉输入、prompt、
 L2+LPIPS loss、validation 和 checkpoint 代码完全共享。本阶段不做 `_half_`、identity、
 ratio control、三退化训练、架构修改、联合 DACG+Difix 或 CCDD-native DACG 训练。
+
+## 10. DAEM-lite stage-2
+
+现有 `best_psnr.pkl` 可以作为 DAEM-lite 的权重初始化：
+
+```bash
+export DAEM_RUN="$RUN_ROOT/ccdd-daem-lite-detail-only-v1"
+
+accelerate launch --mixed_precision=bf16 train_ccdd11_difix.py \
+  --data-root "$CCDD_ROOT" \
+  --coarse-root "$CCDD_COARSE_ROOT/half_train" \
+  --output-dir "$DAEM_RUN/smoke" \
+  --degradation-pairs 1 2 3 4 5 \
+  --negative-train-probability 0.2 \
+  --resolution 512 --max-train-steps 2 --train-batch-size 4 \
+  --dataloader-num-workers 0 \
+  --detail-enabled --detail-num-blocks 1 \
+  --detail-gate-reduction 4 --detail-alpha-init 0.1 \
+  --train-scope detail --detail-learning-rate 1e-4 \
+  --init-checkpoint "$FORMAL_RUN/checkpoints/best_psnr.pkl" \
+  --lr-scheduler linear --lr-warmup-steps 0 \
+  --lambda-l2 1 --lambda-lpips 1 --lambda-gram 0 \
+  --eval-freq 1 --full-eval-freq 2 --viz-freq 1 \
+  --num-validation-samples 2 --num-validation-visualizations 2 \
+  --latest-checkpointing-steps 2 --milestone-steps 2 \
+  --seed 42 --report-to wandb \
+  --tracker-project-name difix-ccdd11-selective-daem \
+  --tracker-run-name ccdd-daem-lite-detail-only-smoke-v1
+```
+
+这里必须使用 `--init-checkpoint`，使 stage-2 的 step、optimizer 和 scheduler 从零开始；
+同一 DAEM-lite run 中断后才使用 `--resume "$DAEM_RUN/.../checkpoints/latest.pkl"`。
+完整的 10k 命令、训练范围、checkpoint 字段和诊断项见
+[`SELECTIVE_DIFIX_DAEM_LITE.md`](SELECTIVE_DIFIX_DAEM_LITE.md)。原有命令未增加
+`--detail-enabled` 时保持原 decoder 前向路径。

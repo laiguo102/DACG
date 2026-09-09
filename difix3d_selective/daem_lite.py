@@ -153,4 +153,3 @@ class GatedDetailSkip(nn.Module):
         self.last_gate_max = detached_gate.amax()
         self.last_residual_ratio = residual.detach().abs().mean() / denominator
         return projected_skip + residual
-
