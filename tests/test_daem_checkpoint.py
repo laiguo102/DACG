@@ -3,7 +3,7 @@ import sys
 import warnings
 from copy import deepcopy
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -44,17 +44,23 @@ class _TinyVae(nn.Module):
         self.decoder = nn.Module()
         self.decoder.skip_conv_1 = nn.Conv2d(4, 4, 1, bias=False)
         self.decoder.detail_blocks = nn.ModuleList([GatedDetailSkip(4)])
-        self.lora_adapter = nn.Linear(4, 4, bias=False)
+        self.lora_vae_skip = nn.Linear(4, 4, bias=False)
+        self.encoder = nn.Linear(4, 4, bias=False)
 
 
 class _TinySelectiveDifix(nn.Module):
     detail_config = model_module.SelectiveDifix.detail_config
     detail_state_dict = model_module.SelectiveDifix.detail_state_dict
+    detail_parameters = model_module.SelectiveDifix.detail_parameters
+    set_train = model_module.SelectiveDifix.set_train
+    trainable_parameters = model_module.SelectiveDifix.trainable_parameters
+    vae_adaptation_parameters = model_module.SelectiveDifix.vae_adaptation_parameters
 
     def __init__(self, *, detail_enabled=True):
         super().__init__()
         self.unet = nn.Linear(4, 4)
         self.vae = _TinyVae()
+        self.text_encoder = nn.Linear(4, 4)
         self.lora_rank_vae = 4
         self.target_modules_vae = ["decoder.skip_conv_1"]
         self.register_buffer("timesteps", torch.tensor([199], dtype=torch.long))
@@ -63,6 +69,7 @@ class _TinySelectiveDifix(nn.Module):
         self.detail_gate_reduction = 4
         self.detail_gate_use_prompt = False
         self.detail_prompt_proj_dim = 32
+        self.train_scope = "all"
 
 
 class _Stateful:
@@ -160,3 +167,78 @@ def test_checkpoint_rejects_incompatible_detail_configuration():
         assert "gate_reduction" in str(error)
     else:
         raise AssertionError("Expected an incompatible detail configuration error")
+
+
+def _parameter_ids(parameters):
+    return {id(parameter) for parameter in parameters}
+
+
+def test_train_scopes_select_exact_parameter_sets():
+    model = _TinySelectiveDifix()
+    detail = _parameter_ids(model.detail_parameters())
+    vae = _parameter_ids(model.vae_adaptation_parameters())
+    unet = _parameter_ids(model.unet.parameters())
+
+    model.set_train("detail")
+    assert _parameter_ids(model.trainable_parameters()) == detail
+    model.set_train("detail+vae")
+    assert _parameter_ids(model.trainable_parameters()) == detail | vae
+    model.set_train("all")
+    assert _parameter_ids(model.trainable_parameters()) == detail | vae | unet
+    assert not any(parameter.requires_grad for parameter in model.text_encoder.parameters())
+    assert not any(parameter.requires_grad for parameter in model.vae.encoder.parameters())
+
+
+def test_optimizer_groups_keep_baseline_single_group_and_split_detail_learning_rate():
+    from difix3d_selective.train import _optimizer_parameter_groups
+
+    baseline = _TinySelectiveDifix(detail_enabled=False)
+    baseline.set_train("all")
+    baseline_args = SimpleNamespace(
+        detail_enabled=False,
+        train_scope="all",
+        learning_rate=5e-6,
+        detail_learning_rate=1e-4,
+    )
+    baseline_groups = _optimizer_parameter_groups(baseline, baseline_args)
+    assert len(baseline_groups) == 1
+    assert baseline_groups[0]["lr"] == 5e-6
+
+    detail = _TinySelectiveDifix()
+    detail.set_train("detail+vae")
+    detail_args = SimpleNamespace(
+        detail_enabled=True,
+        train_scope="detail+vae",
+        learning_rate=5e-6,
+        detail_learning_rate=1e-4,
+    )
+    detail_groups = _optimizer_parameter_groups(detail, detail_args)
+    assert [group["lr"] for group in detail_groups] == [5e-6, 1e-4]
+    assert _parameter_ids(detail_groups[0]["params"]) == _parameter_ids(
+        detail.vae_adaptation_parameters()
+    )
+    assert _parameter_ids(detail_groups[1]["params"]) == _parameter_ids(
+        detail.detail_parameters()
+    )
+
+    detail.set_train("detail")
+    detail_args.train_scope = "detail"
+    detail_only_groups = _optimizer_parameter_groups(detail, detail_args)
+    assert [group["lr"] for group in detail_only_groups] == [1e-4]
+    assert _parameter_ids(detail_only_groups[0]["params"]) == _parameter_ids(
+        detail.detail_parameters()
+    )
+
+    detail.set_train("all")
+    detail_args.train_scope = "all"
+    all_groups = _optimizer_parameter_groups(detail, detail_args)
+    assert [group["lr"] for group in all_groups] == [5e-6, 5e-6, 1e-4]
+    assert _parameter_ids(all_groups[0]["params"]) == _parameter_ids(
+        detail.unet.parameters()
+    )
+    assert _parameter_ids(all_groups[1]["params"]) == _parameter_ids(
+        detail.vae_adaptation_parameters()
+    )
+    assert _parameter_ids(all_groups[2]["params"]) == _parameter_ids(
+        detail.detail_parameters()
+    )

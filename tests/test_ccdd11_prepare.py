@@ -314,6 +314,13 @@ def test_training_parser_defaults_keep_cdd11_and_ccdd_wrapper_can_override():
     assert cdd_defaults["prepare_only"] is False
     assert "negative_train_probability" not in cdd_defaults
     assert ccdd_defaults["negative_train_probability"] == 0.2
+    assert cdd_defaults["detail_enabled"] is False
+    assert cdd_defaults["detail_num_blocks"] == 1
+    assert cdd_defaults["detail_gate_reduction"] == 4
+    assert cdd_defaults["detail_alpha_init"] == 0.1
+    assert cdd_defaults["detail_gate_use_prompt"] is False
+    assert cdd_defaults["train_scope"] == "all"
+    assert cdd_defaults["detail_learning_rate"] == 1e-4
     assert probability("0") == 0.0
     assert probability("1") == 1.0
     with pytest.raises(argparse.ArgumentTypeError, match=r"\[0, 1\]"):
@@ -329,6 +336,14 @@ def test_ccdd_checkpoint_metadata_describes_negative_training_contract():
             seed=42,
             degradation_pairs=[1, 2, 3, 4, 5],
             negative_train_probability=0.2,
+            train_scope="all",
+            detail_enabled=False,
+            detail_num_blocks=1,
+            detail_gate_reduction=4,
+            detail_alpha_init=0.1,
+            detail_gate_use_prompt=False,
+            detail_prompt_proj_dim=32,
+            detail_learning_rate=1e-4,
         )
     )
     assert metadata["negative_train_probability"] == 0.2
@@ -338,6 +353,7 @@ def test_ccdd_checkpoint_metadata_describes_negative_training_contract():
         "original double-degradation image",
         "signed original-minus-DACG texture",
     ]
+    assert metadata["detail"]["enabled"] is False
 
 
 def test_negative_validation_deduplicates_directions_to_590_records(tmp_path):

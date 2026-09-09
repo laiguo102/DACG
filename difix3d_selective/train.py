@@ -82,6 +82,16 @@ def _experiment_metadata(args: argparse.Namespace) -> dict:
         ),
         "seed": int(args.seed),
         "pairs": list(args.degradation_pairs),
+        "train_scope": args.train_scope,
+        "detail": {
+            "enabled": args.detail_enabled,
+            "num_naf_blocks": args.detail_num_blocks,
+            "gate_reduction": args.detail_gate_reduction,
+            "alpha_init": args.detail_alpha_init,
+            "prompt_condition": args.detail_gate_use_prompt,
+            "prompt_proj_dim": args.detail_prompt_proj_dim,
+            "learning_rate": args.detail_learning_rate,
+        },
     }
     if dataset_format == "ccdd11":
         metadata.update(
@@ -99,6 +109,23 @@ def _experiment_metadata(args: argparse.Namespace) -> dict:
             }
         )
     return metadata
+
+
+def _optimizer_parameter_groups(model, args: argparse.Namespace) -> list[dict]:
+    if not args.detail_enabled:
+        return [{"params": model.trainable_parameters(), "lr": args.learning_rate}]
+
+    groups = []
+    if args.train_scope == "all":
+        groups.append({"params": list(model.unet.parameters()), "lr": args.learning_rate})
+    if args.train_scope in ("all", "detail+vae"):
+        groups.append(
+            {"params": model.vae_adaptation_parameters(), "lr": args.learning_rate}
+        )
+    groups.append(
+        {"params": model.detail_parameters(), "lr": args.detail_learning_rate}
+    )
+    return groups
 
 
 def _prepare_manifests(args: argparse.Namespace, output_dir: Path) -> dict:
@@ -157,7 +184,12 @@ def run(args: argparse.Namespace) -> None:
     from tqdm.auto import tqdm
 
     from .data import SelectiveDifixDataset
-    from .model import SelectiveDifix, load_training_checkpoint, save_training_checkpoint
+    from .model import (
+        SelectiveDifix,
+        load_model_checkpoint,
+        load_training_checkpoint,
+        save_training_checkpoint,
+    )
     from .validation import (
         stratified_indices,
         validate,
@@ -181,7 +213,16 @@ def run(args: argparse.Namespace) -> None:
     validation_manifest = output_dir / "prepared" / "manifests" / "validation.jsonl"
 
     with accelerator.main_process_first():
-        model = SelectiveDifix(lora_rank_vae=args.lora_rank_vae, timestep=args.timestep)
+        model = SelectiveDifix(
+            lora_rank_vae=args.lora_rank_vae,
+            timestep=args.timestep,
+            detail_enabled=args.detail_enabled,
+            detail_num_blocks=args.detail_num_blocks,
+            detail_gate_reduction=args.detail_gate_reduction,
+            detail_alpha_init=args.detail_alpha_init,
+            detail_gate_use_prompt=args.detail_gate_use_prompt,
+            detail_prompt_proj_dim=args.detail_prompt_proj_dim,
+        )
         perceptual_model = lpips.LPIPS(net="vgg").eval().requires_grad_(False)
         vgg = None
         if args.lambda_gram > 0:
@@ -200,9 +241,19 @@ def run(args: argparse.Namespace) -> None:
     if args.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
 
+    model.set_train(args.train_scope)
+    if args.init_checkpoint is not None:
+        load_model_checkpoint(
+            model,
+            args.init_checkpoint.resolve(),
+            expected_dataset=(
+                "CCDD-11" if args.dataset_format == "ccdd11" else "CDD-11"
+            ),
+            expected_seed=args.seed,
+        )
     trainable_parameters = model.trainable_parameters()
     optimizer = torch.optim.AdamW(
-        trainable_parameters,
+        _optimizer_parameter_groups(model, args),
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -664,6 +715,22 @@ def parser(default_dataset_format: str = "cdd11") -> argparse.ArgumentParser:
     value.add_argument("--lora-rank-vae", type=int, default=4)
     value.add_argument("--timestep", type=int, default=199)
     value.add_argument(
+        "--detail-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    value.add_argument("--detail-num-blocks", type=int, default=1)
+    value.add_argument("--detail-gate-reduction", type=int, default=4)
+    value.add_argument("--detail-alpha-init", type=float, default=0.1)
+    value.add_argument("--detail-gate-use-prompt", action="store_true")
+    value.add_argument("--detail-prompt-proj-dim", type=int, default=32)
+    value.add_argument(
+        "--train-scope",
+        choices=("all", "detail", "detail+vae"),
+        default="all",
+    )
+    value.add_argument("--detail-learning-rate", type=float, default=1e-4)
+    value.add_argument(
         "--checkpointing-steps", type=int,
         help="Compatibility override for permanent checkpoint frequency.",
     )
@@ -679,7 +746,9 @@ def parser(default_dataset_format: str = "cdd11") -> argparse.ArgumentParser:
     value.add_argument("--enable-xformers-memory-efficient-attention", action="store_true")
     value.add_argument("--allow-tf32", action="store_true")
     value.add_argument("--seed", type=int, default=42)
-    value.add_argument("--resume", type=Path)
+    checkpoint = value.add_mutually_exclusive_group()
+    checkpoint.add_argument("--resume", type=Path)
+    checkpoint.add_argument("--init-checkpoint", type=Path)
     value.add_argument("--report-to", choices=("wandb", "none"), default="wandb")
     value.add_argument("--tracker-project-name", default="difix-cdd11-selective")
     value.add_argument("--tracker-run-name", default="difix-selective-lucid")

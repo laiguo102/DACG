@@ -173,21 +173,24 @@ class SelectiveDifix(torch.nn.Module):
         self.vae = vae
         self.register_buffer("timesteps", torch.tensor([timestep], dtype=torch.long))
         self.text_encoder.requires_grad_(False)
-        self.set_train()
+        self.train_scope = "all"
+        self.set_train("all")
 
-    def set_train(self) -> None:
-        self.unet.train().requires_grad_(True)
+    def set_train(self, train_scope: str | None = None) -> None:
+        train_scope = self.train_scope if train_scope is None else train_scope
+        if train_scope not in ("all", "detail", "detail+vae"):
+            raise ValueError(f"Unknown train scope: {train_scope}")
+        if train_scope != "all" and not self.detail_enabled:
+            raise ValueError(f"train scope {train_scope!r} requires detail_enabled")
+        self.train_scope = train_scope
+
+        self.unet.train(train_scope == "all").requires_grad_(train_scope == "all")
         self.vae.train().requires_grad_(False)
-        for name, parameter in self.vae.named_parameters():
-            if "lora" in name and "vae_skip" in name:
+        if train_scope in ("all", "detail+vae"):
+            for parameter in self.vae_adaptation_parameters():
                 parameter.requires_grad = True
-        for skip_conv in (
-            self.vae.decoder.skip_conv_1,
-            self.vae.decoder.skip_conv_2,
-            self.vae.decoder.skip_conv_3,
-            self.vae.decoder.skip_conv_4,
-        ):
-            skip_conv.requires_grad_(True)
+        if self.detail_enabled:
+            self.vae.decoder.detail_blocks.requires_grad_(True)
         self.text_encoder.eval().requires_grad_(False)
 
     def set_eval(self) -> None:
@@ -197,6 +200,17 @@ class SelectiveDifix(torch.nn.Module):
 
     def trainable_parameters(self) -> list[torch.nn.Parameter]:
         return [parameter for parameter in self.parameters() if parameter.requires_grad]
+
+    def detail_parameters(self) -> list[torch.nn.Parameter]:
+        return list(self.vae.decoder.detail_blocks.parameters())
+
+    def vae_adaptation_parameters(self) -> list[torch.nn.Parameter]:
+        return [
+            parameter
+            for name, parameter in self.vae.named_parameters()
+            if ("lora" in name and "vae_skip" in name)
+            or name.startswith("decoder.skip_conv_")
+        ]
 
     def detail_config(self) -> dict[str, bool | int]:
         return {
