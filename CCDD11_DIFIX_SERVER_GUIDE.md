@@ -309,6 +309,59 @@ python -u compare_ccdd11_pixel_cfg.py \
 `pixel_contact_sheet.png`、记录所选 scene 和全部图片路径的 `comparison.json`，以及
 可检查完成状态的 `state.json`。本程序只生成视觉对照，不重复计算定量指标。
 
+#### 8.0.2 Latent–skip 独立归因
+
+以下诊断保持 checkpoint、正负分支顺序和 VAE posterior `sample()` 不变，只把
+latent beta 与四层 VAE skip beta 拆成独立变量。结果写入独立目录，不改变上一节的
+CFG-v2 输出。先运行 20 个分层样本的 smoke：
+
+```bash
+export ATTR_DIR="$FORMAL_RUN/latent_skip_attribution_v1"
+python -u evaluate_ccdd11_latent_skip.py \
+  --stage smoke \
+  --checkpoint "$FORMAL_RUN/checkpoints/best_psnr.pkl" \
+  --output-dir "$ATTR_DIR/smoke" \
+  --workers 0 --device cuda --mixed-precision bf16 \
+  --enable-xformers-memory-efficient-attention --report-to none
+```
+
+smoke 完成后，在 200 个分层样本上扫描固定 5×5 网格：
+
+```bash
+python -u evaluate_ccdd11_latent_skip.py \
+  --stage screen \
+  --checkpoint "$FORMAL_RUN/checkpoints/best_psnr.pkl" \
+  --output-dir "$ATTR_DIR/screen" \
+  --workers 8 --device cuda --mixed-precision bf16 \
+  --enable-xformers-memory-efficient-attention \
+  --report-to wandb \
+  --wandb-entity c14150591-sjtu \
+  --wandb-project difix-ccdd11-selective \
+  --wandb-run-name ccdd-all5-best-latent-skip-screen-v1
+```
+
+最后在完整 1180 个 validation 样本上确认核心条件、四层消融、两条响应轴，以及
+screen 最优点的一阶 Manhattan 邻域。confirm 会核对 screen 与当前 checkpoint、
+manifest、seed 和协议版本，任何不一致都会停止：
+
+```bash
+python -u evaluate_ccdd11_latent_skip.py \
+  --stage confirm \
+  --checkpoint "$FORMAL_RUN/checkpoints/best_psnr.pkl" \
+  --screening-results "$ATTR_DIR/screen/metrics.json" \
+  --output-dir "$ATTR_DIR/confirm" \
+  --workers 8 --device cuda --mixed-precision bf16 \
+  --enable-xformers-memory-efficient-attention \
+  --report-to wandb \
+  --wandb-entity c14150591-sjtu \
+  --wandb-project difix-ccdd11-selective \
+  --wandb-run-name ccdd-all5-best-latent-skip-confirm-v1
+```
+
+每个阶段均可从相同目录的 `state.json` 和 `records/` 恢复。主要结果见
+`condition_summary.csv`、`paired_effects.csv`、`interaction_summary.csv` 和
+`influence_report.json`；配对置信区间按 scene 聚类并使用固定 10000 次 bootstrap。
+
 以下流程只能在 100k 正式训练完成后执行。先确认 `best_validation.json`，并记录仅由
 `half_train` 的 `validation_full/psnr` 选出的 checkpoint 身份：
 
