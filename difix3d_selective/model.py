@@ -529,6 +529,58 @@ def load_model_checkpoint(
     return _apply_model_checkpoint(model, checkpoint)
 
 
+def load_model_from_checkpoint(
+    path: str | Path,
+    *,
+    expected_dataset: str | None = None,
+    expected_seed: int | None = None,
+) -> tuple[SelectiveDifix, int, dict]:
+    """Construct and load a model using architecture metadata in its checkpoint."""
+
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    metadata = checkpoint.get("experiment_metadata")
+    if expected_dataset is not None or expected_seed is not None:
+        if not isinstance(metadata, dict):
+            raise ValueError(
+                "Checkpoint lacks experiment_metadata required by the evaluation protocol"
+            )
+        if expected_dataset is not None and metadata.get("dataset") != expected_dataset:
+            raise ValueError(
+                f"Checkpoint dataset is {metadata.get('dataset')!r}, expected "
+                f"{expected_dataset!r}"
+            )
+        if expected_seed is not None and int(metadata.get("seed", -1)) != expected_seed:
+            raise ValueError(
+                f"Checkpoint seed is {metadata.get('seed')!r}, expected {expected_seed}"
+            )
+
+    saved_detail_config = checkpoint.get("detail_config")
+    if saved_detail_config is None:
+        detail_config = {
+            "enabled": False,
+            "num_naf_blocks": 1,
+            "gate_reduction": 4,
+            "prompt_condition": False,
+            "prompt_proj_dim": 32,
+        }
+    elif not isinstance(saved_detail_config, dict):
+        raise ValueError("Checkpoint detail_config must be a dictionary")
+    else:
+        detail_config = saved_detail_config
+
+    model = SelectiveDifix(
+        lora_rank_vae=int(checkpoint.get("rank_vae", 4)),
+        timestep=int(checkpoint.get("timestep", 199)),
+        detail_enabled=bool(detail_config.get("enabled", False)),
+        detail_num_blocks=int(detail_config.get("num_naf_blocks", 1)),
+        detail_gate_reduction=int(detail_config.get("gate_reduction", 4)),
+        detail_gate_use_prompt=bool(detail_config.get("prompt_condition", False)),
+        detail_prompt_proj_dim=int(detail_config.get("prompt_proj_dim", 32)),
+    )
+    global_step = _apply_model_checkpoint(model, checkpoint)
+    return model, global_step, dict(metadata or {})
+
+
 def load_training_checkpoint(
     model: SelectiveDifix,
     optimizer,

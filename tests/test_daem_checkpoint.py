@@ -1,4 +1,5 @@
 import importlib
+import importlib.util
 import sys
 import warnings
 from copy import deepcopy
@@ -13,9 +14,8 @@ from difix3d_selective.daem_lite import GatedDetailSkip
 
 
 def _load_model_module():
-    try:
-        return importlib.import_module("difix3d_selective.model")
-    except ModuleNotFoundError:
+    optional_modules = ("diffusers", "peft", "transformers")
+    if any(importlib.util.find_spec(name) is None for name in optional_modules):
         diffusers = ModuleType("diffusers")
         diffusers.AutoencoderKL = object
         diffusers.DDPMScheduler = object
@@ -24,15 +24,21 @@ def _load_model_module():
         transformers = ModuleType("transformers")
         transformers.AutoTokenizer = object
         transformers.CLIPTextModel = object
+        torchvision = ModuleType("torchvision")
+        torchvision_transforms = ModuleType("torchvision.transforms")
+        torchvision.transforms = torchvision_transforms
         with patch.dict(
             sys.modules,
             {
                 "diffusers": diffusers,
                 "peft": peft,
                 "transformers": transformers,
+                "torchvision": torchvision,
+                "torchvision.transforms": torchvision_transforms,
             },
         ):
             return importlib.import_module("difix3d_selective.model")
+    return importlib.import_module("difix3d_selective.model")
 
 
 model_module = _load_model_module()
@@ -58,19 +64,31 @@ class _TinySelectiveDifix(nn.Module):
     trainable_parameters = model_module.SelectiveDifix.trainable_parameters
     vae_adaptation_parameters = model_module.SelectiveDifix.vae_adaptation_parameters
 
-    def __init__(self, *, detail_enabled=True):
+    def __init__(
+        self,
+        lora_rank_vae=4,
+        timestep=199,
+        *,
+        detail_enabled=True,
+        detail_num_blocks=1,
+        detail_gate_reduction=4,
+        detail_alpha_init=0.1,
+        detail_gate_use_prompt=False,
+        detail_prompt_proj_dim=32,
+    ):
+        del detail_alpha_init
         super().__init__()
         self.unet = nn.Linear(4, 4)
         self.vae = _TinyVae()
         self.text_encoder = nn.Linear(4, 4)
-        self.lora_rank_vae = 4
+        self.lora_rank_vae = lora_rank_vae
         self.target_modules_vae = ["decoder.skip_conv_1"]
-        self.register_buffer("timesteps", torch.tensor([199], dtype=torch.long))
+        self.register_buffer("timesteps", torch.tensor([timestep], dtype=torch.long))
         self.detail_enabled = detail_enabled
-        self.detail_num_blocks = 1
-        self.detail_gate_reduction = 4
-        self.detail_gate_use_prompt = False
-        self.detail_prompt_proj_dim = 32
+        self.detail_num_blocks = detail_num_blocks
+        self.detail_gate_reduction = detail_gate_reduction
+        self.detail_gate_use_prompt = detail_gate_use_prompt
+        self.detail_prompt_proj_dim = detail_prompt_proj_dim
         self.train_scope = "all"
 
 
@@ -169,6 +187,62 @@ def test_checkpoint_rejects_incompatible_detail_configuration():
         assert "gate_reduction" in str(error)
     else:
         raise AssertionError("Expected an incompatible detail configuration error")
+
+
+def test_checkpoint_factory_constructs_saved_detail_architecture_once():
+    source = _TinySelectiveDifix(detail_enabled=True)
+    optimizer, scheduler = _optimizer_and_scheduler(source)
+    checkpoint = _checkpoint_payload(source, optimizer, scheduler, step=23)
+    checkpoint["experiment_metadata"] = {
+        "dataset": "CCDD-11",
+        "seed": 42,
+        "pairs": [1, 2, 3, 4, 5],
+    }
+    constructed = []
+
+    class FactoryTiny(_TinySelectiveDifix):
+        def __init__(self, *args, **kwargs):
+            constructed.append(dict(kwargs))
+            super().__init__(*args, **kwargs)
+
+    with (
+        patch.object(model_module, "SelectiveDifix", FactoryTiny),
+        patch.object(model_module.torch, "load", return_value=checkpoint) as load,
+    ):
+        restored, step, metadata = model_module.load_model_from_checkpoint(
+            Path("daem.pkl"), expected_dataset="CCDD-11", expected_seed=42
+        )
+
+    assert load.call_count == 1
+    assert step == 23
+    assert restored.detail_enabled
+    assert constructed[0]["detail_num_blocks"] == 1
+    assert constructed[0]["detail_gate_reduction"] == 4
+    assert metadata["pairs"] == [1, 2, 3, 4, 5]
+
+
+def test_checkpoint_factory_builds_legacy_checkpoint_without_detail():
+    source = _TinySelectiveDifix(detail_enabled=False)
+    optimizer, scheduler = _optimizer_and_scheduler(source)
+    checkpoint = _checkpoint_payload(source, optimizer, scheduler, step=90_000)
+    checkpoint.pop("detail_config")
+    checkpoint.pop("state_dict_detail")
+    checkpoint["experiment_metadata"] = {
+        "dataset": "CCDD-11",
+        "seed": 42,
+        "pairs": [1, 2, 3, 4, 5],
+    }
+
+    with (
+        patch.object(model_module, "SelectiveDifix", _TinySelectiveDifix),
+        patch.object(model_module.torch, "load", return_value=checkpoint),
+    ):
+        restored, step, _ = model_module.load_model_from_checkpoint(
+            Path("baseline.pkl"), expected_dataset="CCDD-11", expected_seed=42
+        )
+
+    assert step == 90_000
+    assert not restored.detail_enabled
 
 
 def _parameter_ids(parameters):
