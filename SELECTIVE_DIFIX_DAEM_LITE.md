@@ -134,6 +134,119 @@ accelerate launch --mixed_precision=bf16 train_ccdd11_difix.py \
 对 CDD-11 使用同一组 detail 参数并换成 `train_cdd11_difix.py`、CDD 数据路径；不要添加
 CCDD 专属的 `--negative-train-probability`。
 
+## Exp C：Detail+VAE
+
+Exp C 与上面的 detail-only Exp B 都从同一个 baseline 90k checkpoint 独立初始化。
+唯一变量是 `--train-scope detail+vae`：除 DAEM-lite 外，同时训练 VAE decoder LoRA
+和四层 `skip_conv`，其学习率为 `5e-6`。不要用 B 的 checkpoint 初始化 C。
+
+```bash
+export B_RUN="$RUN_ROOT/ccdd-daem-lite-detail-only-v1/detail-only-10k"
+export C_ROOT="$RUN_ROOT/ccdd-daem-lite-detail-vae-v1"
+export AB_RESULTS="$B_RUN/paired_validation_v1/full"
+
+accelerate launch --mixed_precision=bf16 train_ccdd11_difix.py \
+  --data-root "$CCDD_ROOT" \
+  --coarse-root "$CCDD_COARSE_ROOT/half_train" \
+  --output-dir "$C_ROOT/smoke" \
+  --degradation-pairs 1 2 3 4 5 \
+  --negative-train-probability 0.2 \
+  --resolution 512 --max-train-steps 2 --train-batch-size 4 \
+  --dataloader-num-workers 0 \
+  --detail-enabled --detail-num-blocks 1 \
+  --detail-gate-reduction 4 --detail-alpha-init 0.1 \
+  --train-scope detail+vae \
+  --learning-rate 5e-6 --detail-learning-rate 1e-4 \
+  --init-checkpoint "$FORMAL_RUN/checkpoints/best_psnr.pkl" \
+  --lr-scheduler linear --lr-warmup-steps 0 \
+  --lambda-l2 1 --lambda-lpips 1 --lambda-gram 0 \
+  --eval-freq 1 --full-eval-freq 2 --viz-freq 1 \
+  --num-validation-samples 2 --num-validation-visualizations 2 \
+  --latest-checkpointing-steps 2 --milestone-steps 2 \
+  --seed 42 --report-to wandb \
+  --tracker-project-name difix-ccdd11-selective-daem \
+  --tracker-run-name ccdd-daem-lite-detail-vae-smoke-v1
+```
+
+smoke 通过后，必须使用新的空目录启动正式 10k：
+
+```bash
+accelerate launch --mixed_precision=bf16 train_ccdd11_difix.py \
+  --data-root "$CCDD_ROOT" \
+  --coarse-root "$CCDD_COARSE_ROOT/half_train" \
+  --output-dir "$C_ROOT/detail-vae-10k" \
+  --degradation-pairs 1 2 3 4 5 \
+  --negative-train-probability 0.2 \
+  --resolution 512 --max-train-steps 10000 --train-batch-size 4 \
+  --dataloader-num-workers 8 \
+  --detail-enabled --detail-num-blocks 1 \
+  --detail-gate-reduction 4 --detail-alpha-init 0.1 \
+  --train-scope detail+vae \
+  --learning-rate 5e-6 --detail-learning-rate 1e-4 \
+  --init-checkpoint "$FORMAL_RUN/checkpoints/best_psnr.pkl" \
+  --lr-scheduler linear --lr-warmup-steps 200 \
+  --lambda-l2 1 --lambda-lpips 1 --lambda-gram 0 \
+  --enable-xformers-memory-efficient-attention \
+  --eval-freq 250 --full-eval-freq 2000 --viz-freq 1000 \
+  --num-validation-samples 100 --num-validation-visualizations 10 \
+  --latest-checkpointing-steps 1000 --milestone-steps 5000 \
+  --seed 42 --report-to wandb \
+  --tracker-project-name difix-ccdd11-selective-daem \
+  --tracker-run-name ccdd-daem-lite-detail-vae-10k-v1
+```
+
+正式训练中断后保持相同参数，用
+`--resume "$C_ROOT/detail-vae-10k/checkpoints/latest.pkl"` 替换
+`--init-checkpoint ...`；二者不能同时使用。
+
+### 固定种子 C 对 B 配对验证
+
+评估器读取 `$AB_RESULTS` 中已经完成的 A 对 B 全量结果，并复用其中 `candidate`
+角色（即 detail-only B）的 1,180 条 positive 和 590 条 negative 记录。它不会构造或
+推理 B 模型；smoke/full 分别只新增 30/1,770 次 C forward。
+
+```bash
+export TORCH_HOME="/home/bml/storage/mnt/v-zz4uoucip21b66el/PRP/Unet4Degradation/model-cache/torch"
+export BC_RESULTS="$C_ROOT/detail-vae-10k/paired_vs_detail_only_v1"
+
+python -u evaluate_ccdd11_paired.py \
+  --comparison-profile detail-only-vs-detail-vae \
+  --reuse-baseline-results "$AB_RESULTS" \
+  --reuse-baseline-role candidate \
+  --baseline-label detail_only \
+  --candidate-label detail_vae \
+  --baseline-checkpoint "$B_RUN/checkpoints/best_psnr.pkl" \
+  --candidate-checkpoint "$C_ROOT/detail-vae-10k/checkpoints/best_psnr.pkl" \
+  --output-dir "$BC_RESULTS/smoke" \
+  --max-samples 20 --num-gallery-samples 2 \
+  --workers 0 --device cuda --mixed-precision bf16 \
+  --bootstrap-resamples 10000 --bootstrap-seed 42 \
+  --enable-xformers-memory-efficient-attention
+```
+
+smoke 通过后使用新的空目录运行全量：
+
+```bash
+python -u evaluate_ccdd11_paired.py \
+  --comparison-profile detail-only-vs-detail-vae \
+  --reuse-baseline-results "$AB_RESULTS" \
+  --reuse-baseline-role candidate \
+  --baseline-label detail_only \
+  --candidate-label detail_vae \
+  --baseline-checkpoint "$B_RUN/checkpoints/best_psnr.pkl" \
+  --candidate-checkpoint "$C_ROOT/detail-vae-10k/checkpoints/best_psnr.pkl" \
+  --output-dir "$BC_RESULTS/full" \
+  --num-gallery-samples 20 \
+  --workers 0 --device cuda --mixed-precision bf16 \
+  --bootstrap-resamples 10000 --bootstrap-seed 42 \
+  --enable-xformers-memory-efficient-attention
+```
+
+`metrics.json` 会记录 `new_model_forwards`、`reused_reference_records` 和
+`reference_results_sha256`。只有 task-macro target PSNR 的 95% CI 下界大于零、至少
+6/10 任务均值提高、没有任务或感知/identity 指标明确退化，并且 gallery 通过人工检查，
+才晋级 Exp C；否则保留 Exp B。
+
 ## 结果判定
 
 checkpoint 仍只由 selective positive validation PSNR 选择。优先比较同一个 baseline

@@ -41,6 +41,8 @@ from .validation import stratified_indices
 
 
 PROTOCOL = "ccdd11-daem-fixed-seed-paired-validation-v1"
+DEFAULT_COMPARISON_PROFILE = "baseline-vs-daem"
+DETAIL_VAE_COMPARISON_PROFILE = "detail-only-vs-detail-vae"
 QUALITY_METRICS = ("mse_l2", "psnr", "ssim", "lpips_vgg", "dists")
 POSITIVE_METRICS = tuple(
     f"{reference}_{metric}"
@@ -154,6 +156,153 @@ def _training_run(checkpoint: Path) -> tuple[Path, Path, dict]:
     if [pair_id for pair_id, _ in selected_pairs(pair_ids)] != [1, 2, 3, 4, 5]:
         raise ValueError("Paired validation requires all five degradation pairs")
     return run_dir, manifest, preparation
+
+
+def _train_manifest(checkpoint: Path) -> Path:
+    path = checkpoint.parent.parent / "prepared" / "manifests" / "train.jsonl"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return path
+
+
+def _checkpoint_summary(checkpoint: Path) -> dict:
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    metadata = payload.get("experiment_metadata")
+    if not isinstance(metadata, dict):
+        raise ValueError(f"Checkpoint lacks experiment_metadata: {checkpoint}")
+    detail_config = payload.get("detail_config")
+    if not isinstance(detail_config, dict):
+        raise ValueError(f"Checkpoint lacks DAEM-lite detail_config: {checkpoint}")
+    summary = {
+        "global_step": int(payload["global_step"]),
+        "rank_vae": int(payload.get("rank_vae", 4)),
+        "timestep": int(payload.get("timestep", 199)),
+        "detail_config": dict(detail_config),
+        "metadata": dict(metadata),
+    }
+    del payload
+    gc.collect()
+    return summary
+
+
+def _validate_detail_vae_checkpoints(
+    baseline: Mapping,
+    candidate: Mapping,
+) -> None:
+    baseline_metadata = baseline["metadata"]
+    candidate_metadata = candidate["metadata"]
+    for label, summary, scope in (
+        ("detail-only", baseline, "detail"),
+        ("detail+vae", candidate, "detail+vae"),
+    ):
+        metadata = summary["metadata"]
+        if metadata.get("dataset") != "CCDD-11" or int(metadata.get("seed", -1)) != 42:
+            raise ValueError(f"The {label} checkpoint must be CCDD-11 seed 42")
+        if [int(value) for value in metadata.get("pairs", [])] != [1, 2, 3, 4, 5]:
+            raise ValueError(f"The {label} checkpoint must cover all five pairs")
+        if float(metadata.get("negative_train_probability", 0.0)) <= 0:
+            raise ValueError(f"The {label} checkpoint lacks negative CCDD-11 training")
+        if metadata.get("train_scope") != scope:
+            raise ValueError(
+                f"The {label} checkpoint train_scope is {metadata.get('train_scope')!r}, "
+                f"expected {scope!r}"
+            )
+        if not bool(summary["detail_config"].get("enabled", False)):
+            raise ValueError(f"The {label} checkpoint must enable DAEM-lite")
+
+    for key in ("rank_vae", "timestep", "detail_config"):
+        if baseline[key] != candidate[key]:
+            raise ValueError(f"Detail-only/detail+vae architecture mismatch: {key}")
+    baseline_detail = baseline_metadata.get("detail", {})
+    candidate_detail = candidate_metadata.get("detail", {})
+    if baseline_detail.get("alpha_init") != candidate_detail.get("alpha_init"):
+        raise ValueError("Detail-only/detail+vae alpha_init mismatch")
+
+
+def _load_reused_reference(
+    results_dir: Path,
+    *,
+    role: str,
+    baseline_checkpoint_sha256: str,
+    validation_manifest_sha256: str,
+    seed: int,
+    mixed_precision: str,
+    xformers: bool,
+    full_positive_ids: set[str],
+    full_negative_ids: set[str],
+    selected_positive_ids: set[str],
+    selected_negative_ids: set[str],
+    gallery_ids: set[str],
+) -> tuple[dict[str, dict], dict[str, dict], dict, int]:
+    state_path = results_dir / "state.json"
+    metrics_path = results_dir / "metrics.json"
+    if not state_path.is_file() or not metrics_path.is_file():
+        raise FileNotFoundError(
+            f"Reusable paired results require state.json and metrics.json: {results_dir}"
+        )
+    state = _read_json(state_path)
+    source_metrics = _read_json(metrics_path)
+    if state.get("status") != "completed":
+        raise ValueError("Reusable paired results are not completed")
+    source_config = state.get("config", {})
+    if source_metrics.get("metadata", {}).get("config") != source_config:
+        raise ValueError("Reusable state.json and metrics.json configurations differ")
+    if source_config.get("protocol") != PROTOCOL:
+        raise ValueError("Reusable paired results use a different protocol")
+    if int(source_config.get("seed", -1)) != seed:
+        raise ValueError("Reusable paired results use a different seed")
+    if source_config.get("mixed_precision") != mixed_precision:
+        raise ValueError("Reusable paired results use a different precision")
+    if bool(source_config.get("xformers_memory_efficient_attention")) != xformers:
+        raise ValueError("Reusable paired results use a different xformers setting")
+    if source_config.get("validation_manifest_sha256") != validation_manifest_sha256:
+        raise ValueError("Reusable paired results use a different validation manifest")
+    if source_config.get("max_samples") is not None:
+        raise ValueError("Reusable paired results must be the full validation run")
+    source_checkpoint = source_config.get(f"{role}_checkpoint", {})
+    if source_checkpoint.get("sha256") != baseline_checkpoint_sha256:
+        raise ValueError("Reusable reference checkpoint SHA256 mismatch")
+
+    records_root = results_dir / "records"
+    positive = _load_role_records(records_root, role, "positive")
+    negative = _load_role_records(records_root, role, "negative")
+    if set(positive) != full_positive_ids or set(negative) != full_negative_ids:
+        raise ValueError("Reusable reference sample set is incomplete or different")
+    source_counts = source_metrics.get("counts", {})
+    if int(source_counts.get("positive_per_model", -1)) != len(positive) or int(
+        source_counts.get("negative_per_model", -1)
+    ) != len(negative):
+        raise ValueError("Reusable metrics.json record counts are inconsistent")
+    for sample_id, record in {**positive, **negative}.items():
+        if int(record.get("inference_seed", -1)) != sample_seed(seed, sample_id):
+            raise ValueError(f"Reusable reference seed mismatch: {sample_id}")
+
+    selected_positive = {key: positive[key] for key in selected_positive_ids}
+    selected_negative = {key: negative[key] for key in selected_negative_ids}
+    negative_gallery_ids = {
+        f"validation/{record['pair']}/{record['scene_id']}/preserve-both"
+        for record in selected_positive.values()
+        if record["sample_id"] in gallery_ids
+    }
+    for sample_id in gallery_ids:
+        if not Path(selected_positive[sample_id].get("prediction_path", "")).is_file():
+            raise ValueError(f"Reusable positive gallery prediction is missing: {sample_id}")
+    for sample_id in negative_gallery_ids:
+        if not Path(selected_negative[sample_id].get("prediction_path", "")).is_file():
+            raise ValueError(f"Reusable negative gallery prediction is missing: {sample_id}")
+
+    steps = {int(record["global_step"]) for record in positive.values()}
+    if len(steps) != 1:
+        raise ValueError("Reusable reference records contain multiple checkpoint steps")
+    metadata = {
+        "path": str(results_dir.resolve()),
+        "role": role,
+        "metrics_sha256": _file_sha256(metrics_path),
+        "state_sha256": _file_sha256(state_path),
+        "positive_records": len(positive),
+        "negative_records": len(negative),
+    }
+    return selected_positive, selected_negative, metadata, steps.pop()
 
 
 def _selected_records(records: list[dict], max_samples: int | None) -> list[dict]:
@@ -286,6 +435,9 @@ def _positive_gallery(
     candidate_01: torch.Tensor,
     baseline_path: str,
     destination: Path,
+    *,
+    baseline_label: str = "baseline",
+    candidate_label: str = "DAEM",
 ) -> None:
     baseline = _pil_tensor(baseline_path)
     candidate = candidate_01[0].detach().float().cpu().clamp(0, 1)
@@ -296,8 +448,8 @@ def _positive_gallery(
         ("double degraded", _tensor_to_pil(source[:, 1].add(1).mul(0.5))),
         ("DACG coarse", _tensor_to_pil(source[:, 0].add(1).mul(0.5))),
         ("selective target", _tensor_to_pil(target.add(1).mul(0.5))),
-        ("baseline", _tensor_to_pil(baseline)),
-        ("DAEM", _tensor_to_pil(candidate)),
+        (baseline_label, _tensor_to_pil(baseline)),
+        (candidate_label, _tensor_to_pil(candidate)),
         ("abs model diff", _tensor_to_pil((candidate - baseline).abs())),
         ("clean GT", _tensor_to_pil(clean.add(1).mul(0.5))),
     ]
@@ -309,16 +461,19 @@ def _negative_gallery(
     candidate_01: torch.Tensor,
     baseline_path: str,
     destination: Path,
+    *,
+    baseline_label: str = "baseline",
+    candidate_label: str = "DAEM",
 ) -> None:
     baseline = _pil_tensor(baseline_path)
     candidate = candidate_01[0].detach().float().cpu().clamp(0, 1)
     degraded = batch["output_pixel_values"][0].add(1).mul(0.5).float().cpu()
     panels = [
         ("double degraded", _tensor_to_pil(degraded)),
-        ("baseline", _tensor_to_pil(baseline)),
-        ("DAEM", _tensor_to_pil(candidate)),
-        ("baseline abs change", _tensor_to_pil((baseline - degraded).abs())),
-        ("DAEM abs change", _tensor_to_pil((candidate - degraded).abs())),
+        (baseline_label, _tensor_to_pil(baseline)),
+        (candidate_label, _tensor_to_pil(candidate)),
+        (f"{baseline_label} abs change", _tensor_to_pil((baseline - degraded).abs())),
+        (f"{candidate_label} abs change", _tensor_to_pil((candidate - degraded).abs())),
     ]
     _save_sheet(panels, destination)
 
@@ -362,6 +517,11 @@ def _evaluate_checkpoint(
     config: dict,
     checkpoint_steps: dict[str, int],
     progress_counts: dict[str, int],
+    comparison_profile: str = DEFAULT_COMPARISON_PROFILE,
+    reference_positive_records: Mapping[str, dict] | None = None,
+    reference_negative_records: Mapping[str, dict] | None = None,
+    baseline_label: str = "baseline",
+    candidate_label: str = "DAEM",
 ) -> int:
     from torch.utils.data import DataLoader, Subset
     from tqdm.auto import tqdm
@@ -379,10 +539,16 @@ def _evaluate_checkpoint(
     model, global_step, metadata = load_model_from_checkpoint(
         checkpoint, expected_dataset="CCDD-11", expected_seed=42
     )
-    if role == "baseline" and model.detail_enabled:
-        raise ValueError("The baseline checkpoint must be detail-disabled or legacy")
-    if role == "candidate" and not model.detail_enabled:
-        raise ValueError("The candidate checkpoint must enable DAEM-lite detail blocks")
+    if comparison_profile == DEFAULT_COMPARISON_PROFILE:
+        if role == "baseline" and model.detail_enabled:
+            raise ValueError("The baseline checkpoint must be detail-disabled or legacy")
+        if role == "candidate" and not model.detail_enabled:
+            raise ValueError("The candidate checkpoint must enable DAEM-lite detail blocks")
+    elif role == "candidate":
+        if not model.detail_enabled:
+            raise ValueError("The detail+vae checkpoint must enable DAEM-lite")
+        if metadata.get("train_scope") != "detail+vae":
+            raise ValueError("The candidate checkpoint must use train_scope='detail+vae'")
     if [int(value) for value in metadata.get("pairs", [])] != [1, 2, 3, 4, 5]:
         raise ValueError(f"The {role} checkpoint does not cover all five pairs")
     if float(metadata.get("negative_train_probability", 0.0)) <= 0:
@@ -392,16 +558,16 @@ def _evaluate_checkpoint(
         model.unet.enable_xformers_memory_efficient_attention()
     model.set_eval()
     checkpoint_steps[role] = global_step
-    baseline_positive_records = (
-        _load_role_records(records_root, "baseline", "positive")
-        if role == "candidate"
-        else {}
-    )
-    baseline_negative_records = (
-        _load_role_records(records_root, "baseline", "negative")
-        if role == "candidate"
-        else {}
-    )
+    baseline_positive_records = dict(reference_positive_records or {})
+    baseline_negative_records = dict(reference_negative_records or {})
+    if role == "candidate" and reference_positive_records is None:
+        baseline_positive_records = _load_role_records(
+            records_root, "baseline", "positive"
+        )
+    if role == "candidate" and reference_negative_records is None:
+        baseline_negative_records = _load_role_records(
+            records_root, "baseline", "negative"
+        )
 
     positive_dataset = SelectiveDifixDataset(
         manifest, model.tokenizer, resolution=512, training_mode="positive"
@@ -455,6 +621,8 @@ def _evaluate_checkpoint(
                     prediction_01,
                     baseline_path,
                     gallery_root / "positive" / f"{_safe_id(sample_id)}.png",
+                    baseline_label=baseline_label,
+                    candidate_label=candidate_label,
                 )
         source_record = manifest_by_id[sample_id]
         record = {
@@ -549,6 +717,8 @@ def _evaluate_checkpoint(
                     prediction_01,
                     baseline_path,
                     gallery_root / "negative" / f"{_safe_id(sample_id)}.png",
+                    baseline_label=baseline_label,
+                    candidate_label=candidate_label,
                 )
         record = {
             "sample_id": sample_id,
@@ -592,6 +762,9 @@ def paired_rows(
     *,
     metrics: tuple[str, ...],
     mode: str,
+    comparison_profile: str = DEFAULT_COMPARISON_PROFILE,
+    baseline_label: str = "baseline",
+    candidate_label: str = "candidate",
 ) -> list[dict]:
     if set(baseline) != set(candidate):
         raise ValueError(f"The {mode} sample sets differ")
@@ -606,6 +779,14 @@ def paired_rows(
             if left[field] != right[field]:
                 raise ValueError(f"Paired protocol mismatch for {sample_id}: {field}")
         row = {"mode": mode, "sample_id": sample_id}
+        if comparison_profile != DEFAULT_COMPARISON_PROFILE:
+            row.update(
+                {
+                    "comparison_profile": comparison_profile,
+                    "baseline_label": baseline_label,
+                    "candidate_label": candidate_label,
+                }
+            )
         for field in identity_fields:
             row[field] = left[field]
         for metric in metrics:
@@ -812,6 +993,32 @@ def summarize_effects(
     return effects, conditions
 
 
+def _label_summaries(
+    effects: list[dict],
+    conditions: list[dict],
+    *,
+    comparison_profile: str,
+    baseline_label: str,
+    candidate_label: str,
+) -> tuple[list[dict], list[dict]]:
+    common = {
+        "comparison_profile": comparison_profile,
+        "baseline_label": baseline_label,
+        "candidate_label": candidate_label,
+    }
+    labeled_effects = [{**common, **row} for row in effects]
+    model_labels = {"baseline": baseline_label, "candidate": candidate_label}
+    labeled_conditions = [
+        {
+            **common,
+            **row,
+            "model": model_labels.get(str(row["model"]), row["model"]),
+        }
+        for row in conditions
+    ]
+    return labeled_effects, labeled_conditions
+
+
 def build_decision(effects: list[dict]) -> dict:
     def find(mode: str, group: str, condition: str, metric: str) -> dict:
         return next(
@@ -888,6 +1095,23 @@ def run(args: argparse.Namespace) -> None:
     if args.num_gallery_samples < 0:
         raise ValueError("--num-gallery-samples must be non-negative")
 
+    comparison_profile = getattr(
+        args, "comparison_profile", DEFAULT_COMPARISON_PROFILE
+    )
+    reuse_results = getattr(args, "reuse_baseline_results", None)
+    reuse_role = getattr(args, "reuse_baseline_role", "candidate")
+    baseline_label = getattr(args, "baseline_label", "baseline")
+    candidate_label = getattr(args, "candidate_label", "candidate")
+    if comparison_profile == DETAIL_VAE_COMPARISON_PROFILE:
+        if reuse_results is None:
+            raise ValueError(
+                "detail-only-vs-detail-vae requires --reuse-baseline-results"
+            )
+    elif reuse_results is not None:
+        raise ValueError(
+            "--reuse-baseline-results requires detail-only-vs-detail-vae profile"
+        )
+
     baseline_checkpoint = args.baseline_checkpoint.resolve()
     candidate_checkpoint = args.candidate_checkpoint.resolve()
     _, baseline_manifest, baseline_preparation = _training_run(baseline_checkpoint)
@@ -900,10 +1124,56 @@ def run(args: argparse.Namespace) -> None:
     validate_full_manifest(manifest_records)
     selected_positive = _selected_records(manifest_records, args.max_samples)
     selected_negative_ids = _negative_ids(selected_positive)
+    full_positive_ids = {str(row["id"]) for row in manifest_records}
+    full_negative_ids = set(_negative_ids(manifest_records))
+    selected_positive_ids = {str(row["id"]) for row in selected_positive}
+    selected_negative_id_set = set(selected_negative_ids)
+    gallery_indices = (
+        []
+        if args.num_gallery_samples == 0
+        else stratified_indices(selected_positive, args.num_gallery_samples)
+    )
     gallery_ids = {
-        str(selected_positive[index]["id"])
-        for index in stratified_indices(selected_positive, args.num_gallery_samples)
+        str(selected_positive[index]["id"]) for index in gallery_indices
     }
+
+    baseline_checkpoint_sha = _file_sha256(baseline_checkpoint)
+    candidate_checkpoint_sha = _file_sha256(candidate_checkpoint)
+    baseline_train_manifest_sha = None
+    candidate_train_manifest_sha = None
+    reference_positive: dict[str, dict] | None = None
+    reference_negative: dict[str, dict] | None = None
+    reference_metadata: dict | None = None
+    reference_step: int | None = None
+    if comparison_profile == DETAIL_VAE_COMPARISON_PROFILE:
+        baseline_train_manifest_sha = _file_sha256(
+            _train_manifest(baseline_checkpoint)
+        )
+        candidate_train_manifest_sha = _file_sha256(
+            _train_manifest(candidate_checkpoint)
+        )
+        if baseline_train_manifest_sha != candidate_train_manifest_sha:
+            raise ValueError("Detail-only and detail+vae train manifest SHA256 differ")
+        _validate_detail_vae_checkpoints(
+            _checkpoint_summary(baseline_checkpoint),
+            _checkpoint_summary(candidate_checkpoint),
+        )
+        reference_positive, reference_negative, reference_metadata, reference_step = (
+            _load_reused_reference(
+                Path(reuse_results).resolve(),
+                role=reuse_role,
+                baseline_checkpoint_sha256=baseline_checkpoint_sha,
+                validation_manifest_sha256=baseline_manifest_sha,
+                seed=args.seed,
+                mixed_precision=args.mixed_precision,
+                xformers=args.enable_xformers_memory_efficient_attention,
+                full_positive_ids=full_positive_ids,
+                full_negative_ids=full_negative_ids,
+                selected_positive_ids=selected_positive_ids,
+                selected_negative_ids=selected_negative_id_set,
+                gallery_ids=gallery_ids,
+            )
+        )
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -914,11 +1184,11 @@ def run(args: argparse.Namespace) -> None:
         "protocol": PROTOCOL,
         "baseline_checkpoint": {
             **_checkpoint_identity(baseline_checkpoint),
-            "sha256": _file_sha256(baseline_checkpoint),
+            "sha256": baseline_checkpoint_sha,
         },
         "candidate_checkpoint": {
             **_checkpoint_identity(candidate_checkpoint),
-            "sha256": _file_sha256(candidate_checkpoint),
+            "sha256": candidate_checkpoint_sha,
         },
         "validation_manifest": str(baseline_manifest.resolve()),
         "validation_manifest_sha256": baseline_manifest_sha,
@@ -935,6 +1205,17 @@ def run(args: argparse.Namespace) -> None:
         "positive_samples": len(selected_positive),
         "negative_samples": len(selected_negative_ids),
     }
+    if comparison_profile == DETAIL_VAE_COMPARISON_PROFILE:
+        config.update(
+            {
+                "comparison_profile": comparison_profile,
+                "baseline_label": baseline_label,
+                "candidate_label": candidate_label,
+                "train_manifest_sha256": baseline_train_manifest_sha,
+                "reuse_baseline_role": reuse_role,
+                "reused_reference": reference_metadata,
+            }
+        )
     if (output_dir / "metrics.json").is_file():
         raise RuntimeError(f"Completed paired results already exist in {output_dir}")
     if state_path.is_file():
@@ -945,6 +1226,9 @@ def run(args: argparse.Namespace) -> None:
         raise RuntimeError("Partial paired records exist without state metadata")
 
     progress_counts = _progress(records_root)
+    if reference_positive is not None and reference_negative is not None:
+        progress_counts["baseline_positive"] = len(reference_positive)
+        progress_counts["baseline_negative"] = len(reference_negative)
     _write_state(
         state_path,
         config,
@@ -963,10 +1247,17 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("CPU evaluation requires --mixed-precision no")
     metric_suite = PairedMetricSuite(device)
     checkpoint_steps: dict[str, int] = {}
-    for role, checkpoint in (
-        ("baseline", baseline_checkpoint),
-        ("candidate", candidate_checkpoint),
-    ):
+    evaluation_roles = (
+        (("candidate", candidate_checkpoint),)
+        if reference_positive is not None
+        else (
+            ("baseline", baseline_checkpoint),
+            ("candidate", candidate_checkpoint),
+        )
+    )
+    if reference_step is not None:
+        checkpoint_steps["baseline"] = reference_step
+    for role, checkpoint in evaluation_roles:
         checkpoint_steps[role] = _evaluate_checkpoint(
             role=role,
             checkpoint=checkpoint,
@@ -983,23 +1274,42 @@ def run(args: argparse.Namespace) -> None:
             config=config,
             checkpoint_steps=checkpoint_steps,
             progress_counts=progress_counts,
+            comparison_profile=comparison_profile,
+            reference_positive_records=reference_positive,
+            reference_negative_records=reference_negative,
+            baseline_label=baseline_label,
+            candidate_label=(
+                "DAEM"
+                if comparison_profile == DEFAULT_COMPARISON_PROFILE
+                else candidate_label
+            ),
         )
 
-    baseline_positive = _load_role_records(records_root, "baseline", "positive")
+    baseline_positive = reference_positive or _load_role_records(
+        records_root, "baseline", "positive"
+    )
     candidate_positive = _load_role_records(records_root, "candidate", "positive")
-    baseline_negative = _load_role_records(records_root, "baseline", "negative")
+    baseline_negative = reference_negative or _load_role_records(
+        records_root, "baseline", "negative"
+    )
     candidate_negative = _load_role_records(records_root, "candidate", "negative")
     positive_rows = paired_rows(
         baseline_positive,
         candidate_positive,
         metrics=POSITIVE_METRICS,
         mode="positive",
+        comparison_profile=comparison_profile,
+        baseline_label=baseline_label,
+        candidate_label=candidate_label,
     )
     negative_rows = paired_rows(
         baseline_negative,
         candidate_negative,
         metrics=NEGATIVE_METRICS,
         mode="negative",
+        comparison_profile=comparison_profile,
+        baseline_label=baseline_label,
+        candidate_label=candidate_label,
     )
     effects, conditions = summarize_effects(
         positive_rows,
@@ -1007,13 +1317,20 @@ def run(args: argparse.Namespace) -> None:
         resamples=args.bootstrap_resamples,
         seed=args.bootstrap_seed,
     )
+    if comparison_profile != DEFAULT_COMPARISON_PROFILE:
+        effects, conditions = _label_summaries(
+            effects,
+            conditions,
+            comparison_profile=comparison_profile,
+            baseline_label=baseline_label,
+            candidate_label=candidate_label,
+        )
     decision = build_decision(effects)
     _write_csv(output_dir / "positive_per_image.csv", positive_rows)
     _write_csv(output_dir / "negative_per_image.csv", negative_rows)
     _write_csv(output_dir / "paired_effects.csv", effects)
     _write_csv(output_dir / "condition_summary.csv", conditions)
-    metrics_payload = {
-        "metadata": {
+    metadata_payload = {
             "protocol": PROTOCOL,
             "dataset": "CCDD-11",
             "split": "validation",
@@ -1039,12 +1356,34 @@ def run(args: argparse.Namespace) -> None:
                 name: _package_version(name)
                 for name in ("torch", "torchvision", "diffusers", "lpips", "piq")
             },
-        },
-        "counts": {
+    }
+    counts_payload = {
             "positive_per_model": len(positive_rows),
             "negative_per_model": len(negative_rows),
             "total_model_forwards": 2 * (len(positive_rows) + len(negative_rows)),
-        },
+    }
+    if reference_metadata is not None:
+        metadata_payload.update(
+            {
+                "comparison_profile": comparison_profile,
+                "baseline_label": baseline_label,
+                "candidate_label": candidate_label,
+                "advantage_definition": (
+                    f"positive always means {candidate_label} is better than "
+                    f"{baseline_label}"
+                ),
+                "reference_results_sha256": reference_metadata["metrics_sha256"],
+            }
+        )
+        counts_payload.update(
+            {
+                "new_model_forwards": len(positive_rows) + len(negative_rows),
+                "reused_reference_records": len(positive_rows) + len(negative_rows),
+            }
+        )
+    metrics_payload = {
+        "metadata": metadata_payload,
+        "counts": counts_payload,
         "decision": decision,
         "paired_effects": effects,
     }
@@ -1059,17 +1398,35 @@ def run(args: argparse.Namespace) -> None:
         negative_total=len(negative_rows),
         checkpoint_steps=checkpoint_steps,
     )
-    print(
-        f"Completed paired validation: {len(positive_rows)} positive and "
-        f"{len(negative_rows)} negative samples per model. Results: {output_dir}",
-        flush=True,
-    )
+    if comparison_profile == DEFAULT_COMPARISON_PROFILE:
+        message = (
+            f"Completed paired validation: {len(positive_rows)} positive and "
+            f"{len(negative_rows)} negative samples per model. Results: {output_dir}"
+        )
+    else:
+        message = (
+            f"Completed {comparison_profile} paired validation: "
+            f"{len(positive_rows)} positive and {len(negative_rows)} negative "
+            f"samples per model. Results: {output_dir}"
+        )
+    print(message, flush=True)
 
 
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description=__doc__)
     value.add_argument("--baseline-checkpoint", type=Path, required=True)
     value.add_argument("--candidate-checkpoint", type=Path, required=True)
+    value.add_argument(
+        "--comparison-profile",
+        choices=(DEFAULT_COMPARISON_PROFILE, DETAIL_VAE_COMPARISON_PROFILE),
+        default=DEFAULT_COMPARISON_PROFILE,
+    )
+    value.add_argument("--reuse-baseline-results", type=Path)
+    value.add_argument(
+        "--reuse-baseline-role", choices=("baseline", "candidate"), default="candidate"
+    )
+    value.add_argument("--baseline-label", default="baseline")
+    value.add_argument("--candidate-label", default="candidate")
     value.add_argument("--output-dir", type=Path, required=True)
     value.add_argument("--workers", type=int, default=8)
     value.add_argument("--device", default="cuda")
