@@ -8,7 +8,9 @@ import gc
 import hashlib
 import json
 import math
+import os
 import time
+import warnings
 from collections import defaultdict
 from pathlib import Path
 from typing import Mapping
@@ -180,12 +182,38 @@ def _load_role_records(root: Path, role: str, mode: str) -> dict[str, dict]:
     if not directory.is_dir():
         return result
     for path in sorted(directory.rglob("*.json")):
-        record = _read_json(path)
+        if path.stat().st_size == 0:
+            warnings.warn(
+                f"Ignoring empty partial record so it can be recomputed: {path}",
+                stacklevel=2,
+            )
+            continue
+        try:
+            record = _read_json(path)
+        except json.JSONDecodeError:
+            if path.read_bytes().strip():
+                raise
+            warnings.warn(
+                f"Ignoring empty partial record so it can be recomputed: {path}",
+                stacklevel=2,
+            )
+            continue
         sample_id = str(record["sample_id"])
         if sample_id in result:
             raise ValueError(f"Duplicate {role}/{mode} record: {sample_id}")
         result[sample_id] = record
     return result
+
+
+def _write_record_json(path: Path, value: dict) -> None:
+    """Persist an independent record using close-to-open friendly direct I/O."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = (json.dumps(value, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    with path.open("wb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def _progress(records_root: Path) -> dict[str, int]:
@@ -450,7 +478,7 @@ def _evaluate_checkpoint(
             **metrics,
             **coarse_metrics,
         }
-        _atomic_json(_record_path(records_root, role, "positive", record), record)
+        _write_record_json(_record_path(records_root, role, "positive", record), record)
         positive_records[sample_id] = record
         progress_counts[f"{role}_positive"] = len(positive_records)
         if index % 10 == 0 or index == len(pending_positive):
@@ -536,7 +564,7 @@ def _evaluate_checkpoint(
             "prediction_path": prediction_path,
             **measured,
         }
-        _atomic_json(_record_path(records_root, role, "negative", record), record)
+        _write_record_json(_record_path(records_root, role, "negative", record), record)
         negative_records[sample_id] = record
         progress_counts[f"{role}_negative"] = len(negative_records)
         if index % 10 == 0 or index == len(pending_negative):

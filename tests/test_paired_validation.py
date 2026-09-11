@@ -15,6 +15,7 @@ from difix3d_selective.paired_validation import (
     COARSE_METRICS,
     NEGATIVE_METRICS,
     POSITIVE_METRICS,
+    _load_role_records,
     _negative_ids,
     _run_prediction,
     paired_rows,
@@ -212,6 +213,23 @@ def _args(baseline: Path, candidate: Path, output: Path):
 
 
 class TestPairedValidation(unittest.TestCase):
+    def test_empty_partial_record_is_treated_as_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            record = (
+                Path(directory)
+                / "baseline"
+                / "positive"
+                / "low_haze"
+                / "empty.json"
+            )
+            record.parent.mkdir(parents=True)
+            record.write_bytes(b"")
+            with self.assertWarnsRegex(UserWarning, "can be recomputed"):
+                loaded = _load_role_records(
+                    Path(directory), "baseline", "positive"
+                )
+            self.assertEqual(loaded, {})
+
     def test_fixed_seed_replays_random_path(self):
         self.assertEqual(sample_seed(42, "a"), sample_seed(42, "a"))
         self.assertNotEqual(sample_seed(42, "a"), sample_seed(42, "b"))
