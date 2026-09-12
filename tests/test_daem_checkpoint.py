@@ -1,5 +1,7 @@
 import importlib
 import importlib.util
+import errno
+import os
 import sys
 import warnings
 from copy import deepcopy
@@ -123,6 +125,43 @@ def _checkpoint_payload(model, optimizer, scheduler, *, step):
             {"dataset": "CCDD-11"},
         )
     return captured
+
+
+def test_checkpoint_save_ignores_stale_temp_and_retries_eio(tmp_path):
+    model = _TinySelectiveDifix()
+    optimizer, scheduler = _optimizer_and_scheduler(model)
+    destination = tmp_path / "checkpoint.pkl"
+    stale_temporary = tmp_path / "checkpoint.pkl.tmp"
+    stale_temporary.write_bytes(b"stale")
+    replace = os.replace
+    replace_sources = []
+
+    def flaky_replace(source, target):
+        replace_sources.append(Path(source))
+        if len(replace_sources) == 1:
+            raise OSError(errno.EIO, "transient mounted-storage error")
+        replace(source, target)
+
+    with (
+        patch.object(model_module.os, "replace", side_effect=flaky_replace),
+        patch.object(model_module.time, "sleep") as sleep,
+    ):
+        model_module.save_training_checkpoint(
+            model,
+            optimizer,
+            scheduler,
+            destination,
+            14_000,
+            {"dataset": "CCDD-11"},
+        )
+
+    checkpoint = torch.load(destination, map_location="cpu", weights_only=False)
+    assert checkpoint["global_step"] == 14_000
+    assert stale_temporary.read_bytes() == b"stale"
+    assert len(replace_sources) == 2
+    assert replace_sources[0] != stale_temporary
+    assert replace_sources[0].parent == destination.parent
+    sleep.assert_called_once_with(1)
 
 
 def test_new_checkpoint_round_trip_preserves_detail_state_and_prediction():

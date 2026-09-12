@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import errno
 import os
+import time
+import uuid
 import warnings
 from pathlib import Path
 
@@ -446,9 +449,18 @@ def save_training_checkpoint(
         checkpoint["experiment_metadata"] = dict(experiment_metadata)
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(destination.name + ".tmp")
+    temporary = destination.with_name(
+        f".{destination.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
     torch.save(checkpoint, temporary)
-    os.replace(temporary, destination)
+    for attempt in range(3):
+        try:
+            os.replace(temporary, destination)
+            break
+        except OSError as error:
+            if error.errno != errno.EIO or attempt == 2:
+                raise
+            time.sleep(1)
 
 
 def _apply_model_checkpoint(model: SelectiveDifix, checkpoint: dict) -> int:
