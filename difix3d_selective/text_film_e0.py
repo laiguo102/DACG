@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import gc
+import os
 from pathlib import Path
 from types import SimpleNamespace
+
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import torch
 import torch.nn.functional as F
@@ -172,6 +175,7 @@ def run(args: argparse.Namespace) -> None:
     device = torch.device(args.device)
     if device.type == "cuda":
         torch.cuda.set_device(device.index)
+        torch.use_deterministic_algorithms(True)
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
         torch.backends.cuda.matmul.allow_tf32 = False
