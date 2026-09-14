@@ -280,13 +280,17 @@ def test_real_ccdd_manifest_dataset_tensor_contract(tmp_path):
         model_max_length = 4
 
         def __call__(self, *args, **kwargs):
-            return SimpleNamespace(input_ids=torch.tensor([[1, 2, 3, 4]]))
+            return SimpleNamespace(
+                input_ids=torch.tensor([[1, 2, 3, 4]]),
+                attention_mask=torch.ones(1, 4, dtype=torch.long),
+            )
 
     sample = SelectiveDifixDataset(result["train_manifest"], Tokenizer(), resolution=512)[0]
     assert tuple(sample["conditioning_pixel_values"].shape) == (2, 3, 512, 512)
     assert tuple(sample["output_pixel_values"].shape) == (3, 512, 512)
     assert tuple(sample["ground_truth_pixel_values"].shape) == (3, 512, 512)
     assert torch.equal(sample["input_ids"], torch.tensor([1, 2, 3, 4]))
+    assert torch.equal(sample["attention_mask"], torch.ones(4, dtype=torch.long))
 
     negative_validation = SelectiveDifixDataset(
         result["validation_manifest"],
@@ -319,8 +323,14 @@ def test_training_parser_defaults_keep_cdd11_and_ccdd_wrapper_can_override():
     assert cdd_defaults["detail_gate_reduction"] == 4
     assert cdd_defaults["detail_alpha_init"] == 0.1
     assert cdd_defaults["detail_gate_use_prompt"] is False
+    assert cdd_defaults["detail_text_mode"] == "none"
+    assert cdd_defaults["detail_text_proj_dim"] == 128
+    assert cdd_defaults["detail_film_hidden_ratio"] == 4
+    assert cdd_defaults["detail_text_condition_scale"] == 1.0
     assert cdd_defaults["train_scope"] == "all"
     assert cdd_defaults["detail_learning_rate"] == 1e-4
+    assert cdd_defaults["text_learning_rate"] == 1e-4
+    assert cdd_defaults["detail_alpha_learning_rate"] == 5e-6
     assert probability("0") == 0.0
     assert probability("1") == 1.0
     with pytest.raises(argparse.ArgumentTypeError, match=r"\[0, 1\]"):
@@ -401,7 +411,7 @@ def test_validation_reports_directed_task_metrics():
     from difix3d_selective.validation import validate
 
     class Model(torch.nn.Module):
-        def forward(self, source, prompt_tokens):
+        def forward(self, source, prompt_tokens, prompt_attention_mask=None):
             return torch.zeros_like(source[:, 0])
 
         def set_train(self):
@@ -427,6 +437,7 @@ def test_validation_reports_directed_task_metrics():
         "output_pixel_values": torch.zeros(1, 3, 12, 12),
         "ground_truth_pixel_values": torch.zeros(1, 3, 12, 12),
         "input_ids": torch.ones(1, 4, dtype=torch.long),
+        "attention_mask": torch.ones(1, 4, dtype=torch.long),
         "sample_id": ["validation/low_haze/00001/remove-low-preserve-haze"],
         "prompt": ["remove low light, preserve haze"],
         "pair_id": torch.tensor([1]),
@@ -442,7 +453,7 @@ def test_negative_validation_reports_identity_metrics_and_visualization():
     from difix3d_selective.validation import validate_negative
 
     class Model(torch.nn.Module):
-        def forward(self, source, prompt_tokens):
+        def forward(self, source, prompt_tokens, prompt_attention_mask=None):
             return source[:, 0]
 
         def set_train(self):
@@ -471,6 +482,7 @@ def test_negative_validation_reports_identity_metrics_and_visualization():
         "output_pixel_values": source[:, 0].clone(),
         "dacg_coarse_pixel_values": torch.full((1, 3, 12, 12), -0.75),
         "input_ids": torch.ones(1, 4, dtype=torch.long),
+        "attention_mask": torch.ones(1, 4, dtype=torch.long),
         "sample_id": ["validation/low_haze/00001/negative"],
         "prompt": ["preserve low light, preserve haze"],
         "pair_id": torch.tensor([1]),

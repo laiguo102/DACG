@@ -17,7 +17,12 @@ from PIL import Image
 from torchvision import transforms
 from transformers import AutoTokenizer, CLIPTextModel
 
-from .daem_lite import GatedDetailSkip
+from .daem_lite import (
+    GatedDetailSkip,
+    TextConditionProjection,
+    TextFiLMDeltaGate,
+    masked_mean_pool,
+)
 from .main_view import select_main_view, select_main_view_skips
 
 SD_TURBO = "stabilityai/sd-turbo"
@@ -53,13 +58,56 @@ def vae_decoder_forward(self, sample, latent_embeds=None):
         self.skip_conv_3,
         self.skip_conv_4,
     ]
+    projected_text = None
+    if self.detail_text_enabled and self.incoming_detail_condition is not None:
+        projected_text = self.detail_text_projection(self.incoming_detail_condition)
+    analysis_text = None
+    if self.incoming_detail_analysis_conditions is not None:
+        analysis_text = tuple(
+            self.detail_text_projection(condition)
+            for condition in self.incoming_detail_analysis_conditions
+        )
+        self.last_detail_analysis = []
     for index, up_block in enumerate(self.up_blocks):
         skip = skip_convs[index](self.incoming_skip_acts[::-1][index] * self.gamma)
         if self.detail_enabled:
+            if analysis_text is not None:
+                base_logits = self.detail_blocks[index].gate_logits(sample, skip)
+                first_delta = self.detail_text_gates[index](
+                    sample, skip, analysis_text[0]
+                )
+                second_delta = self.detail_text_gates[index](
+                    sample, skip, analysis_text[1]
+                )
+                base_gate = 2.0 * torch.sigmoid(base_logits) - 1.0
+                first_gate = 2.0 * torch.sigmoid(base_logits + first_delta) - 1.0
+                second_gate = 2.0 * torch.sigmoid(base_logits + second_delta) - 1.0
+                difference = (first_gate - second_gate).abs()
+                self.last_detail_analysis.append(
+                    {
+                        "base_gate": base_gate.detach().mean(dim=1),
+                        "correct_gate": first_gate.detach().mean(dim=1),
+                        "swapped_gate": second_gate.detach().mean(dim=1),
+                        "gate_difference": difference.detach().mean(dim=1),
+                        "delta_logits": first_delta.detach().mean(dim=1),
+                        "gate_difference_mean": difference.detach().mean(),
+                    }
+                )
+            delta_logits = None
+            if projected_text is not None and self.incoming_text_condition_scale != 0:
+                delta_logits = self.detail_text_gates[index](
+                    sample, skip, projected_text
+                )
             skip = self.detail_blocks[index](
                 decoder_feature=sample,
                 projected_skip=skip,
-                prompt_condition=self.incoming_detail_condition,
+                prompt_condition=(
+                    self.incoming_detail_condition
+                    if self.detail_gate_use_prompt
+                    else None
+                ),
+                delta_logits=delta_logits,
+                text_condition_scale=self.incoming_text_condition_scale,
             )
         sample = up_block(sample + skip, latent_embeds)
     if latent_embeds is None:
@@ -81,8 +129,20 @@ class SelectiveDifix(torch.nn.Module):
         detail_alpha_init: float = 0.1,
         detail_gate_use_prompt: bool = False,
         detail_prompt_proj_dim: int = 32,
+        detail_text_mode: str = "none",
+        detail_text_proj_dim: int = 128,
+        detail_film_hidden_ratio: int = 4,
+        detail_text_condition_scale: float = 1.0,
     ):
         super().__init__()
+        if detail_text_mode not in ("none", "full", "constant"):
+            raise ValueError(f"Unknown detail text mode: {detail_text_mode}")
+        if detail_text_mode != "none" and not detail_enabled:
+            raise ValueError("detail text mode requires detail_enabled")
+        if detail_gate_use_prompt and detail_text_mode != "none":
+            raise ValueError(
+                "--detail-gate-use-prompt cannot be combined with --detail-text-mode"
+            )
         self.tokenizer = AutoTokenizer.from_pretrained(SD_TURBO, subfolder="tokenizer")
         self.text_encoder = CLIPTextModel.from_pretrained(
             SD_TURBO, subfolder="text_encoder"
@@ -161,14 +221,61 @@ class SelectiveDifix(torch.nn.Module):
             ]
         vae.decoder.detail_blocks = torch.nn.ModuleList(detail_blocks)
         vae.decoder.detail_enabled = bool(detail_enabled)
+        text_hidden_size = int(self.text_encoder.config.hidden_size)
+        if detail_enabled and detail_text_mode != "none":
+            vae.decoder.detail_text_projection = TextConditionProjection(
+                text_hidden_size, detail_text_proj_dim
+            )
+            vae.decoder.detail_text_gates = torch.nn.ModuleList(
+                TextFiLMDeltaGate(
+                    channels,
+                    detail_text_proj_dim,
+                    hidden_ratio=detail_film_hidden_ratio,
+                )
+                for channels in (512, 512, 512, 256)
+            )
+        else:
+            vae.decoder.detail_text_projection = None
+            vae.decoder.detail_text_gates = torch.nn.ModuleList()
+        vae.decoder.detail_text_enabled = bool(
+            detail_enabled and detail_text_mode != "none"
+        )
+        vae.decoder.detail_gate_use_prompt = bool(detail_gate_use_prompt)
         vae.decoder.incoming_detail_condition = None
+        vae.decoder.incoming_detail_analysis_conditions = None
+        vae.decoder.last_detail_analysis = []
+        vae.decoder.incoming_text_condition_scale = float(detail_text_condition_scale)
         self.detail_enabled = bool(detail_enabled)
         self.detail_num_blocks = int(detail_num_blocks)
         self.detail_gate_reduction = int(detail_gate_reduction)
         self.detail_alpha_init = float(detail_alpha_init)
         self.detail_gate_use_prompt = bool(detail_gate_use_prompt)
         self.detail_prompt_proj_dim = int(detail_prompt_proj_dim)
+        self.detail_text_mode = detail_text_mode
+        self.detail_text_proj_dim = int(detail_text_proj_dim)
+        self.detail_film_hidden_ratio = int(detail_film_hidden_ratio)
+        self.detail_text_condition_scale = float(detail_text_condition_scale)
         self._last_detail_condition = None
+
+        constant_condition = None
+        if detail_text_mode == "constant":
+            constant_tokens = self.tokenizer(
+                "",
+                max_length=self.tokenizer.model_max_length,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+            with torch.no_grad():
+                constant_hidden = self.text_encoder(
+                    constant_tokens.input_ids, return_dict=True
+                ).last_hidden_state
+            constant_condition = masked_mean_pool(
+                constant_hidden, constant_tokens.attention_mask
+            )
+        self.register_buffer(
+            "_constant_detail_condition", constant_condition, persistent=False
+        )
 
         from .mv_unet import UNet2DConditionModel
 
@@ -181,19 +288,48 @@ class SelectiveDifix(torch.nn.Module):
 
     def set_train(self, train_scope: str | None = None) -> None:
         train_scope = self.train_scope if train_scope is None else train_scope
-        if train_scope not in ("all", "detail", "detail+vae"):
+        if train_scope not in (
+            "all",
+            "detail",
+            "detail+vae",
+            "film",
+            "film+detail",
+        ):
             raise ValueError(f"Unknown train scope: {train_scope}")
         if train_scope != "all" and not self.detail_enabled:
             raise ValueError(f"train scope {train_scope!r} requires detail_enabled")
+        if train_scope in ("film", "film+detail") and not self.text_film_enabled:
+            raise ValueError(f"train scope {train_scope!r} requires detail text mode")
         self.train_scope = train_scope
 
-        self.unet.train(train_scope == "all").requires_grad_(train_scope == "all")
+        train_all = train_scope == "all"
+        train_base_detail = train_scope in (
+            "all",
+            "detail",
+            "detail+vae",
+            "film+detail",
+        )
+        train_text = self.text_film_enabled and train_scope in (
+            "all",
+            "film",
+            "film+detail",
+        )
+        self.unet.train(train_all).requires_grad_(train_all)
         self.vae.train().requires_grad_(False)
         if train_scope in ("all", "detail+vae"):
             for parameter in self.vae_adaptation_parameters():
                 parameter.requires_grad = True
         if self.detail_enabled:
-            self.vae.decoder.detail_blocks.requires_grad_(True)
+            self.vae.decoder.detail_blocks.train(train_base_detail).requires_grad_(
+                train_base_detail
+            )
+        if self.text_film_enabled:
+            self.vae.decoder.detail_text_projection.train(train_text).requires_grad_(
+                train_text
+            )
+            self.vae.decoder.detail_text_gates.train(train_text).requires_grad_(
+                train_text
+            )
         self.text_encoder.eval().requires_grad_(False)
 
     def set_eval(self) -> None:
@@ -206,6 +342,28 @@ class SelectiveDifix(torch.nn.Module):
 
     def detail_parameters(self) -> list[torch.nn.Parameter]:
         return list(self.vae.decoder.detail_blocks.parameters())
+
+    @property
+    def text_film_enabled(self) -> bool:
+        return self.detail_enabled and self.detail_text_mode != "none"
+
+    def text_film_parameters(self) -> list[torch.nn.Parameter]:
+        if not self.text_film_enabled:
+            return []
+        return list(self.vae.decoder.detail_text_projection.parameters()) + list(
+            self.vae.decoder.detail_text_gates.parameters()
+        )
+
+    def detail_alpha_parameters(self) -> list[torch.nn.Parameter]:
+        return [block.alpha for block in self.vae.decoder.detail_blocks]
+
+    def naf_and_base_gate_parameters(self) -> list[torch.nn.Parameter]:
+        parameters = []
+        alpha_ids = {id(parameter) for parameter in self.detail_alpha_parameters()}
+        for parameter in self.detail_parameters():
+            if id(parameter) not in alpha_ids:
+                parameters.append(parameter)
+        return parameters
 
     def vae_adaptation_parameters(self) -> list[torch.nn.Parameter]:
         return [
@@ -220,11 +378,13 @@ class SelectiveDifix(torch.nn.Module):
         vae_adaptation = sum(
             parameter.numel() for parameter in self.vae_adaptation_parameters()
         )
+        text_film = sum(parameter.numel() for parameter in self.text_film_parameters())
         total = sum(parameter.numel() for parameter in self.parameters())
         return {
             "total": total,
-            "baseline_total": total - detail,
+            "baseline_total": total - detail - text_film,
             "detail": detail,
+            "text_film": text_film,
             "vae_adaptation": vae_adaptation,
             "unet": sum(parameter.numel() for parameter in self.unet.parameters()),
             "trainable": sum(
@@ -248,12 +408,64 @@ class SelectiveDifix(torch.nn.Module):
                     f"{layer_prefix}/gate_std": float(block.last_gate_std),
                     f"{layer_prefix}/gate_min": float(block.last_gate_min),
                     f"{layer_prefix}/gate_max": float(block.last_gate_max),
-                    f"{layer_prefix}/alpha": float(block.alpha.detach()),
-                    f"{layer_prefix}/residual_ratio": float(
-                        block.last_residual_ratio
+                    f"{layer_prefix}/base_gate_mean": float(block.last_base_gate_mean),
+                    f"{layer_prefix}/gate_change_abs_mean": float(
+                        block.last_gate_change_abs_mean
                     ),
+                    f"{layer_prefix}/alpha": float(block.alpha.detach()),
+                    f"{layer_prefix}/residual_ratio": float(block.last_residual_ratio),
                 }
             )
+        return values
+
+    def text_film_diagnostics(
+        self, prefix: str = "train/text_film"
+    ) -> dict[str, float]:
+        if not self.text_film_enabled:
+            return {}
+        values = {}
+        for index, gate in enumerate(self.vae.decoder.detail_text_gates):
+            if gate.last_delta_logits_mean is None:
+                continue
+            layer_prefix = f"{prefix}/l{index}"
+            values.update(
+                {
+                    f"{layer_prefix}/delta_logits_mean": float(
+                        gate.last_delta_logits_mean
+                    ),
+                    f"{layer_prefix}/delta_logits_abs_mean": float(
+                        gate.last_delta_logits_abs_mean
+                    ),
+                    f"{layer_prefix}/delta_logits_std": float(
+                        gate.last_delta_logits_std
+                    ),
+                    f"{layer_prefix}/gamma_abs_mean": float(gate.last_gamma_abs_mean),
+                    f"{layer_prefix}/beta_abs_mean": float(gate.last_beta_abs_mean),
+                }
+            )
+        return values
+
+    def text_film_gradient_norms(
+        self, prefix: str = "train/text_film"
+    ) -> dict[str, float]:
+        if not self.text_film_enabled:
+            return {}
+        values = {}
+        modules = [
+            ("shared", self.vae.decoder.detail_text_projection),
+            *[
+                (f"l{index}", gate)
+                for index, gate in enumerate(self.vae.decoder.detail_text_gates)
+            ],
+        ]
+        for name, module in modules:
+            squared = sum(
+                parameter.grad.detach().float().square().sum()
+                for parameter in module.parameters()
+                if parameter.grad is not None
+            )
+            if not isinstance(squared, int):
+                values[f"{prefix}/{name}/text_grad_norm"] = float(squared.sqrt())
         return values
 
     def detail_config(self) -> dict[str, bool | int]:
@@ -268,31 +480,114 @@ class SelectiveDifix(torch.nn.Module):
     def detail_state_dict(self) -> dict[str, torch.Tensor]:
         return self.vae.decoder.detail_blocks.state_dict()
 
+    def text_film_config(self) -> dict[str, bool | float | int | str]:
+        return {
+            "enabled": self.text_film_enabled,
+            "mode": self.detail_text_mode,
+            "pooling": "masked_mean",
+            "clip_hidden_dim": int(self.text_encoder.config.hidden_size),
+            "text_proj_dim": self.detail_text_proj_dim,
+            "film_hidden_ratio": self.detail_film_hidden_ratio,
+            "condition_scale": self.detail_text_condition_scale,
+        }
+
+    def text_film_state_dict(self) -> dict[str, dict[str, torch.Tensor]]:
+        if not self.text_film_enabled:
+            return {}
+        return {
+            "projection": self.vae.decoder.detail_text_projection.state_dict(),
+            "gates": self.vae.decoder.detail_text_gates.state_dict(),
+        }
+
     def _prompt_embeddings(
         self,
         images: torch.Tensor,
         *,
         prompt: list[str] | str | None,
         prompt_tokens: torch.Tensor | None,
+        prompt_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if (prompt is None) == (prompt_tokens is None):
             raise ValueError("Provide exactly one of prompt or prompt_tokens")
         if prompt is not None:
-            tokens = self.tokenizer(
+            tokenized = self.tokenizer(
                 prompt,
                 max_length=self.tokenizer.model_max_length,
                 padding="max_length",
                 truncation=True,
                 return_tensors="pt",
-            ).input_ids.to(images.device)
+            )
+            tokens = tokenized.input_ids.to(images.device)
+            attention_mask = tokenized.attention_mask.to(images.device)
         else:
             tokens = prompt_tokens.to(images.device)
-        if not self.detail_gate_use_prompt:
+            attention_mask = (
+                self._attention_mask(tokens)
+                if prompt_attention_mask is None
+                else prompt_attention_mask.to(images.device)
+            )
+        if not self.detail_gate_use_prompt and not self.text_film_enabled:
             self._last_detail_condition = None
             return self.text_encoder(tokens)[0]
         text_output = self.text_encoder(tokens, return_dict=True)
-        self._last_detail_condition = text_output.pooler_output
+        if self.detail_gate_use_prompt:
+            self._last_detail_condition = text_output.pooler_output
+        elif self.detail_text_mode == "constant":
+            self._last_detail_condition = self._constant_detail_condition.expand(
+                tokens.shape[0], -1
+            )
+        else:
+            self._last_detail_condition = masked_mean_pool(
+                text_output.last_hidden_state, attention_mask
+            )
         return text_output.last_hidden_state
+
+    def _attention_mask(self, tokens: torch.Tensor) -> torch.Tensor:
+        positions = torch.arange(tokens.shape[1], device=tokens.device)[None, :]
+        first_eos = (
+            (tokens == self.tokenizer.eos_token_id)
+            .to(torch.int64)
+            .argmax(dim=1, keepdim=True)
+        )
+        return (positions <= first_eos).to(torch.long)
+
+    def detail_condition(
+        self,
+        images: torch.Tensor,
+        *,
+        prompt: list[str] | str | None = None,
+        prompt_tokens: torch.Tensor | None = None,
+        prompt_attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        """Encode a decoder-only condition without changing the UNet prompt."""
+
+        if not self.detail_gate_use_prompt and not self.text_film_enabled:
+            return None
+        if (prompt is None) == (prompt_tokens is None):
+            raise ValueError("Provide exactly one of prompt or prompt_tokens")
+        if prompt is not None:
+            tokenized = self.tokenizer(
+                prompt,
+                max_length=self.tokenizer.model_max_length,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+            tokens = tokenized.input_ids.to(images.device)
+            attention_mask = tokenized.attention_mask.to(images.device)
+        else:
+            tokens = prompt_tokens.to(images.device)
+            attention_mask = (
+                self._attention_mask(tokens)
+                if prompt_attention_mask is None
+                else prompt_attention_mask.to(images.device)
+            )
+        if self.detail_text_mode == "constant":
+            return self._constant_detail_condition.expand(tokens.shape[0], -1)
+        text_output = self.text_encoder(tokens, return_dict=True)
+        if self.detail_gate_use_prompt:
+            return text_output.pooler_output
+        return masked_mean_pool(text_output.last_hidden_state, attention_mask)
 
     def denoised_main_latent(
         self,
@@ -300,6 +595,7 @@ class SelectiveDifix(torch.nn.Module):
         *,
         prompt: list[str] | str | None = None,
         prompt_tokens: torch.Tensor | None = None,
+        prompt_attention_mask: torch.Tensor | None = None,
         timesteps: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Return the denoised primary-view latent and its encoder skips."""
@@ -315,7 +611,10 @@ class SelectiveDifix(torch.nn.Module):
         )
 
         text = self._prompt_embeddings(
-            images, prompt=prompt, prompt_tokens=prompt_tokens
+            images,
+            prompt=prompt,
+            prompt_tokens=prompt_tokens,
+            prompt_attention_mask=prompt_attention_mask,
         )
         text = repeat(text, "b n c -> (b v) n c", v=num_views)
         current_timesteps = self.timesteps if timesteps is None else timesteps
@@ -339,13 +638,51 @@ class SelectiveDifix(torch.nn.Module):
         encoder_skips: list[torch.Tensor],
         *,
         prompt_condition: torch.Tensor | None = None,
+        text_condition_scale: float | None = None,
     ) -> torch.Tensor:
         """Decode one primary-view latent using explicitly captured VAE skips."""
 
         self.vae.decoder.incoming_skip_acts = encoder_skips
         self.vae.decoder.incoming_detail_condition = prompt_condition
+        self.vae.decoder.incoming_text_condition_scale = (
+            self.detail_text_condition_scale
+            if text_condition_scale is None
+            else float(text_condition_scale)
+        )
         output = self.vae.decode(latent / self.vae.config.scaling_factor).sample
         return output.clamp(-1, 1)
+
+    def analyze_detail_gates(
+        self,
+        latent: torch.Tensor,
+        encoder_skips: list[torch.Tensor],
+        correct_condition: torch.Tensor,
+        swapped_condition: torch.Tensor,
+    ) -> list[dict[str, torch.Tensor]]:
+        """Compare two text gates against the same no-text decoder states."""
+
+        previous_condition = self.vae.decoder.incoming_detail_condition
+        previous_scale = self.vae.decoder.incoming_text_condition_scale
+        previous_analysis = self.vae.decoder.incoming_detail_analysis_conditions
+        self.vae.decoder.incoming_detail_analysis_conditions = (
+            correct_condition,
+            swapped_condition,
+        )
+        try:
+            self.decode_main_latent(
+                latent,
+                encoder_skips,
+                prompt_condition=correct_condition,
+                text_condition_scale=0.0,
+            )
+            return [
+                {key: value.detach().cpu() for key, value in layer.items()}
+                for layer in self.vae.decoder.last_detail_analysis
+            ]
+        finally:
+            self.vae.decoder.incoming_detail_condition = previous_condition
+            self.vae.decoder.incoming_text_condition_scale = previous_scale
+            self.vae.decoder.incoming_detail_analysis_conditions = previous_analysis
 
     def cfg_latents(
         self,
@@ -354,6 +691,8 @@ class SelectiveDifix(torch.nn.Module):
         *,
         positive_prompt_tokens: torch.Tensor,
         negative_prompt_tokens: torch.Tensor,
+        positive_prompt_attention_mask: torch.Tensor | None = None,
+        negative_prompt_attention_mask: torch.Tensor | None = None,
         timesteps: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
@@ -366,11 +705,13 @@ class SelectiveDifix(torch.nn.Module):
         z_positive, positive_skips = self.denoised_main_latent(
             positive_images,
             prompt_tokens=positive_prompt_tokens,
+            prompt_attention_mask=positive_prompt_attention_mask,
             timesteps=timesteps,
         )
         z_negative, negative_skips = self.denoised_main_latent(
             negative_images,
             prompt_tokens=negative_prompt_tokens,
+            prompt_attention_mask=negative_prompt_attention_mask,
             timesteps=timesteps,
         )
         return z_positive, z_negative, positive_skips, negative_skips
@@ -381,18 +722,33 @@ class SelectiveDifix(torch.nn.Module):
         *,
         prompt: list[str] | str | None = None,
         prompt_tokens: torch.Tensor | None = None,
+        prompt_attention_mask: torch.Tensor | None = None,
+        detail_prompt: list[str] | str | None = None,
+        detail_prompt_tokens: torch.Tensor | None = None,
+        detail_prompt_attention_mask: torch.Tensor | None = None,
+        text_condition_scale: float | None = None,
         timesteps: torch.Tensor | None = None,
     ) -> torch.Tensor:
         main_latent, main_skips = self.denoised_main_latent(
             images,
             prompt=prompt,
             prompt_tokens=prompt_tokens,
+            prompt_attention_mask=prompt_attention_mask,
             timesteps=timesteps,
         )
+        prompt_condition = self._last_detail_condition
+        if detail_prompt is not None or detail_prompt_tokens is not None:
+            prompt_condition = self.detail_condition(
+                images,
+                prompt=detail_prompt,
+                prompt_tokens=detail_prompt_tokens,
+                prompt_attention_mask=detail_prompt_attention_mask,
+            )
         return self.decode_main_latent(
             main_latent,
             main_skips,
-            prompt_condition=self._last_detail_condition,
+            prompt_condition=prompt_condition,
+            text_condition_scale=text_condition_scale,
         )
 
     @torch.inference_mode()
@@ -442,6 +798,9 @@ def save_training_checkpoint(
         },
         "state_dict_detail": model.detail_state_dict(),
         "detail_config": model.detail_config(),
+        "state_dict_text_film": model.text_film_state_dict(),
+        "text_film_config": model.text_film_config(),
+        "text_mode": model.detail_text_mode,
         "optimizer": optimizer.state_dict(),
         "lr_scheduler": scheduler.state_dict(),
     }
@@ -507,9 +866,45 @@ def _apply_model_checkpoint(model: SelectiveDifix, checkpoint: dict) -> int:
             raise ValueError(
                 f"Checkpoint DAEM-lite configuration mismatch: {mismatches}"
             )
-        model.vae.decoder.detail_blocks.load_state_dict(
-            saved_detail_state, strict=True
+        model.vae.decoder.detail_blocks.load_state_dict(saved_detail_state, strict=True)
+
+    saved_text_config = checkpoint.get("text_film_config")
+    saved_text_state = checkpoint.get("state_dict_text_film")
+    if saved_text_config is None and saved_text_state is None:
+        if model.text_film_enabled:
+            warnings.warn(
+                "Loading a checkpoint without Text-FiLM state; the new delta gates "
+                "remain zero-initialized.",
+                stacklevel=2,
+            )
+    elif not isinstance(saved_text_config, dict) or not isinstance(
+        saved_text_state, dict
+    ):
+        raise ValueError(
+            "Checkpoint must contain both text_film_config and state_dict_text_film"
         )
+    else:
+        current_text_config = model.text_film_config()
+        mismatches = {
+            key: (saved_text_config.get(key), current_text_config[key])
+            for key in current_text_config
+            if saved_text_config.get(key) != current_text_config[key]
+        }
+        if mismatches:
+            raise ValueError(
+                f"Checkpoint Text-FiLM configuration mismatch: {mismatches}"
+            )
+        if model.text_film_enabled:
+            if set(saved_text_state) != {"projection", "gates"}:
+                raise ValueError("Checkpoint Text-FiLM state is incomplete")
+            model.vae.decoder.detail_text_projection.load_state_dict(
+                saved_text_state["projection"], strict=True
+            )
+            model.vae.decoder.detail_text_gates.load_state_dict(
+                saved_text_state["gates"], strict=True
+            )
+        elif saved_text_state:
+            raise ValueError("Checkpoint contains Text-FiLM weights for text mode none")
     return int(checkpoint["global_step"])
 
 
@@ -523,6 +918,7 @@ def load_model_checkpoint(
     """Load model weights only, for validation/backfill without an optimizer."""
 
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    model.loaded_checkpoint_metadata = dict(checkpoint.get("experiment_metadata") or {})
     if expected_dataset is not None or expected_seed is not None:
         metadata = checkpoint.get("experiment_metadata")
         if not isinstance(metadata, dict):
@@ -580,6 +976,19 @@ def load_model_from_checkpoint(
     else:
         detail_config = saved_detail_config
 
+    saved_text_config = checkpoint.get("text_film_config")
+    if saved_text_config is None:
+        text_config = {
+            "mode": "none",
+            "text_proj_dim": 128,
+            "film_hidden_ratio": 4,
+            "condition_scale": 1.0,
+        }
+    elif not isinstance(saved_text_config, dict):
+        raise ValueError("Checkpoint text_film_config must be a dictionary")
+    else:
+        text_config = saved_text_config
+
     model = SelectiveDifix(
         lora_rank_vae=int(checkpoint.get("rank_vae", 4)),
         timestep=int(checkpoint.get("timestep", 199)),
@@ -588,6 +997,10 @@ def load_model_from_checkpoint(
         detail_gate_reduction=int(detail_config.get("gate_reduction", 4)),
         detail_gate_use_prompt=bool(detail_config.get("prompt_condition", False)),
         detail_prompt_proj_dim=int(detail_config.get("prompt_proj_dim", 32)),
+        detail_text_mode=str(text_config.get("mode", "none")),
+        detail_text_proj_dim=int(text_config.get("text_proj_dim", 128)),
+        detail_film_hidden_ratio=int(text_config.get("film_hidden_ratio", 4)),
+        detail_text_condition_scale=float(text_config.get("condition_scale", 1.0)),
     )
     global_step = _apply_model_checkpoint(model, checkpoint)
     return model, global_step, dict(metadata or {})
@@ -600,7 +1013,32 @@ def load_training_checkpoint(
     path: str | Path,
 ) -> int:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    metadata = checkpoint.get("experiment_metadata") or {}
+    saved_scope = metadata.get("train_scope")
+    if saved_scope is not None and saved_scope != model.train_scope:
+        raise ValueError(
+            f"Cannot resume train_scope={saved_scope!r} as {model.train_scope!r}; "
+            "use --init-checkpoint between training stages"
+        )
+    saved_optimizer = checkpoint.get("optimizer")
+    current_names = None
+    if hasattr(optimizer, "param_groups") and isinstance(saved_optimizer, dict):
+        saved_names = [
+            group.get("name") for group in saved_optimizer.get("param_groups", [])
+        ]
+        current_names = [group.get("name") for group in optimizer.param_groups]
+        if (
+            any(name is not None for name in saved_names)
+            and saved_names != current_names
+        ):
+            raise ValueError(
+                "Cannot resume with different optimizer parameter groups: "
+                f"checkpoint={saved_names}, current={current_names}"
+            )
     global_step = _apply_model_checkpoint(model, checkpoint)
     optimizer.load_state_dict(checkpoint["optimizer"])
+    if current_names is not None:
+        for group, name in zip(optimizer.param_groups, current_names):
+            group["name"] = name
     scheduler.load_state_dict(checkpoint["lr_scheduler"])
     return global_step

@@ -41,7 +41,10 @@ class FakeTokenizer:
     model_max_length = 4
 
     def __call__(self, *args, **kwargs):
-        return SimpleNamespace(input_ids=torch.tensor([[1, 2, 3, 4]]))
+        return SimpleNamespace(
+            input_ids=torch.tensor([[1, 2, 3, 4]]),
+            attention_mask=torch.ones(1, 4, dtype=torch.long),
+        )
 
 
 class TestSelectiveProtocol(unittest.TestCase):
@@ -250,7 +253,7 @@ class TestValidationVisualization(unittest.TestCase):
         from difix3d_selective.validation import METRIC_NAMES, validate
 
         class Model(torch.nn.Module):
-            def forward(self, source, prompt_tokens):
+            def forward(self, source, prompt_tokens, prompt_attention_mask=None):
                 return torch.zeros_like(source[:, 0])
 
             def set_train(self):
@@ -277,6 +280,7 @@ class TestValidationVisualization(unittest.TestCase):
             "output_pixel_values": torch.full((1, 3, 12, 12), 0.2),
             "ground_truth_pixel_values": torch.full((1, 3, 12, 12), 0.4),
             "input_ids": torch.ones(1, 4, dtype=torch.long),
+            "attention_mask": torch.ones(1, 4, dtype=torch.long),
             "sample_id": ["validation/low_haze/1/remove-low-preserve-haze"],
             "prompt": ["remove low light, preserve haze"],
         }

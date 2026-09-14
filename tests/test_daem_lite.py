@@ -12,6 +12,9 @@ from difix3d_selective.daem_lite import (
     LayerNorm2d,
     NAFBlockLite,
     SimpleGate,
+    TextConditionProjection,
+    TextFiLMDeltaGate,
+    masked_mean_pool,
 )
 
 
@@ -38,7 +41,14 @@ class _Decoder:
         self.skip_conv_4 = nn.Identity()
         self.incoming_skip_acts = [torch.randn(1, channels, 5, 6)]
         self.incoming_detail_condition = None
+        self.incoming_detail_analysis_conditions = None
+        self.last_detail_analysis = []
+        self.incoming_text_condition_scale = 1.0
         self.detail_enabled = detail_enabled
+        self.detail_text_enabled = False
+        self.detail_gate_use_prompt = False
+        self.detail_text_projection = None
+        self.detail_text_gates = nn.ModuleList()
         self.detail_blocks = nn.ModuleList([GatedDetailSkip(channels)])
         self.gamma = 1
 
@@ -86,6 +96,110 @@ def test_prompt_condition_is_spatially_expanded():
     assert block.gate[0].in_channels == 72
     with pytest.raises(ValueError, match="prompt_condition"):
         block(decoder, projected_skip)
+
+
+def test_masked_mean_pool_excludes_padding():
+    hidden = torch.tensor([[[1.0, 3.0], [3.0, 5.0], [100.0, 100.0]]])
+    mask = torch.tensor([[1, 1, 0]])
+    torch.testing.assert_close(
+        masked_mean_pool(hidden, mask), torch.tensor([[2.0, 4.0]])
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 3])
+@pytest.mark.parametrize("channels", [32, 64])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_text_film_delta_is_zero_initialized(batch_size, channels, dtype):
+    projection = TextConditionProjection(12, 8).to(dtype=dtype)
+    gate = TextFiLMDeltaGate(channels, 8, hidden_ratio=4).to(dtype=dtype)
+    decoder = torch.randn(batch_size, channels, 6, 5, dtype=dtype)
+    projected_skip = torch.randn_like(decoder)
+    condition = projection(torch.randn(batch_size, 12, dtype=dtype))
+
+    delta = gate(decoder, projected_skip, condition)
+
+    assert delta.shape == projected_skip.shape
+    torch.testing.assert_close(delta, torch.zeros_like(delta), atol=0, rtol=0)
+    assert torch.count_nonzero(gate.delta_out.weight) == 0
+    assert torch.count_nonzero(gate.delta_out.bias) == 0
+    assert torch.count_nonzero(gate.to_gamma_beta.weight) > 0
+
+
+@pytest.mark.parametrize("token_count", [2, 7])
+def test_masked_mean_pool_handles_variable_token_lengths(token_count):
+    hidden = torch.randn(2, token_count, 6)
+    mask = torch.ones(2, token_count, dtype=torch.long)
+    mask[1, -1] = 0
+
+    pooled = masked_mean_pool(hidden, mask)
+
+    torch.testing.assert_close(pooled[0], hidden[0].mean(0))
+    torch.testing.assert_close(pooled[1], hidden[1, :-1].mean(0))
+
+
+def test_text_film_four_decoder_levels_keep_b20_channels():
+    channels = (512, 512, 512, 256)
+    gates = nn.ModuleList(TextFiLMDeltaGate(value, 128) for value in channels)
+    condition = torch.randn(1, 128)
+
+    for value, gate in zip(channels, gates):
+        decoder = torch.randn(1, value, 3, 3)
+        delta = gate(decoder, torch.randn_like(decoder), condition)
+        assert delta.shape == decoder.shape
+
+    assert [gate.hidden_channels for gate in gates] == [128, 128, 128, 64]
+
+
+def test_zero_delta_preserves_base_gate_and_scale_zero_is_fallback():
+    block = GatedDetailSkip(32)
+    text_gate = TextFiLMDeltaGate(32, 8)
+    decoder = torch.randn(2, 32, 6, 5)
+    projected_skip = torch.randn_like(decoder)
+    condition = torch.randn(2, 8)
+    baseline = block(decoder, projected_skip)
+    delta = text_gate(decoder, projected_skip, condition)
+
+    with_text = block(decoder, projected_skip, delta_logits=delta)
+    disabled = block(
+        decoder,
+        projected_skip,
+        delta_logits=torch.randn_like(delta),
+        text_condition_scale=0.0,
+    )
+
+    torch.testing.assert_close(with_text, baseline, atol=0, rtol=0)
+    torch.testing.assert_close(disabled, baseline, atol=0, rtol=0)
+
+
+def test_text_film_upstream_gradients_begin_after_zero_output_updates():
+    projection = TextConditionProjection(12, 8)
+    gate = TextFiLMDeltaGate(32, 8)
+    optimizer = torch.optim.SGD(
+        list(projection.parameters()) + list(gate.parameters()), lr=0.1
+    )
+    decoder = torch.randn(2, 32, 6, 5)
+    projected_skip = torch.randn_like(decoder)
+    text = torch.randn(2, 12)
+
+    gate(decoder, projected_skip, projection(text)).sum().backward()
+    assert torch.count_nonzero(gate.delta_out.weight.grad) > 0
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    gate(decoder, projected_skip, projection(text)).sum().backward()
+
+    assert torch.count_nonzero(gate.to_gamma_beta.weight.grad) > 0
+    assert torch.count_nonzero(projection.projection.weight.grad) > 0
+
+
+def test_nonzero_delta_branch_is_prompt_sensitive():
+    gate = TextFiLMDeltaGate(32, 8)
+    with torch.no_grad():
+        gate.delta_out.weight.normal_(std=0.01)
+    decoder = torch.randn(2, 32, 6, 5)
+    projected_skip = torch.randn_like(decoder)
+    first = gate(decoder, projected_skip, torch.randn(2, 8))
+    second = gate(decoder, projected_skip, torch.randn(2, 8))
+    assert not torch.equal(first, second)
 
 
 def test_initial_gate_has_gradient_and_refiner_gradients_are_finite():

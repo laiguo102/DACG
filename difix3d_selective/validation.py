@@ -8,7 +8,7 @@ from typing import Any
 import torch
 
 from cdd11_full.metrics import rgb_psnr, rgb_ssim
-from .protocol import PAIR_FOLDERS, directed_tasks
+from .protocol import PAIR_FOLDERS, PROMPT_NAMES, directed_tasks
 
 
 METRIC_NAMES = (
@@ -38,7 +38,9 @@ def stratified_indices(records: list[dict], total: int) -> list[int]:
     for index, record in enumerate(records):
         key = (record.get("pair_id"), record.get("remove"), record.get("preserve"))
         groups[key].append(index)
-    ordered_groups = [groups[key] for key in sorted(groups, key=lambda item: tuple(map(str, item)))]
+    ordered_groups = [
+        groups[key] for key in sorted(groups, key=lambda item: tuple(map(str, item)))
+    ]
     selected: list[int] = []
     offset = 0
     while len(selected) < total:
@@ -119,7 +121,11 @@ def validate(
             source = batch["conditioning_pixel_values"]
             target = batch["output_pixel_values"]
             ground_truth = batch["ground_truth_pixel_values"]
-            prediction = model(source, prompt_tokens=batch["input_ids"])
+            prediction = model(
+                source,
+                prompt_tokens=batch["input_ids"],
+                prompt_attention_mask=batch["attention_mask"],
+            )
 
             prediction_01 = prediction.float().add(1).mul(0.5).clamp(0, 1)
             coarse_01 = source[:, 0].float().add(1).mul(0.5).clamp(0, 1)
@@ -127,14 +133,14 @@ def validate(
             ground_truth_01 = ground_truth.float().add(1).mul(0.5).clamp(0, 1)
             perceptual = lpips_model(prediction.float(), target.float()).mean()
             metric_values = (
-                    rgb_psnr(prediction_01, target_01),
-                    rgb_ssim(prediction_01, target_01),
-                    perceptual.detach().item(),
-                    rgb_psnr(prediction_01, ground_truth_01),
-                    rgb_ssim(prediction_01, ground_truth_01),
-                    rgb_psnr(coarse_01, target_01),
-                    rgb_ssim(coarse_01, target_01),
-                )
+                rgb_psnr(prediction_01, target_01),
+                rgb_ssim(prediction_01, target_01),
+                perceptual.detach().item(),
+                rgb_psnr(prediction_01, ground_truth_01),
+                rgb_ssim(prediction_01, ground_truth_01),
+                rgb_psnr(coarse_01, target_01),
+                rgb_ssim(coarse_01, target_01),
+            )
             pair_id = int(batch["pair_id"][0]) if "pair_id" in batch else -1
             direction = -1
             if pair_id in PAIR_FOLDERS and "remove" in batch:
@@ -147,14 +153,20 @@ def validate(
                 (*metric_values, pair_id, direction), dtype=torch.float32
             )
             rows.append(row)
-            if accelerator.is_main_process and len(visualizations) < visualization_limit:
+            if (
+                accelerator.is_main_process
+                and len(visualizations) < visualization_limit
+            ):
                 caption = (
                     f"{batch['sample_id'][0]} | {batch['prompt'][0]} | "
                     "left to right: degraded | DACG coarse | selective target | "
                     "Difix final | clean GT"
                 )
                 visualizations.append(
-                    (comparison_image(source, target, prediction, ground_truth), caption)
+                    (
+                        comparison_image(source, target, prediction, ground_truth),
+                        caption,
+                    )
                 )
     finally:
         model.train()
@@ -205,7 +217,11 @@ def validate_negative(
             source = batch["conditioning_pixel_values"]
             target = batch["output_pixel_values"]
             coarse = batch["dacg_coarse_pixel_values"]
-            prediction = model(source, prompt_tokens=batch["input_ids"])
+            prediction = model(
+                source,
+                prompt_tokens=batch["input_ids"],
+                prompt_attention_mask=batch["attention_mask"],
+            )
 
             prediction_01 = prediction.float().add(1).mul(0.5).clamp(0, 1)
             target_01 = target.float().add(1).mul(0.5).clamp(0, 1)
@@ -219,7 +235,10 @@ def validate_negative(
             rows.append(
                 prediction.new_tensor((*metric_values, pair_id), dtype=torch.float32)
             )
-            if accelerator.is_main_process and len(visualizations) < visualization_limit:
+            if (
+                accelerator.is_main_process
+                and len(visualizations) < visualization_limit
+            ):
                 caption = (
                     f"{batch['sample_id'][0]} | {batch['prompt'][0]} | "
                     "left to right: double degraded | DACG coarse | signed texture | "
@@ -247,6 +266,78 @@ def validate_negative(
         for name, value in zip(NEGATIVE_METRIC_NAMES, pair_means):
             metrics[f"pairs/{pair}/{name}"] = value
     return metrics, visualizations
+
+
+@torch.inference_mode()
+def validate_text_film(model, loader, accelerator: Any) -> dict[str, float]:
+    """Measure decoder-only prompt effects while sharing the correct UNet latent."""
+
+    unwrapped = accelerator.unwrap_model(model)
+    if not unwrapped.text_film_enabled:
+        return {}
+    model.eval()
+    rows = []
+    try:
+        for batch in loader:
+            source = batch["conditioning_pixel_values"]
+            target = batch["output_pixel_values"]
+            latent, skips = unwrapped.denoised_main_latent(
+                source,
+                prompt_tokens=batch["input_ids"],
+                prompt_attention_mask=batch["attention_mask"],
+            )
+            correct_condition = unwrapped._last_detail_condition
+            swapped_prompts = [
+                f"remove {PROMPT_NAMES[preserve]}, preserve {PROMPT_NAMES[remove]}"
+                for remove, preserve in zip(batch["remove"], batch["preserve"])
+            ]
+            swapped_condition = unwrapped.detail_condition(
+                source, prompt=swapped_prompts
+            )
+            correct = unwrapped.decode_main_latent(
+                latent, skips, prompt_condition=correct_condition
+            )
+            swapped = unwrapped.decode_main_latent(
+                latent, skips, prompt_condition=swapped_condition
+            )
+            no_text = unwrapped.decode_main_latent(
+                latent,
+                skips,
+                prompt_condition=correct_condition,
+                text_condition_scale=0.0,
+            )
+            correct_01 = correct.float().add(1).mul(0.5).clamp(0, 1)
+            swapped_01 = swapped.float().add(1).mul(0.5).clamp(0, 1)
+            target_01 = target.float().add(1).mul(0.5).clamp(0, 1)
+            rows.append(
+                torch.stack(
+                    (
+                        (correct.float() - swapped.float()).abs().mean(),
+                        correct.new_tensor(
+                            rgb_psnr(correct_01, target_01)
+                            - rgb_psnr(swapped_01, target_01)
+                        ),
+                        (correct.float() - no_text.float()).abs().mean(),
+                    )
+                ).float()
+            )
+    finally:
+        model.train()
+        unwrapped.set_train()
+
+    if not rows:
+        raise ValueError("text validation loader produced no samples")
+    gathered = accelerator.gather_for_metrics(torch.stack(rows)).mean(0).cpu()
+    baseline_name = (
+        "output_delta_l1_vs_b20"
+        if unwrapped.train_scope == "film"
+        else "output_delta_l1_vs_no_text"
+    )
+    return {
+        "val/text_film/prompt_swap_output_delta_l1": float(gathered[0]),
+        "val/text_film/correct_vs_swapped_target_psnr_gap": float(gathered[1]),
+        f"val/text_film/{baseline_name}": float(gathered[2]),
+    }
 
 
 def wandb_images(visualizations: list[tuple[torch.Tensor, str]]) -> list[Any]:

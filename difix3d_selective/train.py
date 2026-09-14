@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import random
 import time
@@ -72,7 +73,12 @@ def _best_state(output_dir: Path) -> dict[str, float | int]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _experiment_metadata(args: argparse.Namespace) -> dict:
+def _experiment_metadata(
+    args: argparse.Namespace,
+    *,
+    parent_metadata: dict | None = None,
+    parent_sha256: str | None = None,
+) -> dict:
     dataset_format = getattr(args, "dataset_format", "cdd11")
     metadata = {
         "dataset": "CCDD-11" if dataset_format == "ccdd11" else "CDD-11",
@@ -93,7 +99,25 @@ def _experiment_metadata(args: argparse.Namespace) -> dict:
             "prompt_proj_dim": args.detail_prompt_proj_dim,
             "learning_rate": args.detail_learning_rate,
         },
+        "text_film": {
+            "mode": getattr(args, "detail_text_mode", "none"),
+            "pooling": "masked_mean",
+            "text_proj_dim": getattr(args, "detail_text_proj_dim", 128),
+            "film_hidden_ratio": getattr(args, "detail_film_hidden_ratio", 4),
+            "condition_scale": getattr(args, "detail_text_condition_scale", 1.0),
+            "learning_rate": getattr(args, "text_learning_rate", 1e-4),
+            "detail_alpha_learning_rate": getattr(
+                args, "detail_alpha_learning_rate", 5e-6
+            ),
+        },
     }
+    if getattr(args, "init_checkpoint", None) is not None:
+        metadata["parent_checkpoint"] = str(args.init_checkpoint.resolve())
+        metadata["parent_checkpoint_sha256"] = parent_sha256
+        metadata["parent_train_scope"] = (parent_metadata or {}).get("train_scope")
+        metadata["root_checkpoint_sha256"] = (parent_metadata or {}).get(
+            "root_checkpoint_sha256", parent_sha256
+        )
     if dataset_format == "ccdd11":
         metadata.update(
             {
@@ -114,19 +138,106 @@ def _experiment_metadata(args: argparse.Namespace) -> dict:
 
 def _optimizer_parameter_groups(model, args: argparse.Namespace) -> list[dict]:
     if not args.detail_enabled:
-        return [{"params": model.trainable_parameters(), "lr": args.learning_rate}]
+        groups = [
+            {
+                "name": "adaptation",
+                "params": model.trainable_parameters(),
+                "lr": args.learning_rate,
+                "weight_decay": args.adam_weight_decay,
+            }
+        ]
+        if {id(parameter) for parameter in groups[0]["params"]} != {
+            id(parameter) for parameter in model.trainable_parameters()
+        }:
+            raise ValueError(
+                "Optimizer groups do not match the trainable parameter set"
+            )
+        return groups
 
     groups = []
-    if args.train_scope == "all":
-        groups.append({"params": list(model.unet.parameters()), "lr": args.learning_rate})
-    if args.train_scope in ("all", "detail+vae"):
+    if args.train_scope == "film":
         groups.append(
-            {"params": model.vae_adaptation_parameters(), "lr": args.learning_rate}
+            {
+                "name": "text_film",
+                "params": model.text_film_parameters(),
+                "lr": args.text_learning_rate,
+                "weight_decay": args.adam_weight_decay,
+            }
         )
-    groups.append(
-        {"params": model.detail_parameters(), "lr": args.detail_learning_rate}
-    )
+    elif args.train_scope == "film+detail":
+        groups.extend(
+            [
+                {
+                    "name": "text_film",
+                    "params": model.text_film_parameters(),
+                    "lr": args.text_learning_rate,
+                    "weight_decay": args.adam_weight_decay,
+                },
+                {
+                    "name": "detail",
+                    "params": model.naf_and_base_gate_parameters(),
+                    "lr": args.detail_learning_rate,
+                    "weight_decay": args.adam_weight_decay,
+                },
+                {
+                    "name": "alpha",
+                    "params": model.detail_alpha_parameters(),
+                    "lr": args.detail_alpha_learning_rate,
+                    "weight_decay": 0.0,
+                },
+            ]
+        )
+    else:
+        if args.train_scope == "all":
+            groups.append(
+                {
+                    "name": "unet",
+                    "params": list(model.unet.parameters()),
+                    "lr": args.learning_rate,
+                    "weight_decay": args.adam_weight_decay,
+                }
+            )
+        if args.train_scope in ("all", "detail+vae"):
+            groups.append(
+                {
+                    "name": "vae_adaptation",
+                    "params": model.vae_adaptation_parameters(),
+                    "lr": args.learning_rate,
+                    "weight_decay": args.adam_weight_decay,
+                }
+            )
+        groups.append(
+            {
+                "name": "detail",
+                "params": model.detail_parameters(),
+                "lr": args.detail_learning_rate,
+                "weight_decay": args.adam_weight_decay,
+            }
+        )
+        if args.train_scope == "all" and model.text_film_enabled:
+            groups.append(
+                {
+                    "name": "text_film",
+                    "params": model.text_film_parameters(),
+                    "lr": args.text_learning_rate,
+                    "weight_decay": args.adam_weight_decay,
+                }
+            )
+
+    group_ids = [id(parameter) for group in groups for parameter in group["params"]]
+    if len(group_ids) != len(set(group_ids)):
+        raise ValueError("Optimizer parameter groups contain duplicate parameters")
+    if set(group_ids) != {id(parameter) for parameter in model.trainable_parameters()}:
+        raise ValueError("Optimizer groups do not match the trainable parameter set")
     return groups
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _prepare_manifests(args: argparse.Namespace, output_dir: Path) -> dict:
@@ -195,6 +306,7 @@ def run(args: argparse.Namespace) -> None:
         stratified_indices,
         validate,
         validate_negative,
+        validate_text_film,
         wandb_images,
     )
 
@@ -223,15 +335,23 @@ def run(args: argparse.Namespace) -> None:
             detail_alpha_init=args.detail_alpha_init,
             detail_gate_use_prompt=args.detail_gate_use_prompt,
             detail_prompt_proj_dim=args.detail_prompt_proj_dim,
+            detail_text_mode=args.detail_text_mode,
+            detail_text_proj_dim=args.detail_text_proj_dim,
+            detail_film_hidden_ratio=args.detail_film_hidden_ratio,
+            detail_text_condition_scale=args.detail_text_condition_scale,
         )
         perceptual_model = lpips.LPIPS(net="vgg").eval().requires_grad_(False)
         vgg = None
         if args.lambda_gram > 0:
             import torchvision
 
-            vgg = torchvision.models.vgg16(
-                weights=torchvision.models.VGG16_Weights.DEFAULT
-            ).features.eval().requires_grad_(False)
+            vgg = (
+                torchvision.models.vgg16(
+                    weights=torchvision.models.VGG16_Weights.DEFAULT
+                )
+                .features.eval()
+                .requires_grad_(False)
+            )
 
     if args.enable_xformers_memory_efficient_attention:
         if not is_xformers_available():
@@ -243,7 +363,10 @@ def run(args: argparse.Namespace) -> None:
         torch.backends.cuda.matmul.allow_tf32 = True
 
     model.set_train(args.train_scope)
+    parent_metadata = None
+    parent_sha256 = None
     if args.init_checkpoint is not None:
+        parent_sha256 = _file_sha256(args.init_checkpoint.resolve())
         load_model_checkpoint(
             model,
             args.init_checkpoint.resolve(),
@@ -252,10 +375,29 @@ def run(args: argparse.Namespace) -> None:
             ),
             expected_seed=args.seed,
         )
+        parent_metadata = model.loaded_checkpoint_metadata
     trainable_parameters = model.trainable_parameters()
     parameter_counts = model.parameter_counts()
+    optimizer_groups = _optimizer_parameter_groups(model, args)
+    optimizer_group_metadata = {
+        group["name"]: {
+            "learning_rate": float(group["lr"]),
+            "weight_decay": float(group["weight_decay"]),
+            "parameters": sum(parameter.numel() for parameter in group["params"]),
+        }
+        for group in optimizer_groups
+    }
+    if accelerator.is_main_process:
+        for group in optimizer_groups:
+            print(
+                "Optimizer group "
+                f"{group['name']}: parameters="
+                f"{sum(parameter.numel() for parameter in group['params'])}, "
+                f"lr={group['lr']}, weight_decay={group['weight_decay']}",
+                flush=True,
+            )
     optimizer = torch.optim.AdamW(
-        _optimizer_parameter_groups(model, args),
+        optimizer_groups,
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -273,9 +415,8 @@ def run(args: argparse.Namespace) -> None:
             model, optimizer, lr_scheduler, args.resume.resolve()
         )
 
-    negative_validation_enabled = (
-        args.dataset_format == "ccdd11"
-        and hasattr(args, "negative_train_probability")
+    negative_validation_enabled = args.dataset_format == "ccdd11" and hasattr(
+        args, "negative_train_probability"
     )
     negative_train_probability = (
         float(args.negative_train_probability) if negative_validation_enabled else 0.0
@@ -305,15 +446,21 @@ def run(args: argparse.Namespace) -> None:
         workers=args.dataloader_num_workers,
     )
     fast_validation_loader = _make_loader(
-        Subset(validation_dataset, fast_indices), batch_size=1, shuffle=False,
+        Subset(validation_dataset, fast_indices),
+        batch_size=1,
+        shuffle=False,
         workers=min(args.dataloader_num_workers, 4),
     )
     full_validation_loader = _make_loader(
-        validation_dataset, batch_size=1, shuffle=False,
+        validation_dataset,
+        batch_size=1,
+        shuffle=False,
         workers=min(args.dataloader_num_workers, 4),
     )
     visualization_loader = _make_loader(
-        Subset(validation_dataset, visualization_indices), batch_size=1, shuffle=False,
+        Subset(validation_dataset, visualization_indices),
+        batch_size=1,
+        shuffle=False,
         workers=min(args.dataloader_num_workers, 4),
     )
 
@@ -410,7 +557,9 @@ def run(args: argparse.Namespace) -> None:
         accelerator.init_trackers(
             args.tracker_project_name,
             config=tracker_config,
-            init_kwargs={"wandb": {"name": args.tracker_run_name, "dir": str(output_dir)}},
+            init_kwargs={
+                "wandb": {"name": args.tracker_run_name, "dir": str(output_dir)}
+            },
         )
         if args.report_to == "wandb" and accelerator.is_main_process:
             run_tracker = accelerator.get_tracker("wandb", unwrap=True)
@@ -441,8 +590,13 @@ def run(args: argparse.Namespace) -> None:
         torch.cuda.reset_peak_memory_stats(accelerator.device)
 
     best = _best_state(output_dir) if accelerator.is_main_process else None
-    experiment_metadata = _experiment_metadata(args)
+    experiment_metadata = _experiment_metadata(
+        args,
+        parent_metadata=parent_metadata,
+        parent_sha256=parent_sha256,
+    )
     experiment_metadata["parameter_counts"] = parameter_counts
+    experiment_metadata["optimizer_groups"] = optimizer_group_metadata
     progress = tqdm(
         total=args.max_train_steps,
         initial=global_step,
@@ -467,7 +621,11 @@ def run(args: argparse.Namespace) -> None:
         negative_samples_since_sync += int(batch["is_negative"].sum().item())
         training_samples_since_sync += int(batch["is_negative"].numel())
         with accelerator.accumulate(model):
-            prediction = model(source, prompt_tokens=batch["input_ids"])
+            prediction = model(
+                source,
+                prompt_tokens=batch["input_ids"],
+                prompt_attention_mask=batch["attention_mask"],
+            )
             loss_l2 = F.mse_loss(prediction.float(), target.float()) * args.lambda_l2
             loss_lpips = (
                 perceptual_model(prediction.float(), target.float()).mean()
@@ -485,12 +643,18 @@ def run(args: argparse.Namespace) -> None:
                 left = random.randint(0, prediction.shape[-1] - crop_size)
                 prediction_vgg = crop(prediction_vgg, top, left, crop_size, crop_size)
                 target_vgg = crop(target_vgg, top, left, crop_size, crop_size)
-                loss_gram = gram_loss(prediction_vgg, target_vgg, vgg) * args.lambda_gram
+                loss_gram = (
+                    gram_loss(prediction_vgg, target_vgg, vgg) * args.lambda_gram
+                )
                 loss = loss + loss_gram
 
             accelerator.backward(loss)
+            gradient_logs = {}
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(trainable_parameters, args.max_grad_norm)
+                gradient_logs = accelerator.unwrap_model(
+                    model
+                ).text_film_gradient_norms()
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad(set_to_none=True)
@@ -521,23 +685,31 @@ def run(args: argparse.Namespace) -> None:
             "train/negative_fraction": realized_negative_fraction,
             "train/step_time_seconds": time.perf_counter() - step_started,
         }
+        logs.update(gradient_logs)
+        for group in optimizer.param_groups:
+            logs[f"train/lr/{group['name']}"] = group["lr"]
         logs["train/images_per_second"] = (
             float(global_mode_counts[1].item()) / logs["train/step_time_seconds"]
         )
         if accelerator.device.type == "cuda":
-            logs["train/peak_cuda_memory_gb"] = (
-                torch.cuda.max_memory_allocated(accelerator.device) / (1024**3)
-            )
+            logs["train/peak_cuda_memory_gb"] = torch.cuda.max_memory_allocated(
+                accelerator.device
+            ) / (1024**3)
         logs.update(
             accelerator.unwrap_model(model).detail_diagnostics(prefix="train/detail")
         )
+        logs.update(accelerator.unwrap_model(model).text_film_diagnostics())
         progress.set_postfix(loss=logs["train/loss"])
         if args.report_to != "none":
             accelerator.log(logs, step=global_step)
 
         fast_due = trigger_schedule(global_step, args.max_train_steps, args.eval_freq)
-        full_due = trigger_schedule(global_step, args.max_train_steps, args.full_eval_freq)
-        visualization_due = trigger_schedule(global_step, args.max_train_steps, args.viz_freq)
+        full_due = trigger_schedule(
+            global_step, args.max_train_steps, args.full_eval_freq
+        )
+        visualization_due = trigger_schedule(
+            global_step, args.max_train_steps, args.viz_freq
+        )
         visualizations = []
         negative_visualizations = []
         if fast_due:
@@ -559,6 +731,11 @@ def run(args: argparse.Namespace) -> None:
             )
             if accelerator.is_main_process:
                 print(f"validation step={global_step}: {fast_metrics}", flush=True)
+            text_metrics = validate_text_film(
+                model, fast_validation_loader, accelerator
+            )
+            if text_metrics and args.report_to != "none":
+                accelerator.log(text_metrics, step=global_step)
             if negative_validation_enabled:
                 negative_fast_metrics, negative_visualizations = validate_negative(
                     model,
@@ -611,11 +788,7 @@ def run(args: argparse.Namespace) -> None:
             )
             if args.report_to != "none" and accelerator.is_main_process:
                 accelerator.log(
-                    {
-                        NEGATIVE_VISUALIZATION_KEY: wandb_images(
-                            negative_visualizations
-                        )
-                    },
+                    {NEGATIVE_VISUALIZATION_KEY: wandb_images(negative_visualizations)},
                     step=global_step,
                 )
 
@@ -636,8 +809,11 @@ def run(args: argparse.Namespace) -> None:
                     }
                     checkpoint_dir = output_dir / "checkpoints"
                     save_training_checkpoint(
-                        accelerator.unwrap_model(model), optimizer, lr_scheduler,
-                        checkpoint_dir / "best_psnr.pkl", global_step,
+                        accelerator.unwrap_model(model),
+                        optimizer,
+                        lr_scheduler,
+                        checkpoint_dir / "best_psnr.pkl",
+                        global_step,
                         experiment_metadata,
                     )
                     _write_json(output_dir / "best_validation.json", best)
@@ -678,22 +854,31 @@ def run(args: argparse.Namespace) -> None:
             unwrapped = accelerator.unwrap_model(model)
             if latest_due:
                 save_training_checkpoint(
-                    unwrapped, optimizer, lr_scheduler,
-                    checkpoint_dir / "latest.pkl", global_step,
+                    unwrapped,
+                    optimizer,
+                    lr_scheduler,
+                    checkpoint_dir / "latest.pkl",
+                    global_step,
                     experiment_metadata,
                 )
             if milestone_due:
                 save_training_checkpoint(
-                    unwrapped, optimizer, lr_scheduler,
-                    checkpoint_dir / f"model_{global_step:06d}.pkl", global_step,
+                    unwrapped,
+                    optimizer,
+                    lr_scheduler,
+                    checkpoint_dir / f"model_{global_step:06d}.pkl",
+                    global_step,
                     experiment_metadata,
                 )
 
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         save_training_checkpoint(
-            accelerator.unwrap_model(model), optimizer, lr_scheduler,
-            output_dir / "checkpoints" / "final.pkl", global_step,
+            accelerator.unwrap_model(model),
+            optimizer,
+            lr_scheduler,
+            output_dir / "checkpoints" / "final.pkl",
+            global_step,
             experiment_metadata,
         )
     accelerator.end_training()
@@ -705,11 +890,13 @@ def parser(default_dataset_format: str = "cdd11") -> argparse.ArgumentParser:
     value.add_argument("--coarse-root", type=Path, required=True)
     value.add_argument("--output-dir", type=Path, required=True)
     value.add_argument(
-        "--dataset-format", choices=("cdd11", "ccdd11"),
+        "--dataset-format",
+        choices=("cdd11", "ccdd11"),
         default=default_dataset_format,
     )
     value.add_argument(
-        "--prepare-only", action="store_true",
+        "--prepare-only",
+        action="store_true",
         help="Build and validate manifests without loading Difix or perceptual models.",
     )
     value.add_argument(
@@ -755,13 +942,24 @@ def parser(default_dataset_format: str = "cdd11") -> argparse.ArgumentParser:
     value.add_argument("--detail-gate-use-prompt", action="store_true")
     value.add_argument("--detail-prompt-proj-dim", type=int, default=32)
     value.add_argument(
+        "--detail-text-mode",
+        choices=("none", "full", "constant"),
+        default="none",
+    )
+    value.add_argument("--detail-text-proj-dim", type=int, default=128)
+    value.add_argument("--detail-film-hidden-ratio", type=int, default=4)
+    value.add_argument("--detail-text-condition-scale", type=float, default=1.0)
+    value.add_argument(
         "--train-scope",
-        choices=("all", "detail", "detail+vae"),
+        choices=("all", "detail", "detail+vae", "film", "film+detail"),
         default="all",
     )
     value.add_argument("--detail-learning-rate", type=float, default=1e-4)
+    value.add_argument("--text-learning-rate", type=float, default=1e-4)
+    value.add_argument("--detail-alpha-learning-rate", type=float, default=5e-6)
     value.add_argument(
-        "--checkpointing-steps", type=int,
+        "--checkpointing-steps",
+        type=int,
         help="Compatibility override for permanent checkpoint frequency.",
     )
     value.add_argument("--latest-checkpointing-steps", type=int, default=1000)
@@ -771,9 +969,13 @@ def parser(default_dataset_format: str = "cdd11") -> argparse.ArgumentParser:
     value.add_argument("--viz-freq", type=int, default=1000)
     value.add_argument("--num-validation-samples", type=int, default=100)
     value.add_argument("--num-validation-visualizations", type=int, default=10)
-    value.add_argument("--mixed-precision", choices=("no", "fp16", "bf16"), default="bf16")
+    value.add_argument(
+        "--mixed-precision", choices=("no", "fp16", "bf16"), default="bf16"
+    )
     value.add_argument("--gradient-checkpointing", action="store_true")
-    value.add_argument("--enable-xformers-memory-efficient-attention", action="store_true")
+    value.add_argument(
+        "--enable-xformers-memory-efficient-attention", action="store_true"
+    )
     value.add_argument("--allow-tf32", action="store_true")
     value.add_argument("--seed", type=int, default=42)
     checkpoint = value.add_mutually_exclusive_group()

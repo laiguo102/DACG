@@ -44,9 +44,11 @@ PROTOCOL = "ccdd11-daem-fixed-seed-paired-validation-v1"
 DEFAULT_COMPARISON_PROFILE = "baseline-vs-daem"
 DETAIL_VAE_COMPARISON_PROFILE = "detail-only-vs-detail-vae"
 DETAIL_STEPS_COMPARISON_PROFILE = "detail-only-10k-vs-20k"
+TEXT_FILM_COMPARISON_PROFILE = "b20-vs-text-film"
 REUSED_REFERENCE_PROFILES = (
     DETAIL_VAE_COMPARISON_PROFILE,
     DETAIL_STEPS_COMPARISON_PROFILE,
+    TEXT_FILM_COMPARISON_PROFILE,
 )
 QUALITY_METRICS = ("mse_l2", "psnr", "ssim", "lpips_vgg", "dists")
 POSITIVE_METRICS = tuple(
@@ -124,7 +126,9 @@ class PairedMetricSuite:
             prediction_01.repeat(len(ordered), 1, 1, 1), references_01
         ).reshape(-1)
         if lpips_values.numel() != len(ordered) or dists_values.numel() != len(ordered):
-            raise RuntimeError("A learned metric did not return one value per reference")
+            raise RuntimeError(
+                "A learned metric did not return one value per reference"
+            )
 
         result: dict[str, float] = {}
         for index, name in enumerate(names):
@@ -183,6 +187,9 @@ def _checkpoint_summary(checkpoint: Path) -> dict:
         "rank_vae": int(payload.get("rank_vae", 4)),
         "timestep": int(payload.get("timestep", 199)),
         "detail_config": dict(detail_config),
+        "text_film_config": dict(
+            payload.get("text_film_config") or {"enabled": False, "mode": "none"}
+        ),
         "metadata": dict(metadata),
     }
     del payload
@@ -201,9 +208,7 @@ def _validate_detail_vae_checkpoints(
         ("detail+vae", candidate, "detail+vae"),
     ):
         metadata = summary["metadata"]
-        if metadata.get("dataset") != "CCDD-11" or int(
-            metadata.get("seed", -1)
-        ) != 42:
+        if metadata.get("dataset") != "CCDD-11" or int(metadata.get("seed", -1)) != 42:
             raise ValueError(f"The {label} checkpoint must be CCDD-11 seed 42")
         if [int(value) for value in metadata.get("pairs", [])] != [1, 2, 3, 4, 5]:
             raise ValueError(f"The {label} checkpoint must cover all five pairs")
@@ -262,6 +267,39 @@ def _validate_detail_steps_checkpoints(
     for key in ("alpha_init", "learning_rate"):
         if baseline_detail.get(key) != candidate_detail.get(key):
             raise ValueError(f"Detail-only 10k/20k {key} mismatch")
+
+
+def _validate_text_film_checkpoints(
+    baseline: Mapping,
+    candidate: Mapping,
+    *,
+    baseline_sha256: str,
+) -> None:
+    baseline_metadata = baseline["metadata"]
+    candidate_metadata = candidate["metadata"]
+    if int(baseline["global_step"]) != 20_000:
+        raise ValueError("Text-FiLM baseline must be the detail-only 20k checkpoint")
+    if baseline_metadata.get("train_scope") != "detail":
+        raise ValueError("Text-FiLM baseline must use train_scope='detail'")
+    if baseline["text_film_config"].get("mode", "none") != "none":
+        raise ValueError("Text-FiLM baseline must not contain a text branch")
+    if candidate_metadata.get("train_scope") not in ("film", "film+detail"):
+        raise ValueError("Text-FiLM candidate must use film or film+detail scope")
+    if candidate["text_film_config"].get("mode") not in ("full", "constant"):
+        raise ValueError("Text-FiLM candidate must use full or constant text mode")
+    if candidate_metadata.get("root_checkpoint_sha256") != baseline_sha256:
+        raise ValueError("Text-FiLM candidate is not descended from this B-20k")
+    for summary in (baseline, candidate):
+        metadata = summary["metadata"]
+        if metadata.get("dataset") != "CCDD-11" or int(metadata.get("seed", -1)) != 42:
+            raise ValueError("Text-FiLM comparison requires CCDD-11 seed 42")
+        if [int(value) for value in metadata.get("pairs", [])] != [1, 2, 3, 4, 5]:
+            raise ValueError("Text-FiLM comparison requires all five pairs")
+        if float(metadata.get("negative_train_probability", 0.0)) <= 0:
+            raise ValueError("Text-FiLM comparison requires negative CCDD-11 training")
+    for key in ("rank_vae", "timestep", "detail_config"):
+        if baseline[key] != candidate[key]:
+            raise ValueError(f"B-20k/Text-FiLM architecture mismatch: {key}")
 
 
 def _load_reused_reference(
@@ -331,10 +369,14 @@ def _load_reused_reference(
     }
     for sample_id in gallery_ids:
         if not Path(selected_positive[sample_id].get("prediction_path", "")).is_file():
-            raise ValueError(f"Reusable positive gallery prediction is missing: {sample_id}")
+            raise ValueError(
+                f"Reusable positive gallery prediction is missing: {sample_id}"
+            )
     for sample_id in negative_gallery_ids:
         if not Path(selected_negative[sample_id].get("prediction_path", "")).is_file():
-            raise ValueError(f"Reusable negative gallery prediction is missing: {sample_id}")
+            raise ValueError(
+                f"Reusable negative gallery prediction is missing: {sample_id}"
+            )
 
     steps = {int(record["global_step"]) for record in positive.values()}
     if len(steps) != 1:
@@ -366,7 +408,14 @@ def _negative_ids(records: list[dict]) -> list[str]:
 def _record_path(root: Path, role: str, mode: str, record: Mapping) -> Path:
     if mode == "positive":
         task = f"remove-{record['remove']}-preserve-{record['preserve']}"
-        return root / role / mode / str(record["pair"]) / task / f"{record['scene_id']}.json"
+        return (
+            root
+            / role
+            / mode
+            / str(record["pair"])
+            / task
+            / f"{record['scene_id']}.json"
+        )
     return root / role / mode / str(record["pair"]) / f"{record['scene_id']}.json"
 
 
@@ -532,6 +581,7 @@ def _run_prediction(
 ) -> tuple[torch.Tensor, float]:
     source = batch["conditioning_pixel_values"].to(device, non_blocking=True)
     tokens = batch["input_ids"].to(device, non_blocking=True)
+    attention_mask = batch["attention_mask"].to(device, non_blocking=True)
     devices = [device.index] if device.type == "cuda" else []
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -539,7 +589,11 @@ def _run_prediction(
     with torch.random.fork_rng(devices=devices):
         torch.manual_seed(seed)
         with torch.inference_mode(), _autocast(device, mixed_precision):
-            prediction = model(source, prompt_tokens=tokens)
+            prediction = model(
+                source,
+                prompt_tokens=tokens,
+                prompt_attention_mask=attention_mask,
+            )
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     return prediction, time.perf_counter() - started
@@ -575,7 +629,10 @@ def _evaluate_checkpoint(
     negative_records = _load_role_records(records_root, role, "negative")
     expected_positive = {str(row["id"]) for row in selected_positive}
     expected_negative = set(selected_negative_ids)
-    if set(positive_records) == expected_positive and set(negative_records) == expected_negative:
+    if (
+        set(positive_records) == expected_positive
+        and set(negative_records) == expected_negative
+    ):
         return int(next(iter(positive_records.values()))["global_step"])
 
     torch.manual_seed(args.seed)
@@ -586,25 +643,30 @@ def _evaluate_checkpoint(
     )
     if comparison_profile == DEFAULT_COMPARISON_PROFILE:
         if role == "baseline" and model.detail_enabled:
-            raise ValueError("The baseline checkpoint must be detail-disabled or legacy")
+            raise ValueError(
+                "The baseline checkpoint must be detail-disabled or legacy"
+            )
         if role == "candidate" and not model.detail_enabled:
-            raise ValueError("The candidate checkpoint must enable DAEM-lite detail blocks")
-    elif (
-        comparison_profile == DETAIL_VAE_COMPARISON_PROFILE
-        and role == "candidate"
-    ):
+            raise ValueError(
+                "The candidate checkpoint must enable DAEM-lite detail blocks"
+            )
+    elif comparison_profile == DETAIL_VAE_COMPARISON_PROFILE and role == "candidate":
         if not model.detail_enabled:
             raise ValueError("The detail+vae checkpoint must enable DAEM-lite")
         if metadata.get("train_scope") != "detail+vae":
-            raise ValueError("The candidate checkpoint must use train_scope='detail+vae'")
-    elif (
-        comparison_profile == DETAIL_STEPS_COMPARISON_PROFILE
-        and role == "candidate"
-    ):
+            raise ValueError(
+                "The candidate checkpoint must use train_scope='detail+vae'"
+            )
+    elif comparison_profile == DETAIL_STEPS_COMPARISON_PROFILE and role == "candidate":
         if not model.detail_enabled:
             raise ValueError("The detail-only 20k checkpoint must enable DAEM-lite")
         if metadata.get("train_scope") != "detail":
             raise ValueError("The candidate checkpoint must use train_scope='detail'")
+    elif comparison_profile == TEXT_FILM_COMPARISON_PROFILE:
+        if role == "baseline" and model.text_film_enabled:
+            raise ValueError("The B-20k baseline must not enable Text-FiLM")
+        if role == "candidate" and not model.text_film_enabled:
+            raise ValueError("The candidate checkpoint must enable Text-FiLM")
     if [int(value) for value in metadata.get("pairs", [])] != [1, 2, 3, 4, 5]:
         raise ValueError(f"The {role} checkpoint does not cover all five pairs")
     if float(metadata.get("negative_train_probability", 0.0)) <= 0:
@@ -629,7 +691,8 @@ def _evaluate_checkpoint(
         manifest, model.tokenizer, resolution=512, training_mode="positive"
     )
     positive_index = {
-        str(record["id"]): index for index, record in enumerate(positive_dataset.records)
+        str(record["id"]): index
+        for index, record in enumerate(positive_dataset.records)
     }
     pending_positive = sorted(expected_positive - set(positive_records))
     loader = DataLoader(
@@ -667,7 +730,13 @@ def _evaluate_checkpoint(
         prediction_path = ""
         if sample_id in gallery_ids:
             prediction_01 = prediction.float().add(1).mul(0.5).clamp(0, 1)
-            destination = gallery_root / "predictions" / role / "positive" / f"{_safe_id(sample_id)}.png"
+            destination = (
+                gallery_root
+                / "predictions"
+                / role
+                / "positive"
+                / f"{_safe_id(sample_id)}.png"
+            )
             _save_image(prediction_01, destination)
             prediction_path = str(destination)
             if role == "candidate":
@@ -760,10 +829,18 @@ def _evaluate_checkpoint(
         measured = metric_suite(prediction, {"identity": identity})
         prediction_01 = prediction.float().add(1).mul(0.5).clamp(0, 1)
         identity_01 = identity.float().add(1).mul(0.5).clamp(0, 1)
-        measured["identity_mae"] = float((prediction_01 - identity_01).abs().mean().item())
+        measured["identity_mae"] = float(
+            (prediction_01 - identity_01).abs().mean().item()
+        )
         prediction_path = ""
         if sample_id in negative_gallery_ids:
-            destination = gallery_root / "predictions" / role / "negative" / f"{_safe_id(sample_id)}.png"
+            destination = (
+                gallery_root
+                / "predictions"
+                / role
+                / "negative"
+                / f"{_safe_id(sample_id)}.png"
+            )
             _save_image(prediction_01, destination)
             prediction_path = str(destination)
             if role == "candidate":
@@ -827,7 +904,14 @@ def paired_rows(
     rows = []
     identity_fields = ("scene_id", "pair_id", "pair", "prompt", "inference_seed")
     if mode == "positive":
-        identity_fields += ("remove", "preserve", "coarse_path", "degraded_path", "target_path", "clean_gt_path")
+        identity_fields += (
+            "remove",
+            "preserve",
+            "coarse_path",
+            "degraded_path",
+            "target_path",
+            "clean_gt_path",
+        )
     for sample_id in sorted(baseline):
         left = baseline[sample_id]
         right = candidate[sample_id]
@@ -869,7 +953,9 @@ def _point_estimate(rows: list[dict], field: str, *, task_macro: bool) -> float:
     for row in rows:
         key = f"{row['pair']}:remove-{row['remove']}:preserve-{row['preserve']}"
         by_task[key].append(float(row[field]))
-    return math.fsum(math.fsum(values) / len(values) for values in by_task.values()) / len(by_task)
+    return math.fsum(
+        math.fsum(values) / len(values) for values in by_task.values()
+    ) / len(by_task)
 
 
 def _cluster_bootstrap_ci(
@@ -936,13 +1022,23 @@ def summarize_effects(
     effects: list[dict] = []
     conditions: list[dict] = []
 
-    def add_group(mode: str, group: str, condition: str, rows: list[dict], metrics: tuple[str, ...], *, task_macro: bool = False) -> None:
+    def add_group(
+        mode: str,
+        group: str,
+        condition: str,
+        rows: list[dict],
+        metrics: tuple[str, ...],
+        *,
+        task_macro: bool = False,
+    ) -> None:
         for metric in metrics:
             baseline_field = f"baseline_{metric}"
             candidate_field = f"candidate_{metric}"
             advantage_field = f"candidate_advantage_{metric}"
             baseline_mean = _point_estimate(rows, baseline_field, task_macro=task_macro)
-            candidate_mean = _point_estimate(rows, candidate_field, task_macro=task_macro)
+            candidate_mean = _point_estimate(
+                rows, candidate_field, task_macro=task_macro
+            )
             raw_delta = candidate_mean - baseline_mean
             advantage = _point_estimate(rows, advantage_field, task_macro=task_macro)
             low, high = _cluster_bootstrap_ci(
@@ -978,7 +1074,10 @@ def summarize_effects(
                     "conclusion": conclusion,
                 }
             )
-            for model_name, value in (("baseline", baseline_mean), ("candidate", candidate_mean)):
+            for model_name, value in (
+                ("baseline", baseline_mean),
+                ("candidate", candidate_mean),
+            ):
                 conditions.append(
                     {
                         "mode": mode,
@@ -1151,9 +1250,7 @@ def run(args: argparse.Namespace) -> None:
     if args.num_gallery_samples < 0:
         raise ValueError("--num-gallery-samples must be non-negative")
 
-    comparison_profile = getattr(
-        args, "comparison_profile", DEFAULT_COMPARISON_PROFILE
-    )
+    comparison_profile = getattr(args, "comparison_profile", DEFAULT_COMPARISON_PROFILE)
     reuse_results = getattr(args, "reuse_baseline_results", None)
     reuse_role = getattr(args, "reuse_baseline_role", "candidate")
     baseline_label = getattr(args, "baseline_label", "baseline")
@@ -1187,9 +1284,7 @@ def run(args: argparse.Namespace) -> None:
         if args.num_gallery_samples == 0
         else stratified_indices(selected_positive, args.num_gallery_samples)
     )
-    gallery_ids = {
-        str(selected_positive[index]["id"]) for index in gallery_indices
-    }
+    gallery_ids = {str(selected_positive[index]["id"]) for index in gallery_indices}
 
     baseline_checkpoint_sha = _file_sha256(baseline_checkpoint)
     candidate_checkpoint_sha = _file_sha256(candidate_checkpoint)
@@ -1200,9 +1295,7 @@ def run(args: argparse.Namespace) -> None:
     reference_metadata: dict | None = None
     reference_step: int | None = None
     if comparison_profile in REUSED_REFERENCE_PROFILES:
-        baseline_train_manifest_sha = _file_sha256(
-            _train_manifest(baseline_checkpoint)
-        )
+        baseline_train_manifest_sha = _file_sha256(_train_manifest(baseline_checkpoint))
         candidate_train_manifest_sha = _file_sha256(
             _train_manifest(candidate_checkpoint)
         )
@@ -1212,8 +1305,14 @@ def run(args: argparse.Namespace) -> None:
         candidate_summary = _checkpoint_summary(candidate_checkpoint)
         if comparison_profile == DETAIL_VAE_COMPARISON_PROFILE:
             _validate_detail_vae_checkpoints(baseline_summary, candidate_summary)
-        else:
+        elif comparison_profile == DETAIL_STEPS_COMPARISON_PROFILE:
             _validate_detail_steps_checkpoints(baseline_summary, candidate_summary)
+        else:
+            _validate_text_film_checkpoints(
+                baseline_summary,
+                candidate_summary,
+                baseline_sha256=baseline_checkpoint_sha,
+            )
         reference_positive, reference_negative, reference_metadata, reference_step = (
             _load_reused_reference(
                 Path(reuse_results).resolve(),
@@ -1387,36 +1486,36 @@ def run(args: argparse.Namespace) -> None:
     _write_csv(output_dir / "paired_effects.csv", effects)
     _write_csv(output_dir / "condition_summary.csv", conditions)
     metadata_payload = {
-            "protocol": PROTOCOL,
-            "dataset": "CCDD-11",
-            "split": "validation",
-            "created_at_utc": _now(),
-            "config": config,
-            "checkpoint_steps": checkpoint_steps,
-            "baseline_training_preparation": baseline_preparation,
-            "candidate_training_preparation": candidate_preparation,
-            "posterior_sampling": "sample() with a fixed SHA256-derived seed per sample",
-            "bootstrap": {
-                "unit": "scene_id cluster",
-                "resamples": args.bootstrap_resamples,
-                "seed": args.bootstrap_seed,
-                "confidence_interval": "percentile 95%",
-            },
-            "advantage_definition": "positive always means candidate DAEM is better",
-            "metric_semantics": {
-                "mse_scale": "prediction and reference tensors in [-1, 1]",
-                "psnr_ssim_scale": "prediction and reference tensors mapped to [0, 1]",
-                "lpips_backbone": "VGG",
-            },
-            "software": {
-                name: _package_version(name)
-                for name in ("torch", "torchvision", "diffusers", "lpips", "piq")
-            },
+        "protocol": PROTOCOL,
+        "dataset": "CCDD-11",
+        "split": "validation",
+        "created_at_utc": _now(),
+        "config": config,
+        "checkpoint_steps": checkpoint_steps,
+        "baseline_training_preparation": baseline_preparation,
+        "candidate_training_preparation": candidate_preparation,
+        "posterior_sampling": "sample() with a fixed SHA256-derived seed per sample",
+        "bootstrap": {
+            "unit": "scene_id cluster",
+            "resamples": args.bootstrap_resamples,
+            "seed": args.bootstrap_seed,
+            "confidence_interval": "percentile 95%",
+        },
+        "advantage_definition": "positive always means candidate DAEM is better",
+        "metric_semantics": {
+            "mse_scale": "prediction and reference tensors in [-1, 1]",
+            "psnr_ssim_scale": "prediction and reference tensors mapped to [0, 1]",
+            "lpips_backbone": "VGG",
+        },
+        "software": {
+            name: _package_version(name)
+            for name in ("torch", "torchvision", "diffusers", "lpips", "piq")
+        },
     }
     counts_payload = {
-            "positive_per_model": len(positive_rows),
-            "negative_per_model": len(negative_rows),
-            "total_model_forwards": 2 * (len(positive_rows) + len(negative_rows)),
+        "positive_per_model": len(positive_rows),
+        "negative_per_model": len(negative_rows),
+        "total_model_forwards": 2 * (len(positive_rows) + len(negative_rows)),
     }
     if reference_metadata is not None:
         metadata_payload.update(
@@ -1478,6 +1577,7 @@ def parser() -> argparse.ArgumentParser:
             DEFAULT_COMPARISON_PROFILE,
             DETAIL_VAE_COMPARISON_PROFILE,
             DETAIL_STEPS_COMPARISON_PROFILE,
+            TEXT_FILM_COMPARISON_PROFILE,
         ),
         default=DEFAULT_COMPARISON_PROFILE,
     )

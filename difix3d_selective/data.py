@@ -33,9 +33,7 @@ def _image_tensor(path: str, resolution: int) -> torch.Tensor:
     return TF.normalize(tensor, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 
 
-def negative_conditioning(
-    coarse: torch.Tensor, degraded: torch.Tensor
-) -> torch.Tensor:
+def negative_conditioning(coarse: torch.Tensor, degraded: torch.Tensor) -> torch.Tensor:
     """Build the preserve-both condition used by negative CCDD-11 samples."""
 
     if coarse.shape != degraded.shape:
@@ -122,19 +120,20 @@ class SelectiveDifixDataset(torch.utils.data.Dataset):
             remove = record.get("remove", "")
             preserve = record.get("preserve", "")
         ground_truth = _image_tensor(record["clear_image"], self.resolution)
-        input_ids = self.tokenizer(
+        tokenized = self.tokenizer(
             prompt,
             max_length=self.tokenizer.model_max_length,
             padding="max_length",
             truncation=True,
             return_tensors="pt",
-        ).input_ids[0]
+        )
         return {
             "conditioning_pixel_values": conditioning,
             "output_pixel_values": target,
             "ground_truth_pixel_values": ground_truth,
             "dacg_coarse_pixel_values": coarse,
-            "input_ids": input_ids,
+            "input_ids": tokenized.input_ids[0],
+            "attention_mask": tokenized.attention_mask[0],
             "prompt": prompt,
             "training_mode": mode,
             "is_negative": is_negative,

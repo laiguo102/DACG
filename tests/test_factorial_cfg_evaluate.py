@@ -186,7 +186,8 @@ class TestSmokeIntegration(unittest.TestCase):
 
             def __call__(self, prompts, **kwargs):
                 return SimpleNamespace(
-                    input_ids=torch.ones(len(prompts), 4, dtype=torch.long)
+                    input_ids=torch.ones(len(prompts), 4, dtype=torch.long),
+                    attention_mask=torch.ones(len(prompts), 4, dtype=torch.long),
                 )
 
         class FakeModel(torch.nn.Module):

@@ -15,6 +15,7 @@ from difix3d_selective.paired_validation import (
     COARSE_METRICS,
     DETAIL_STEPS_COMPARISON_PROFILE,
     DETAIL_VAE_COMPARISON_PROFILE,
+    TEXT_FILM_COMPARISON_PROFILE,
     NEGATIVE_METRICS,
     POSITIVE_METRICS,
     PROTOCOL,
@@ -23,6 +24,7 @@ from difix3d_selective.paired_validation import (
     _negative_ids,
     _record_path,
     _run_prediction,
+    _validate_text_film_checkpoints,
     _write_record_json,
     paired_rows,
     run,
@@ -32,6 +34,51 @@ from difix3d_selective.paired_validation import (
 from difix3d_selective.protocol import PAIR_FOLDERS, directed_tasks, preserve_pair_prompt
 from difix3d_selective.validation import stratified_indices
 from difix3d_selective.evaluate import _file_sha256
+
+
+def test_text_film_profile_validates_b20_parent_and_candidate_scope():
+    from difix3d_selective.paired_validation import parser
+
+    detail_config = {
+        "enabled": True,
+        "num_naf_blocks": 1,
+        "gate_reduction": 4,
+        "prompt_condition": False,
+        "prompt_proj_dim": 32,
+    }
+    common = {
+        "dataset": "CCDD-11",
+        "seed": 42,
+        "pairs": [1, 2, 3, 4, 5],
+        "negative_train_probability": 0.2,
+    }
+    baseline = {
+        "global_step": 20_000,
+        "rank_vae": 4,
+        "timestep": 199,
+        "detail_config": detail_config,
+        "text_film_config": {"enabled": False, "mode": "none"},
+        "metadata": {**common, "train_scope": "detail"},
+    }
+    candidate = {
+        "global_step": 3_000,
+        "rank_vae": 4,
+        "timestep": 199,
+        "detail_config": detail_config,
+        "text_film_config": {"enabled": True, "mode": "full"},
+        "metadata": {
+            **common,
+            "train_scope": "film",
+            "parent_checkpoint_sha256": "b20-sha",
+            "root_checkpoint_sha256": "b20-sha",
+        },
+    }
+
+    _validate_text_film_checkpoints(baseline, candidate, baseline_sha256="b20-sha")
+    profile = next(
+        action for action in parser()._actions if action.dest == "comparison_profile"
+    )
+    assert TEXT_FILM_COMPARISON_PROFILE in profile.choices
 
 
 def _full_manifest_records(root: Path) -> list[dict]:
@@ -96,7 +143,10 @@ class _Tokenizer:
     model_max_length = 4
 
     def __call__(self, prompt, **_):
-        return SimpleNamespace(input_ids=torch.ones(1, 4, dtype=torch.long))
+        return SimpleNamespace(
+            input_ids=torch.ones(1, 4, dtype=torch.long),
+            attention_mask=torch.ones(1, 4, dtype=torch.long),
+        )
 
 
 class _FakeDataset(torch.utils.data.Dataset):
@@ -140,6 +190,7 @@ class _FakeDataset(torch.utils.data.Dataset):
             "output_pixel_values": degraded if negative else torch.full((3, 4, 4), value + 0.2),
             "ground_truth_pixel_values": torch.full((3, 4, 4), value + 0.3),
             "input_ids": torch.ones(4, dtype=torch.long),
+            "attention_mask": torch.ones(4, dtype=torch.long),
             "prompt": preserve_pair_prompt(record["pair_id"]) if negative else record["prompt"],
             "sample_id": sample_id,
             "scene_id": record["scene_id"],
@@ -167,8 +218,8 @@ class _FakeModel(nn.Module):
     def set_eval(self):
         self.eval().requires_grad_(False)
 
-    def forward(self, images, *, prompt_tokens):
-        del prompt_tokens
+    def forward(self, images, *, prompt_tokens, prompt_attention_mask=None):
+        del prompt_tokens, prompt_attention_mask
         if self.fail_after is not None and self.successful_calls >= self.fail_after:
             raise RuntimeError("intentional interruption")
         type(self).successful_calls += 1
@@ -382,6 +433,7 @@ class TestPairedValidation(unittest.TestCase):
         batch = {
             "conditioning_pixel_values": torch.zeros(1, 2, 3, 4, 4),
             "input_ids": torch.ones(1, 4, dtype=torch.long),
+            "attention_mask": torch.ones(1, 4, dtype=torch.long),
         }
         _FakeModel.successful_calls = 0
         left, _ = _run_prediction(model, batch, torch.device("cpu"), "no", 123)

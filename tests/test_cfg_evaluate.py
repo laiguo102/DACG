@@ -296,7 +296,10 @@ class TestCfgManifest(unittest.TestCase):
             model_max_length = 4
 
             def __call__(self, prompts, **kwargs):
-                return SimpleNamespace(input_ids=torch.ones(len(prompts), 4, dtype=torch.long))
+                return SimpleNamespace(
+                    input_ids=torch.ones(len(prompts), 4, dtype=torch.long),
+                    attention_mask=torch.ones(len(prompts), 4, dtype=torch.long),
+                )
 
         class FakeModel(torch.nn.Module):
             def __init__(self, **kwargs):
