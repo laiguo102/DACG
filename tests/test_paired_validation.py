@@ -13,6 +13,7 @@ from torch import nn
 from difix3d_selective.data import load_records
 from difix3d_selective.paired_validation import (
     COARSE_METRICS,
+    DETAIL_STEPS_COMPARISON_PROFILE,
     DETAIL_VAE_COMPARISON_PROFILE,
     NEGATIVE_METRICS,
     POSITIVE_METRICS,
@@ -193,10 +194,15 @@ class _FakeMetricSuite:
 def _fake_factory(path, **_):
     path_text = str(path)
     detail_vae = "detail_vae" in path_text
+    detail_20k = "detail_only_20k" in path_text
     detail_only = "detail_only" in path_text
     candidate = "candidate" in path_text
     detail_enabled = candidate or detail_only or detail_vae
-    offset = 0.1 if detail_vae else (0.05 if detail_enabled else 0.0)
+    offset = (
+        0.1
+        if detail_vae
+        else (0.08 if detail_20k else (0.05 if detail_enabled else 0.0))
+    )
     model = _FakeModel(detail_enabled, offset)
     metadata = {
         "dataset": "CCDD-11",
@@ -205,13 +211,15 @@ def _fake_factory(path, **_):
         "negative_train_probability": 0.2,
         "train_scope": "detail+vae" if detail_vae else ("detail" if detail_enabled else "all"),
     }
-    return model, 10000 if detail_enabled else 90000, metadata
+    step = 20_000 if detail_20k else (10_000 if detail_enabled else 90_000)
+    return model, step, metadata
 
 
 def _fake_checkpoint_summary(path: Path) -> dict:
     detail_vae = "detail_vae" in str(path)
+    detail_20k = "detail_only_20k" in str(path)
     return {
-        "global_step": 10000,
+        "global_step": 20000 if detail_20k else 10000,
         "rank_vae": 4,
         "timestep": 199,
         "detail_config": {
@@ -227,7 +235,7 @@ def _fake_checkpoint_summary(path: Path) -> dict:
             "pairs": [1, 2, 3, 4, 5],
             "negative_train_probability": 0.2,
             "train_scope": "detail+vae" if detail_vae else "detail",
-            "detail": {"alpha_init": 0.1},
+            "detail": {"alpha_init": 0.1, "learning_rate": 1e-4},
         },
     }
 
@@ -669,6 +677,101 @@ class TestPairedValidation(unittest.TestCase):
                 side_effect=bad_summary,
             ):
                 with self.assertRaisesRegex(ValueError, "expected 'detail\\+vae'"):
+                    run(args)
+
+    def test_detail_steps_profile_reuses_10k_without_loading_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            records = _full_manifest_records(root)
+            manifest_text = "\n".join(json.dumps(row) for row in records) + "\n"
+            detail_10k = _write_run(root, "detail_only", manifest_text)
+            detail_20k = _write_run(root, "detail_only_20k", manifest_text)
+            reference = _write_reusable_results(
+                root,
+                detail_10k,
+                detail_10k.parent.parent
+                / "prepared"
+                / "manifests"
+                / "validation.jsonl",
+                records,
+            )
+            args = _args(detail_10k, detail_20k, root / "output")
+            args.comparison_profile = DETAIL_STEPS_COMPARISON_PROFILE
+            args.reuse_baseline_results = reference
+            args.baseline_label = "detail_only_10k"
+            args.candidate_label = "detail_only_20k"
+            factory_calls = []
+
+            def tracked_factory(path, **kwargs):
+                factory_calls.append(Path(path))
+                return _fake_factory(path, **kwargs)
+
+            _FakeModel.successful_calls = 0
+            _FakeModel.fail_after = None
+            fake_model_module = ModuleType("difix3d_selective.model")
+            fake_model_module.load_model_from_checkpoint = tracked_factory
+            with (
+                patch.dict(sys.modules, {"difix3d_selective.model": fake_model_module}),
+                patch(
+                    "difix3d_selective.paired_validation.SelectiveDifixDataset",
+                    _FakeDataset,
+                ),
+                patch(
+                    "difix3d_selective.paired_validation.PairedMetricSuite",
+                    _FakeMetricSuite,
+                ),
+                patch(
+                    "difix3d_selective.paired_validation._checkpoint_summary",
+                    side_effect=_fake_checkpoint_summary,
+                ),
+            ):
+                run(args)
+
+            self.assertEqual(factory_calls, [detail_20k.resolve()])
+            self.assertEqual(_FakeModel.successful_calls, 30)
+            metrics = json.loads(
+                (root / "output" / "metrics.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(metrics["counts"]["new_model_forwards"], 30)
+            self.assertEqual(metrics["counts"]["reused_reference_records"], 30)
+            self.assertEqual(
+                metrics["metadata"]["comparison_profile"],
+                DETAIL_STEPS_COMPARISON_PROFILE,
+            )
+            self.assertEqual(
+                metrics["metadata"]["checkpoint_steps"],
+                {"baseline": 10_000, "candidate": 20_000},
+            )
+            with (root / "output" / "positive_per_image.csv").open(
+                encoding="utf-8"
+            ) as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual(rows[0]["baseline_label"], "detail_only_10k")
+            self.assertEqual(rows[0]["candidate_label"], "detail_only_20k")
+            self.assertGreater(float(rows[0]["raw_delta_target_psnr"]), 0)
+
+    def test_detail_steps_profile_rejects_wrong_checkpoint_step(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            records = _full_manifest_records(root)
+            manifest_text = "\n".join(json.dumps(row) for row in records) + "\n"
+            detail_10k = _write_run(root, "detail_only", manifest_text)
+            detail_20k = _write_run(root, "detail_only_20k", manifest_text)
+            args = _args(detail_10k, detail_20k, root / "output")
+            args.comparison_profile = DETAIL_STEPS_COMPARISON_PROFILE
+            args.reuse_baseline_results = root / "unused"
+
+            def wrong_step_summary(path):
+                summary = _fake_checkpoint_summary(path)
+                if "detail_only_20k" in str(path):
+                    summary["global_step"] = 19_000
+                return summary
+
+            with patch(
+                "difix3d_selective.paired_validation._checkpoint_summary",
+                side_effect=wrong_step_summary,
+            ):
+                with self.assertRaisesRegex(ValueError, "expected 20000"):
                     run(args)
 
     def test_reused_reference_rejects_protocol_identity_and_sample_mismatches(self):

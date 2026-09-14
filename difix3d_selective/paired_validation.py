@@ -1,4 +1,4 @@
-"""Fixed-seed paired validation for baseline and DAEM-lite CCDD-11 checkpoints."""
+"""Fixed-seed paired validation for CCDD-11 checkpoints."""
 
 from __future__ import annotations
 
@@ -43,6 +43,11 @@ from .validation import stratified_indices
 PROTOCOL = "ccdd11-daem-fixed-seed-paired-validation-v1"
 DEFAULT_COMPARISON_PROFILE = "baseline-vs-daem"
 DETAIL_VAE_COMPARISON_PROFILE = "detail-only-vs-detail-vae"
+DETAIL_STEPS_COMPARISON_PROFILE = "detail-only-10k-vs-20k"
+REUSED_REFERENCE_PROFILES = (
+    DETAIL_VAE_COMPARISON_PROFILE,
+    DETAIL_STEPS_COMPARISON_PROFILE,
+)
 QUALITY_METRICS = ("mse_l2", "psnr", "ssim", "lpips_vgg", "dists")
 POSITIVE_METRICS = tuple(
     f"{reference}_{metric}"
@@ -196,7 +201,9 @@ def _validate_detail_vae_checkpoints(
         ("detail+vae", candidate, "detail+vae"),
     ):
         metadata = summary["metadata"]
-        if metadata.get("dataset") != "CCDD-11" or int(metadata.get("seed", -1)) != 42:
+        if metadata.get("dataset") != "CCDD-11" or int(
+            metadata.get("seed", -1)
+        ) != 42:
             raise ValueError(f"The {label} checkpoint must be CCDD-11 seed 42")
         if [int(value) for value in metadata.get("pairs", [])] != [1, 2, 3, 4, 5]:
             raise ValueError(f"The {label} checkpoint must cover all five pairs")
@@ -217,6 +224,44 @@ def _validate_detail_vae_checkpoints(
     candidate_detail = candidate_metadata.get("detail", {})
     if baseline_detail.get("alpha_init") != candidate_detail.get("alpha_init"):
         raise ValueError("Detail-only/detail+vae alpha_init mismatch")
+
+
+def _validate_detail_steps_checkpoints(
+    baseline: Mapping,
+    candidate: Mapping,
+) -> None:
+    for label, summary, expected_step in (
+        ("detail-only 10k", baseline, 10_000),
+        ("detail-only 20k", candidate, 20_000),
+    ):
+        metadata = summary["metadata"]
+        if metadata.get("dataset") != "CCDD-11" or int(metadata.get("seed", -1)) != 42:
+            raise ValueError(f"The {label} checkpoint must be CCDD-11 seed 42")
+        if [int(value) for value in metadata.get("pairs", [])] != [1, 2, 3, 4, 5]:
+            raise ValueError(f"The {label} checkpoint must cover all five pairs")
+        if float(metadata.get("negative_train_probability", 0.0)) <= 0:
+            raise ValueError(f"The {label} checkpoint lacks negative CCDD-11 training")
+        if metadata.get("train_scope") != "detail":
+            raise ValueError(
+                f"The {label} checkpoint train_scope is {metadata.get('train_scope')!r}, "
+                "expected 'detail'"
+            )
+        if not bool(summary["detail_config"].get("enabled", False)):
+            raise ValueError(f"The {label} checkpoint must enable DAEM-lite")
+        if int(summary["global_step"]) != expected_step:
+            raise ValueError(
+                f"The {label} checkpoint global_step is {summary['global_step']}, "
+                f"expected {expected_step}"
+            )
+
+    for key in ("rank_vae", "timestep", "detail_config"):
+        if baseline[key] != candidate[key]:
+            raise ValueError(f"Detail-only 10k/20k architecture mismatch: {key}")
+    baseline_detail = baseline["metadata"].get("detail", {})
+    candidate_detail = candidate["metadata"].get("detail", {})
+    for key in ("alpha_init", "learning_rate"):
+        if baseline_detail.get(key) != candidate_detail.get(key):
+            raise ValueError(f"Detail-only 10k/20k {key} mismatch")
 
 
 def _load_reused_reference(
@@ -544,11 +589,22 @@ def _evaluate_checkpoint(
             raise ValueError("The baseline checkpoint must be detail-disabled or legacy")
         if role == "candidate" and not model.detail_enabled:
             raise ValueError("The candidate checkpoint must enable DAEM-lite detail blocks")
-    elif role == "candidate":
+    elif (
+        comparison_profile == DETAIL_VAE_COMPARISON_PROFILE
+        and role == "candidate"
+    ):
         if not model.detail_enabled:
             raise ValueError("The detail+vae checkpoint must enable DAEM-lite")
         if metadata.get("train_scope") != "detail+vae":
             raise ValueError("The candidate checkpoint must use train_scope='detail+vae'")
+    elif (
+        comparison_profile == DETAIL_STEPS_COMPARISON_PROFILE
+        and role == "candidate"
+    ):
+        if not model.detail_enabled:
+            raise ValueError("The detail-only 20k checkpoint must enable DAEM-lite")
+        if metadata.get("train_scope") != "detail":
+            raise ValueError("The candidate checkpoint must use train_scope='detail'")
     if [int(value) for value in metadata.get("pairs", [])] != [1, 2, 3, 4, 5]:
         raise ValueError(f"The {role} checkpoint does not cover all five pairs")
     if float(metadata.get("negative_train_probability", 0.0)) <= 0:
@@ -1102,14 +1158,12 @@ def run(args: argparse.Namespace) -> None:
     reuse_role = getattr(args, "reuse_baseline_role", "candidate")
     baseline_label = getattr(args, "baseline_label", "baseline")
     candidate_label = getattr(args, "candidate_label", "candidate")
-    if comparison_profile == DETAIL_VAE_COMPARISON_PROFILE:
+    if comparison_profile in REUSED_REFERENCE_PROFILES:
         if reuse_results is None:
-            raise ValueError(
-                "detail-only-vs-detail-vae requires --reuse-baseline-results"
-            )
+            raise ValueError(f"{comparison_profile} requires --reuse-baseline-results")
     elif reuse_results is not None:
         raise ValueError(
-            "--reuse-baseline-results requires detail-only-vs-detail-vae profile"
+            "--reuse-baseline-results requires a reusable-reference comparison profile"
         )
 
     baseline_checkpoint = args.baseline_checkpoint.resolve()
@@ -1145,7 +1199,7 @@ def run(args: argparse.Namespace) -> None:
     reference_negative: dict[str, dict] | None = None
     reference_metadata: dict | None = None
     reference_step: int | None = None
-    if comparison_profile == DETAIL_VAE_COMPARISON_PROFILE:
+    if comparison_profile in REUSED_REFERENCE_PROFILES:
         baseline_train_manifest_sha = _file_sha256(
             _train_manifest(baseline_checkpoint)
         )
@@ -1153,11 +1207,13 @@ def run(args: argparse.Namespace) -> None:
             _train_manifest(candidate_checkpoint)
         )
         if baseline_train_manifest_sha != candidate_train_manifest_sha:
-            raise ValueError("Detail-only and detail+vae train manifest SHA256 differ")
-        _validate_detail_vae_checkpoints(
-            _checkpoint_summary(baseline_checkpoint),
-            _checkpoint_summary(candidate_checkpoint),
-        )
+            raise ValueError("Baseline and candidate train manifest SHA256 differ")
+        baseline_summary = _checkpoint_summary(baseline_checkpoint)
+        candidate_summary = _checkpoint_summary(candidate_checkpoint)
+        if comparison_profile == DETAIL_VAE_COMPARISON_PROFILE:
+            _validate_detail_vae_checkpoints(baseline_summary, candidate_summary)
+        else:
+            _validate_detail_steps_checkpoints(baseline_summary, candidate_summary)
         reference_positive, reference_negative, reference_metadata, reference_step = (
             _load_reused_reference(
                 Path(reuse_results).resolve(),
@@ -1205,7 +1261,7 @@ def run(args: argparse.Namespace) -> None:
         "positive_samples": len(selected_positive),
         "negative_samples": len(selected_negative_ids),
     }
-    if comparison_profile == DETAIL_VAE_COMPARISON_PROFILE:
+    if comparison_profile in REUSED_REFERENCE_PROFILES:
         config.update(
             {
                 "comparison_profile": comparison_profile,
@@ -1418,7 +1474,11 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--candidate-checkpoint", type=Path, required=True)
     value.add_argument(
         "--comparison-profile",
-        choices=(DEFAULT_COMPARISON_PROFILE, DETAIL_VAE_COMPARISON_PROFILE),
+        choices=(
+            DEFAULT_COMPARISON_PROFILE,
+            DETAIL_VAE_COMPARISON_PROFILE,
+            DETAIL_STEPS_COMPARISON_PROFILE,
+        ),
         default=DEFAULT_COMPARISON_PROFILE,
     )
     value.add_argument("--reuse-baseline-results", type=Path)

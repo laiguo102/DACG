@@ -247,6 +247,36 @@ python -u evaluate_ccdd11_paired.py \
 6/10 任务均值提高、没有任务或感知/identity 指标明确退化，并且 gallery 通过人工检查，
 才晋级 Exp C；否则保留 Exp B。
 
+### 固定种子 B20 对 B10 配对验证
+
+B20 与 B10 使用相同 detail-only 结构。复用 A 对 B10 全量验证中的 `candidate` 记录，
+只新增 B20 的推理。该 profile 固定要求 baseline 为 step 10,000、candidate 为 step
+20,000，并验证两者的训练范围、DAEM-lite 结构以及 train/validation manifest 哈希一致。
+
+```bash
+export B10_RUN="$RUN_ROOT/ccdd-daem-lite-detail-only-v1/detail-only-10k"
+export B20_RUN="$RUN_ROOT/ccdd-daem-lite-detail-only-v1/detail-only-20k-extension-v1"
+export B10_RESULTS="$B10_RUN/paired_validation_v1/full"
+export B20_RESULTS="$B20_RUN/paired_vs_detail_only_10k_v1"
+
+python -u evaluate_ccdd11_paired.py \
+  --comparison-profile detail-only-10k-vs-20k \
+  --reuse-baseline-results "$B10_RESULTS" \
+  --reuse-baseline-role candidate \
+  --baseline-label detail_only_10k \
+  --candidate-label detail_only_20k \
+  --baseline-checkpoint "$B10_RUN/checkpoints/best_psnr.pkl" \
+  --candidate-checkpoint "$B20_RUN/checkpoints/best_psnr.pkl" \
+  --output-dir "$B20_RESULTS/smoke" \
+  --max-samples 20 --num-gallery-samples 2 \
+  --workers 0 --device cuda --mixed-precision bf16 \
+  --bootstrap-resamples 10000 --bootstrap-seed 42 \
+  --enable-xformers-memory-efficient-attention
+```
+
+smoke 通过后移除 `--max-samples 20`，将输出改为 `$B20_RESULTS/full`，并把
+`--num-gallery-samples` 改为 20。smoke/full 分别只新增 30/1,770 次模型 forward。
+
 ## 结果判定
 
 checkpoint 仍只由 selective positive validation PSNR 选择。优先比较同一个 baseline
