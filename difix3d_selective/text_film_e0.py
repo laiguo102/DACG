@@ -86,6 +86,78 @@ def _predictions(model, batches, device, precision: str, output_dir: Path | None
     return values
 
 
+@torch.inference_mode()
+def _zero_init_equivalence(model, batches, device, precision: str) -> float:
+    """Compare legacy and Text-FiLM decoder paths on identical latent inputs."""
+
+    model.set_eval()
+    differences = []
+    decoder = model.vae.decoder
+    for batch in batches:
+        sample_id = str(batch["sample_id"][0])
+        devices = [device.index] if device.type == "cuda" else []
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(sample_seed(42, sample_id))
+            with _autocast(device, precision):
+                latent, skips = model.denoised_main_latent(
+                    batch["conditioning_pixel_values"].to(device),
+                    prompt_tokens=batch["input_ids"].to(device),
+                    prompt_attention_mask=batch["attention_mask"].to(device),
+                )
+                condition = model._last_detail_condition
+                decoder.detail_text_enabled = False
+                try:
+                    legacy = model.decode_main_latent(
+                        latent, skips, prompt_condition=None
+                    )
+                finally:
+                    decoder.detail_text_enabled = True
+                text_film = model.decode_main_latent(
+                    latent, skips, prompt_condition=condition
+                )
+        differences.append(float((legacy.float() - text_film.float()).abs().max()))
+    return max(differences)
+
+
+@torch.inference_mode()
+def _roundtrip_decoder_snapshot(model, batch, device):
+    """Capture one deterministic decoder input and its Text-FiLM output."""
+
+    model.set_eval()
+    sample_id = str(batch["sample_id"][0])
+    devices = [device.index] if device.type == "cuda" else []
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(sample_seed(42, sample_id))
+        with _autocast(device, "no"):
+            latent, skips = model.denoised_main_latent(
+                batch["conditioning_pixel_values"].to(device),
+                prompt_tokens=batch["input_ids"].to(device),
+                prompt_attention_mask=batch["attention_mask"].to(device),
+            )
+            condition = model._last_detail_condition
+            prediction = model.decode_main_latent(
+                latent, skips, prompt_condition=condition
+            )
+    return {
+        "latent": latent.detach().cpu(),
+        "skips": [skip.detach().cpu() for skip in skips],
+        "condition": condition.detach().cpu(),
+        "prediction": prediction.detach().float().cpu(),
+    }
+
+
+@torch.inference_mode()
+def _decode_snapshot(model, snapshot, device) -> torch.Tensor:
+    model.set_eval()
+    with _autocast(device, "no"):
+        prediction = model.decode_main_latent(
+            snapshot["latent"].to(device),
+            [skip.to(device) for skip in snapshot["skips"]],
+            prompt_condition=snapshot["condition"].to(device),
+        )
+    return prediction.detach().float().cpu()
+
+
 def run(args: argparse.Namespace) -> None:
     from .model import (
         load_model_checkpoint,
@@ -100,6 +172,10 @@ def run(args: argparse.Namespace) -> None:
     device = torch.device(args.device)
     if device.type == "cuda":
         torch.cuda.set_device(device.index)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if checkpoint.get("text_film_config") is not None:
         raise ValueError("E0 requires the legacy B-20k checkpoint without Text-FiLM")
@@ -113,10 +189,9 @@ def run(args: argparse.Namespace) -> None:
         manifest, baseline_model.tokenizer, resolution=512, training_mode="positive"
     )
     batches = list(_selected_batches(dataset, args.samples))
-    reference = {}
     baseline_model = baseline_model.to(device)
     for precision in args.precisions:
-        reference[precision] = _predictions(
+        _predictions(
             baseline_model,
             batches,
             device,
@@ -136,14 +211,10 @@ def run(args: argparse.Namespace) -> None:
         expected_seed=42,
     )
     text_model = text_model.to(device)
-    equivalence = {}
-    for precision in args.precisions:
-        predictions = _predictions(text_model, batches, device, precision, None)
-        differences = [
-            float((prediction - reference[precision][sample_id]).abs().max())
-            for sample_id, prediction in predictions.items()
-        ]
-        equivalence[precision] = max(differences)
+    equivalence = {
+        precision: _zero_init_equivalence(text_model, batches, device, precision)
+        for precision in args.precisions
+    }
 
     delta_abs_max = max(
         float(gate.last_delta_logits_abs_mean)
@@ -221,7 +292,7 @@ def run(args: argparse.Namespace) -> None:
     film_detail_trainable_parameters = sum(
         item["parameters"] for item in parameter_group_audit["film+detail"]
     )
-    roundtrip_reference = _predictions(text_model, [batch], device, "no", None)
+    roundtrip_snapshot = _roundtrip_decoder_snapshot(text_model, batch, device)
     captured_text_config = text_model.text_film_config()
     captured_text_state = {
         section: {key: value.detach().cpu().clone() for key, value in state.items()}
@@ -258,10 +329,9 @@ def run(args: argparse.Namespace) -> None:
         for key, value in state.items()
     )
     restored = restored.to(device)
-    roundtrip_prediction = _predictions(restored, [batch], device, "no", None)
-    roundtrip_output_max_abs_diff = max(
-        float((prediction - roundtrip_reference[sample_id]).abs().max())
-        for sample_id, prediction in roundtrip_prediction.items()
+    roundtrip_prediction = _decode_snapshot(restored, roundtrip_snapshot, device)
+    roundtrip_output_max_abs_diff = float(
+        (roundtrip_prediction - roundtrip_snapshot["prediction"]).abs().max()
     )
     report = {
         "b20_checkpoint": str(checkpoint_path),

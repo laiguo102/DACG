@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import torch
 
+from difix3d_selective.text_film_e0 import _zero_init_equivalence
 from difix3d_selective.text_film_evaluate import (
     swapped_prompts,
     text_variant_predictions,
@@ -120,3 +121,37 @@ def test_fast_text_validation_reuses_latent_and_names_film_baseline():
         "val/text_film/correct_vs_swapped_target_psnr_gap",
         "val/text_film/output_delta_l1_vs_b20",
     }
+
+
+def test_e0_equivalence_uses_one_shared_latent_for_both_decoder_paths():
+    class Model(_FakeTextModel):
+        def __init__(self):
+            super().__init__()
+            self.vae = SimpleNamespace(
+                decoder=SimpleNamespace(detail_text_enabled=True)
+            )
+
+        def set_eval(self):
+            return None
+
+        def decode_main_latent(
+            self,
+            latent,
+            skips,
+            *,
+            prompt_condition,
+            text_condition_scale=None,
+        ):
+            del skips, text_condition_scale
+            if prompt_condition is None:
+                return latent
+            return latent + prompt_condition[:, :, None, None] * 0
+
+    model = Model()
+    batch = {**_batch(), "sample_id": ["sample-a", "sample-b"]}
+
+    difference = _zero_init_equivalence(model, [batch], torch.device("cpu"), "no")
+
+    assert difference == 0
+    assert model.unet_calls == 1
+    assert model.vae.decoder.detail_text_enabled
