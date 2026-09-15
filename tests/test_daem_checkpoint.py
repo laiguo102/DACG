@@ -52,11 +52,13 @@ model_module = _load_model_module()
 
 
 class _TinyVae(nn.Module):
-    def __init__(self, *, text_film: bool = False):
+    def __init__(self, *, text_film: bool = False, num_naf_blocks: int = 1):
         super().__init__()
         self.decoder = nn.Module()
         self.decoder.skip_conv_1 = nn.Conv2d(4, 4, 1, bias=False)
-        self.decoder.detail_blocks = nn.ModuleList([GatedDetailSkip(4)])
+        self.decoder.detail_blocks = nn.ModuleList(
+            [GatedDetailSkip(4, num_naf_blocks=num_naf_blocks)]
+        )
         self.decoder.detail_text_projection = (
             TextConditionProjection(4, 4) if text_film else None
         )
@@ -104,7 +106,10 @@ class _TinySelectiveDifix(nn.Module):
         del detail_alpha_init
         super().__init__()
         self.unet = nn.Linear(4, 4)
-        self.vae = _TinyVae(text_film=detail_text_mode != "none")
+        self.vae = _TinyVae(
+            text_film=detail_text_mode != "none",
+            num_naf_blocks=detail_num_blocks,
+        )
         self.text_encoder = nn.Linear(4, 4)
         self.text_encoder.config = SimpleNamespace(hidden_size=4)
         self.lora_rank_vae = lora_rank_vae
@@ -196,8 +201,11 @@ def test_checkpoint_save_ignores_stale_temp_and_retries_eio(tmp_path):
     sleep.assert_called_once_with(1)
 
 
-def test_new_checkpoint_round_trip_preserves_detail_state_and_prediction():
-    source = _TinySelectiveDifix()
+@pytest.mark.parametrize("num_naf_blocks", [1, 2])
+def test_new_checkpoint_round_trip_preserves_detail_state_and_prediction(
+    num_naf_blocks,
+):
+    source = _TinySelectiveDifix(detail_num_blocks=num_naf_blocks)
     with torch.no_grad():
         for parameter in source.vae.decoder.detail_blocks.parameters():
             parameter.uniform_(-0.2, 0.2)
@@ -208,7 +216,7 @@ def test_new_checkpoint_round_trip_preserves_detail_state_and_prediction():
     projected_skip = torch.randn_like(decoder)
     expected = source.vae.decoder.detail_blocks[0](decoder, projected_skip)
 
-    restored = _TinySelectiveDifix()
+    restored = _TinySelectiveDifix(detail_num_blocks=num_naf_blocks)
     restored_optimizer, restored_scheduler = _optimizer_and_scheduler(restored)
     with patch.object(model_module.torch, "load", return_value=checkpoint):
         loaded_step = model_module.load_training_checkpoint(
@@ -379,6 +387,50 @@ def test_checkpoint_rejects_incompatible_detail_configuration():
         assert "gate_reduction" in str(error)
     else:
         raise AssertionError("Expected an incompatible detail configuration error")
+
+
+def test_two_block_init_from_disabled_baseline_keeps_new_detail_weights():
+    source = _TinySelectiveDifix(detail_enabled=False)
+    optimizer, scheduler = _optimizer_and_scheduler(source)
+    checkpoint = _checkpoint_payload(source, optimizer, scheduler, step=90_000)
+    target = _TinySelectiveDifix(detail_num_blocks=2)
+    before = {key: value.clone() for key, value in target.detail_state_dict().items()}
+
+    with (
+        patch.object(model_module.torch, "load", return_value=checkpoint),
+        pytest.raises(ValueError, match="DAEM-lite configuration mismatch"),
+    ):
+        model_module.load_model_checkpoint(target, Path("baseline.pkl"))
+
+    with patch.object(model_module.torch, "load", return_value=checkpoint):
+        step = model_module.load_model_checkpoint(
+            target,
+            Path("baseline.pkl"),
+            initialize_detail_from_disabled=True,
+        )
+
+    assert step == 90_000
+    assert len(target.vae.decoder.detail_blocks[0].refiner) == 2
+    for key, value in before.items():
+        torch.testing.assert_close(target.detail_state_dict()[key], value)
+    torch.testing.assert_close(target.unet.weight, source.unet.weight)
+
+
+def test_two_block_init_rejects_trained_single_block_checkpoint():
+    source = _TinySelectiveDifix(detail_num_blocks=1)
+    optimizer, scheduler = _optimizer_and_scheduler(source)
+    checkpoint = _checkpoint_payload(source, optimizer, scheduler, step=10_000)
+    target = _TinySelectiveDifix(detail_num_blocks=2)
+
+    with (
+        patch.object(model_module.torch, "load", return_value=checkpoint),
+        pytest.raises(ValueError, match="num_naf_blocks"),
+    ):
+        model_module.load_model_checkpoint(
+            target,
+            Path("b10.pkl"),
+            initialize_detail_from_disabled=True,
+        )
 
 
 def test_checkpoint_rejects_incompatible_text_film_configuration():

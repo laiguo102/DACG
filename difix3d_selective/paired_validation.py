@@ -44,10 +44,12 @@ PROTOCOL = "ccdd11-daem-fixed-seed-paired-validation-v1"
 DEFAULT_COMPARISON_PROFILE = "baseline-vs-daem"
 DETAIL_VAE_COMPARISON_PROFILE = "detail-only-vs-detail-vae"
 DETAIL_STEPS_COMPARISON_PROFILE = "detail-only-10k-vs-20k"
+DETAIL_BLOCKS_COMPARISON_PROFILE = "detail-only-1block-vs-2blocks"
 TEXT_FILM_COMPARISON_PROFILE = "b20-vs-text-film"
 REUSED_REFERENCE_PROFILES = (
     DETAIL_VAE_COMPARISON_PROFILE,
     DETAIL_STEPS_COMPARISON_PROFILE,
+    DETAIL_BLOCKS_COMPARISON_PROFILE,
     TEXT_FILM_COMPARISON_PROFILE,
 )
 QUALITY_METRICS = ("mse_l2", "psnr", "ssim", "lpips_vgg", "dists")
@@ -267,6 +269,58 @@ def _validate_detail_steps_checkpoints(
     for key in ("alpha_init", "learning_rate"):
         if baseline_detail.get(key) != candidate_detail.get(key):
             raise ValueError(f"Detail-only 10k/20k {key} mismatch")
+
+
+def _validate_detail_blocks_checkpoints(
+    baseline: Mapping,
+    candidate: Mapping,
+) -> None:
+    for label, summary, expected_blocks in (
+        ("detail-only one block", baseline, 1),
+        ("detail-only two blocks", candidate, 2),
+    ):
+        metadata = summary["metadata"]
+        config = summary["detail_config"]
+        if metadata.get("dataset") != "CCDD-11" or int(
+            metadata.get("seed", -1)
+        ) != 42:
+            raise ValueError(f"The {label} checkpoint must be CCDD-11 seed 42")
+        if [int(value) for value in metadata.get("pairs", [])] != [1, 2, 3, 4, 5]:
+            raise ValueError(f"The {label} checkpoint must cover all five pairs")
+        if metadata.get("train_scope") != "detail":
+            raise ValueError(f"The {label} checkpoint must use train_scope='detail'")
+        if float(metadata.get("negative_train_probability", 0.0)) <= 0:
+            raise ValueError(f"The {label} checkpoint lacks negative CCDD-11 training")
+        if not 0 < int(summary["global_step"]) <= 10_000:
+            raise ValueError(f"The {label} best checkpoint must be within 10k steps")
+        if not config.get("enabled") or config.get("num_naf_blocks") != expected_blocks:
+            raise ValueError(f"The {label} checkpoint must use {expected_blocks} NAFBlock")
+        if config.get("prompt_condition") or summary["text_film_config"].get(
+            "mode"
+        ) != "none":
+            raise ValueError(f"The {label} checkpoint must not use text conditioning")
+
+    for key in ("rank_vae", "timestep"):
+        if baseline[key] != candidate[key]:
+            raise ValueError(f"One-block/two-block architecture mismatch: {key}")
+    for key in ("gate_reduction", "prompt_proj_dim"):
+        if baseline["detail_config"].get(key) != candidate["detail_config"].get(key):
+            raise ValueError(f"One-block/two-block detail configuration mismatch: {key}")
+
+    baseline_metadata = baseline["metadata"]
+    candidate_metadata = candidate["metadata"]
+    parent_sha = baseline_metadata.get("parent_checkpoint_sha256")
+    if not parent_sha or candidate_metadata.get("parent_checkpoint_sha256") != parent_sha:
+        raise ValueError("One-block/two-block runs must share the original checkpoint")
+    if baseline_metadata.get("negative_train_probability") != candidate_metadata.get(
+        "negative_train_probability"
+    ):
+        raise ValueError("One-block/two-block negative training probability mismatch")
+    for key in ("alpha_init", "learning_rate"):
+        baseline_value = baseline_metadata.get("detail", {}).get(key)
+        candidate_value = candidate_metadata.get("detail", {}).get(key)
+        if baseline_value is None or baseline_value != candidate_value:
+            raise ValueError(f"One-block/two-block detail {key} mismatch")
 
 
 def _validate_text_film_checkpoints(
@@ -662,6 +716,9 @@ def _evaluate_checkpoint(
             raise ValueError("The detail-only 20k checkpoint must enable DAEM-lite")
         if metadata.get("train_scope") != "detail":
             raise ValueError("The candidate checkpoint must use train_scope='detail'")
+    elif comparison_profile == DETAIL_BLOCKS_COMPARISON_PROFILE and role == "candidate":
+        if not model.detail_enabled or model.detail_num_blocks != 2:
+            raise ValueError("The candidate checkpoint must enable two detail blocks")
     elif comparison_profile == TEXT_FILM_COMPARISON_PROFILE:
         if role == "baseline" and model.text_film_enabled:
             raise ValueError("The B-20k baseline must not enable Text-FiLM")
@@ -1307,6 +1364,8 @@ def run(args: argparse.Namespace) -> None:
             _validate_detail_vae_checkpoints(baseline_summary, candidate_summary)
         elif comparison_profile == DETAIL_STEPS_COMPARISON_PROFILE:
             _validate_detail_steps_checkpoints(baseline_summary, candidate_summary)
+        elif comparison_profile == DETAIL_BLOCKS_COMPARISON_PROFILE:
+            _validate_detail_blocks_checkpoints(baseline_summary, candidate_summary)
         else:
             _validate_text_film_checkpoints(
                 baseline_summary,
@@ -1577,6 +1636,7 @@ def parser() -> argparse.ArgumentParser:
             DEFAULT_COMPARISON_PROFILE,
             DETAIL_VAE_COMPARISON_PROFILE,
             DETAIL_STEPS_COMPARISON_PROFILE,
+            DETAIL_BLOCKS_COMPARISON_PROFILE,
             TEXT_FILM_COMPARISON_PROFILE,
         ),
         default=DEFAULT_COMPARISON_PROFILE,

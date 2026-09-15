@@ -374,6 +374,7 @@ def run(args: argparse.Namespace) -> None:
                 "CCDD-11" if args.dataset_format == "ccdd11" else "CDD-11"
             ),
             expected_seed=args.seed,
+            initialize_detail_from_disabled=True,
         )
         parent_metadata = model.loaded_checkpoint_metadata
     trainable_parameters = model.trainable_parameters()

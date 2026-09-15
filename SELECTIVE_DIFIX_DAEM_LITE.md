@@ -277,6 +277,128 @@ python -u evaluate_ccdd11_paired.py \
 smoke 通过后移除 `--max-samples 20`，将输出改为 `$B20_RESULTS/full`，并把
 `--num-gallery-samples` 改为 20。smoke/full 分别只新增 30/1,770 次模型 forward。
 
+## Exp D：每层两个 NAFBlockLite
+
+Exp D 是 B10 的容量消融：从与 B10 **相同的原始 baseline checkpoint** 独立初始化，
+训练 10k，保持 CCDD-11 数据、五组退化、negative 采样、loss、gate、优化器和验证
+频率一致。唯一结构变量是 `--detail-num-blocks 2`；仍使用 primary/coarse skip、
+`--train-scope detail`，不启用 prompt 或 Text-FiLM，也不从 B/C checkpoint 续训。
+原始 baseline 若显式保存 `detail_config.enabled=false`，`--init-checkpoint` 会保留原有
+UNet/VAE 权重并新建两个 zero-gate block；已训练的一 block checkpoint 不能直接初始化 D。
+
+双 block 的 detail 参数量为 `12,691,524`，比 B10 的 `6,668,612` 多
+`6,022,912`。训练已有 `model/parameters/*`、峰值 CUDA 显存和
+`train/images_per_second` 日志，可直接比较参数、显存和速度。
+
+```bash
+export B10_RUN="$RUN_ROOT/ccdd-daem-lite-detail-only-v1/detail-only-10k"
+export AB_RESULTS="$B10_RUN/paired_validation_v1/full"
+export D_ROOT="$RUN_ROOT/ccdd-daem-lite-two-naf-v1"
+export D_RUN="$D_ROOT/detail-only-10k"
+
+accelerate launch --mixed_precision=bf16 train_ccdd11_difix.py \
+  --data-root "$CCDD_ROOT" \
+  --coarse-root "$CCDD_COARSE_ROOT/half_train" \
+  --output-dir "$D_ROOT/smoke" \
+  --degradation-pairs 1 2 3 4 5 \
+  --negative-train-probability 0.2 \
+  --resolution 512 --max-train-steps 2 --train-batch-size 4 \
+  --dataloader-num-workers 0 \
+  --detail-enabled --detail-num-blocks 2 \
+  --detail-gate-reduction 4 --detail-alpha-init 0.1 \
+  --train-scope detail \
+  --learning-rate 5e-6 --detail-learning-rate 1e-4 \
+  --init-checkpoint "$FORMAL_RUN/checkpoints/best_psnr.pkl" \
+  --lr-scheduler linear --lr-warmup-steps 0 \
+  --lambda-l2 1 --lambda-lpips 1 --lambda-gram 0 \
+  --eval-freq 1 --full-eval-freq 2 --viz-freq 1 \
+  --num-validation-samples 2 --num-validation-visualizations 2 \
+  --latest-checkpointing-steps 2 --milestone-steps 2 \
+  --seed 42 --report-to wandb \
+  --tracker-project-name difix-ccdd11-selective-daem \
+  --tracker-run-name ccdd-daem-lite-two-naf-smoke-v1
+```
+
+确认两步 loss、双 block 参数量、显存与 checkpoint 正常后，以新的空目录独立启动
+正式训练；smoke 的权重不用于正式训练。
+
+```bash
+accelerate launch --mixed_precision=bf16 train_ccdd11_difix.py \
+  --data-root "$CCDD_ROOT" \
+  --coarse-root "$CCDD_COARSE_ROOT/half_train" \
+  --output-dir "$D_RUN" \
+  --degradation-pairs 1 2 3 4 5 \
+  --negative-train-probability 0.2 \
+  --resolution 512 --max-train-steps 10000 --train-batch-size 4 \
+  --dataloader-num-workers 8 \
+  --detail-enabled --detail-num-blocks 2 \
+  --detail-gate-reduction 4 --detail-alpha-init 0.1 \
+  --train-scope detail \
+  --learning-rate 5e-6 --detail-learning-rate 1e-4 \
+  --init-checkpoint "$FORMAL_RUN/checkpoints/best_psnr.pkl" \
+  --lr-scheduler linear --lr-warmup-steps 200 \
+  --lambda-l2 1 --lambda-lpips 1 --lambda-gram 0 \
+  --enable-xformers-memory-efficient-attention \
+  --eval-freq 250 --full-eval-freq 2000 --viz-freq 1000 \
+  --num-validation-samples 100 --num-validation-visualizations 10 \
+  --latest-checkpointing-steps 1000 --milestone-steps 5000 \
+  --seed 42 --report-to wandb \
+  --tracker-project-name difix-ccdd11-selective-daem \
+  --tracker-run-name ccdd-daem-lite-two-naf-10k-v1
+```
+
+正式训练中断时保持参数不变，用
+`--resume "$D_RUN/checkpoints/latest.pkl"` 替换 `--init-checkpoint ...`。
+`best_psnr.pkl` 仍按 positive full-validation PSNR 选择，可能早于 step 10,000。
+
+### 固定种子 B10 对 D 配对验证
+
+评估使用 A 对 B10 全量结果的 `candidate` 角色复用 B10 的正/负样本记录；
+baseline checkpoint 必须与该结果记录的 B10 `best_psnr.pkl` 哈希一致。
+smoke/full 分别只新增 30/1,770 次 D forward。评估器会检查两次训练的原始
+checkpoint 哈希、训练范围、detail 结构和 train/validation manifest 哈希。
+
+```bash
+export D_RESULTS="$D_RUN/paired_vs_one_block_v1"
+
+python -u evaluate_ccdd11_paired.py \
+  --comparison-profile detail-only-1block-vs-2blocks \
+  --reuse-baseline-results "$AB_RESULTS" \
+  --reuse-baseline-role candidate \
+  --baseline-label detail_only_1block \
+  --candidate-label detail_only_2blocks \
+  --baseline-checkpoint "$B10_RUN/checkpoints/best_psnr.pkl" \
+  --candidate-checkpoint "$D_RUN/checkpoints/best_psnr.pkl" \
+  --output-dir "$D_RESULTS/smoke" \
+  --max-samples 20 --num-gallery-samples 2 \
+  --workers 0 --device cuda --mixed-precision bf16 \
+  --bootstrap-resamples 10000 --bootstrap-seed 42 \
+  --enable-xformers-memory-efficient-attention
+```
+
+smoke 通过后使用新的空目录运行全量验证：
+
+```bash
+python -u evaluate_ccdd11_paired.py \
+  --comparison-profile detail-only-1block-vs-2blocks \
+  --reuse-baseline-results "$AB_RESULTS" \
+  --reuse-baseline-role candidate \
+  --baseline-label detail_only_1block \
+  --candidate-label detail_only_2blocks \
+  --baseline-checkpoint "$B10_RUN/checkpoints/best_psnr.pkl" \
+  --candidate-checkpoint "$D_RUN/checkpoints/best_psnr.pkl" \
+  --output-dir "$D_RESULTS/full" \
+  --num-gallery-samples 20 \
+  --workers 0 --device cuda --mixed-precision bf16 \
+  --bootstrap-resamples 10000 --bootstrap-seed 42 \
+  --enable-xformers-memory-efficient-attention
+```
+
+查看 `metrics.json` 的 task-macro target PSNR、10 个 directed task、LPIPS/DISTS、
+negative identity，以及 `new_model_forwards` 和 `reused_reference_records`。
+结合 gallery 检查 rain/snow 是否被重新注入，并对照 B10/D 的显存和吞吐日志判断
+新增约六百万参数是否值得保留。
+
 ## 结果判定
 
 checkpoint 仍只由 selective positive validation PSNR 选择。优先比较同一个 baseline

@@ -822,7 +822,12 @@ def save_training_checkpoint(
             time.sleep(1)
 
 
-def _apply_model_checkpoint(model: SelectiveDifix, checkpoint: dict) -> int:
+def _apply_model_checkpoint(
+    model: SelectiveDifix,
+    checkpoint: dict,
+    *,
+    initialize_detail_from_disabled: bool = False,
+) -> int:
     checkpoint_rank = int(checkpoint.get("rank_vae", model.lora_rank_vae))
     if checkpoint_rank != model.lora_rank_vae:
         raise ValueError(
@@ -862,11 +867,17 @@ def _apply_model_checkpoint(model: SelectiveDifix, checkpoint: dict) -> int:
             for key in current_detail_config
             if saved_detail_config.get(key) != current_detail_config[key]
         }
-        if mismatches:
+        fresh_detail = (
+            initialize_detail_from_disabled
+            and saved_detail_config.get("enabled") is False
+            and model.detail_enabled
+        )
+        if mismatches and not fresh_detail:
             raise ValueError(
                 f"Checkpoint DAEM-lite configuration mismatch: {mismatches}"
             )
-        model.vae.decoder.detail_blocks.load_state_dict(saved_detail_state, strict=True)
+        if not fresh_detail:
+            model.vae.decoder.detail_blocks.load_state_dict(saved_detail_state, strict=True)
 
     saved_text_config = checkpoint.get("text_film_config")
     saved_text_state = checkpoint.get("state_dict_text_film")
@@ -914,8 +925,9 @@ def load_model_checkpoint(
     *,
     expected_dataset: str | None = None,
     expected_seed: int | None = None,
+    initialize_detail_from_disabled: bool = False,
 ) -> int:
-    """Load model weights only, for validation/backfill without an optimizer."""
+    """Load model weights without optimizer state."""
 
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     model.loaded_checkpoint_metadata = dict(checkpoint.get("experiment_metadata") or {})
@@ -934,7 +946,11 @@ def load_model_checkpoint(
             raise ValueError(
                 f"Checkpoint seed is {metadata.get('seed')!r}, expected {expected_seed}"
             )
-    return _apply_model_checkpoint(model, checkpoint)
+    return _apply_model_checkpoint(
+        model,
+        checkpoint,
+        initialize_detail_from_disabled=initialize_detail_from_disabled,
+    )
 
 
 def load_model_from_checkpoint(

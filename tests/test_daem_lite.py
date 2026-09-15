@@ -28,7 +28,13 @@ class _PassthroughBlock(nn.Module):
 
 
 class _Decoder:
-    def __init__(self, channels: int, *, detail_enabled: bool):
+    def __init__(
+        self,
+        channels: int,
+        *,
+        detail_enabled: bool,
+        num_naf_blocks: int = 1,
+    ):
         self.conv_in = nn.Identity()
         self.mid_block = _PassthroughBlock()
         self.up_blocks = nn.ModuleList([_PassthroughBlock()])
@@ -49,7 +55,9 @@ class _Decoder:
         self.detail_gate_use_prompt = False
         self.detail_text_projection = None
         self.detail_text_gates = nn.ModuleList()
-        self.detail_blocks = nn.ModuleList([GatedDetailSkip(channels)])
+        self.detail_blocks = nn.ModuleList(
+            [GatedDetailSkip(channels, num_naf_blocks=num_naf_blocks)]
+        )
         self.gamma = 1
 
 
@@ -60,14 +68,20 @@ def test_layer_norm_and_simple_gate_shapes():
 
 
 @pytest.mark.parametrize("channels", [32, 64])
-def test_gated_detail_skip_shape_gate_range_and_baseline_equivalence(channels):
-    block = GatedDetailSkip(channels, alpha_init=0.1)
+@pytest.mark.parametrize("num_naf_blocks", [1, 2])
+def test_gated_detail_skip_shape_gate_range_and_baseline_equivalence(
+    channels, num_naf_blocks
+):
+    block = GatedDetailSkip(
+        channels, num_naf_blocks=num_naf_blocks, alpha_init=0.1
+    )
     decoder = torch.randn(2, channels, 8, 8)
     projected_skip = torch.randn_like(decoder)
 
     output = block(decoder, projected_skip)
 
     assert output.shape == projected_skip.shape
+    assert len(block.refiner) == num_naf_blocks
     assert block.last_gate_shape == tuple(projected_skip.shape)
     assert 0.0 <= float(block.last_gate_min) <= float(block.last_gate_max) <= 1.0
     torch.testing.assert_close(output, projected_skip, atol=1e-7, rtol=1e-6)
@@ -202,8 +216,11 @@ def test_nonzero_delta_branch_is_prompt_sensitive():
     assert not torch.equal(first, second)
 
 
-def test_initial_gate_has_gradient_and_refiner_gradients_are_finite():
-    block = GatedDetailSkip(32, alpha_init=0.1)
+@pytest.mark.parametrize("num_naf_blocks", [1, 2])
+def test_initial_gate_has_gradient_and_refiner_gradients_are_finite(num_naf_blocks):
+    block = GatedDetailSkip(
+        32, num_naf_blocks=num_naf_blocks, alpha_init=0.1
+    )
     decoder = torch.randn(2, 32, 6, 5)
     projected_skip = torch.randn_like(decoder)
 
@@ -228,7 +245,10 @@ def test_shape_mismatch_is_rejected():
         block(torch.randn(1, 32, 8, 8), torch.randn(1, 32, 4, 4))
 
 
-def test_decoder_detail_disabled_and_zero_initialized_enabled_match_baseline():
+@pytest.mark.parametrize("num_naf_blocks", [1, 2])
+def test_decoder_detail_disabled_and_zero_initialized_enabled_match_baseline(
+    num_naf_blocks,
+):
     try:
         model_module = importlib.import_module("difix3d_selective.model")
     except ModuleNotFoundError:
@@ -256,7 +276,9 @@ def test_decoder_detail_disabled_and_zero_initialized_enabled_match_baseline():
     vae_decoder_forward = model_module.vae_decoder_forward
     sample = torch.randn(1, 8, 5, 6)
     baseline_decoder = _Decoder(8, detail_enabled=False)
-    detail_decoder = _Decoder(8, detail_enabled=True)
+    detail_decoder = _Decoder(
+        8, detail_enabled=True, num_naf_blocks=num_naf_blocks
+    )
     detail_decoder.incoming_skip_acts = baseline_decoder.incoming_skip_acts
 
     baseline = vae_decoder_forward(baseline_decoder, sample)

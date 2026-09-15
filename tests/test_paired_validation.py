@@ -7,12 +7,14 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 from torch import nn
 
 from difix3d_selective.data import load_records
 from difix3d_selective.paired_validation import (
     COARSE_METRICS,
+    DETAIL_BLOCKS_COMPARISON_PROFILE,
     DETAIL_STEPS_COMPARISON_PROFILE,
     DETAIL_VAE_COMPARISON_PROFILE,
     TEXT_FILM_COMPARISON_PROFILE,
@@ -24,6 +26,7 @@ from difix3d_selective.paired_validation import (
     _negative_ids,
     _record_path,
     _run_prediction,
+    _validate_detail_blocks_checkpoints,
     _validate_text_film_checkpoints,
     _write_record_json,
     paired_rows,
@@ -79,6 +82,32 @@ def test_text_film_profile_validates_b20_parent_and_candidate_scope():
         action for action in parser()._actions if action.dest == "comparison_profile"
     )
     assert TEXT_FILM_COMPARISON_PROFILE in profile.choices
+
+
+def test_detail_blocks_profile_checks_capacity_and_original_checkpoint():
+    from difix3d_selective.paired_validation import parser
+
+    baseline = _fake_checkpoint_summary(Path("detail_only/checkpoints/best_psnr.pkl"))
+    candidate = _fake_checkpoint_summary(
+        Path("detail_only_2blocks/checkpoints/best_psnr.pkl")
+    )
+    _validate_detail_blocks_checkpoints(baseline, candidate)
+    profile = next(
+        action for action in parser()._actions if action.dest == "comparison_profile"
+    )
+    assert DETAIL_BLOCKS_COMPARISON_PROFILE in profile.choices
+
+    candidate["detail_config"]["num_naf_blocks"] = 1
+    with pytest.raises(ValueError, match="2 NAFBlock"):
+        _validate_detail_blocks_checkpoints(baseline, candidate)
+    candidate["detail_config"]["num_naf_blocks"] = 2
+    candidate["global_step"] = 10_001
+    with pytest.raises(ValueError, match="within 10k steps"):
+        _validate_detail_blocks_checkpoints(baseline, candidate)
+    candidate["global_step"] = 8_000
+    candidate["metadata"]["parent_checkpoint_sha256"] = "another-baseline"
+    with pytest.raises(ValueError, match="share the original checkpoint"):
+        _validate_detail_blocks_checkpoints(baseline, candidate)
 
 
 def _full_manifest_records(root: Path) -> list[dict]:
@@ -205,10 +234,13 @@ class _FakeModel(nn.Module):
     successful_calls = 0
     fail_after = None
 
-    def __init__(self, detail_enabled: bool, offset: float):
+    def __init__(
+        self, detail_enabled: bool, offset: float, detail_num_blocks: int = 1
+    ):
         super().__init__()
         self.anchor = nn.Parameter(torch.zeros(()))
         self.detail_enabled = detail_enabled
+        self.detail_num_blocks = detail_num_blocks
         self.offset = offset
         self.tokenizer = _Tokenizer()
         self.unet = SimpleNamespace(
@@ -246,15 +278,20 @@ def _fake_factory(path, **_):
     path_text = str(path)
     detail_vae = "detail_vae" in path_text
     detail_20k = "detail_only_20k" in path_text
+    detail_2blocks = "detail_only_2blocks" in path_text
     detail_only = "detail_only" in path_text
     candidate = "candidate" in path_text
     detail_enabled = candidate or detail_only or detail_vae
     offset = (
         0.1
         if detail_vae
-        else (0.08 if detail_20k else (0.05 if detail_enabled else 0.0))
+        else (
+            0.08
+            if detail_20k
+            else (0.07 if detail_2blocks else (0.05 if detail_enabled else 0.0))
+        )
     )
-    model = _FakeModel(detail_enabled, offset)
+    model = _FakeModel(detail_enabled, offset, 2 if detail_2blocks else 1)
     metadata = {
         "dataset": "CCDD-11",
         "seed": 42,
@@ -262,30 +299,37 @@ def _fake_factory(path, **_):
         "negative_train_probability": 0.2,
         "train_scope": "detail+vae" if detail_vae else ("detail" if detail_enabled else "all"),
     }
-    step = 20_000 if detail_20k else (10_000 if detail_enabled else 90_000)
+    step = (
+        20_000
+        if detail_20k
+        else (8_000 if detail_2blocks else (10_000 if detail_enabled else 90_000))
+    )
     return model, step, metadata
 
 
 def _fake_checkpoint_summary(path: Path) -> dict:
     detail_vae = "detail_vae" in str(path)
     detail_20k = "detail_only_20k" in str(path)
+    detail_2blocks = "detail_only_2blocks" in str(path)
     return {
-        "global_step": 20000 if detail_20k else 10000,
+        "global_step": 20000 if detail_20k else (8000 if detail_2blocks else 10000),
         "rank_vae": 4,
         "timestep": 199,
         "detail_config": {
             "enabled": True,
-            "num_naf_blocks": 1,
+            "num_naf_blocks": 2 if detail_2blocks else 1,
             "gate_reduction": 4,
             "prompt_condition": False,
             "prompt_proj_dim": 32,
         },
+        "text_film_config": {"enabled": False, "mode": "none"},
         "metadata": {
             "dataset": "CCDD-11",
             "seed": 42,
             "pairs": [1, 2, 3, 4, 5],
             "negative_train_probability": 0.2,
             "train_scope": "detail+vae" if detail_vae else "detail",
+            "parent_checkpoint_sha256": "original-baseline-sha",
             "detail": {"alpha_init": 0.1, "learning_rate": 1e-4},
         },
     }
@@ -801,6 +845,67 @@ class TestPairedValidation(unittest.TestCase):
             self.assertEqual(rows[0]["baseline_label"], "detail_only_10k")
             self.assertEqual(rows[0]["candidate_label"], "detail_only_20k")
             self.assertGreater(float(rows[0]["raw_delta_target_psnr"]), 0)
+
+    def test_detail_blocks_profile_reuses_b10_without_loading_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            records = _full_manifest_records(root)
+            manifest_text = "\n".join(json.dumps(row) for row in records) + "\n"
+            b10 = _write_run(root, "detail_only", manifest_text)
+            d10 = _write_run(root, "detail_only_2blocks", manifest_text)
+            reference = _write_reusable_results(
+                root,
+                b10,
+                b10.parent.parent / "prepared" / "manifests" / "validation.jsonl",
+                records,
+            )
+            args = _args(b10, d10, root / "output")
+            args.comparison_profile = DETAIL_BLOCKS_COMPARISON_PROFILE
+            args.reuse_baseline_results = reference
+            args.baseline_label = "detail_only_1block"
+            args.candidate_label = "detail_only_2blocks"
+            factory_calls = []
+
+            def tracked_factory(path, **kwargs):
+                factory_calls.append(Path(path))
+                return _fake_factory(path, **kwargs)
+
+            _FakeModel.successful_calls = 0
+            _FakeModel.fail_after = None
+            fake_model_module = ModuleType("difix3d_selective.model")
+            fake_model_module.load_model_from_checkpoint = tracked_factory
+            with (
+                patch.dict(sys.modules, {"difix3d_selective.model": fake_model_module}),
+                patch(
+                    "difix3d_selective.paired_validation.SelectiveDifixDataset",
+                    _FakeDataset,
+                ),
+                patch(
+                    "difix3d_selective.paired_validation.PairedMetricSuite",
+                    _FakeMetricSuite,
+                ),
+                patch(
+                    "difix3d_selective.paired_validation._checkpoint_summary",
+                    side_effect=_fake_checkpoint_summary,
+                ),
+            ):
+                run(args)
+
+            self.assertEqual(factory_calls, [d10.resolve()])
+            self.assertEqual(_FakeModel.successful_calls, 30)
+            metrics = json.loads(
+                (root / "output" / "metrics.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(metrics["counts"]["new_model_forwards"], 30)
+            self.assertEqual(metrics["counts"]["reused_reference_records"], 30)
+            self.assertEqual(
+                metrics["metadata"]["checkpoint_steps"],
+                {"baseline": 10_000, "candidate": 8_000},
+            )
+            self.assertEqual(
+                metrics["metadata"]["comparison_profile"],
+                DETAIL_BLOCKS_COMPARISON_PROFILE,
+            )
 
     def test_detail_steps_profile_rejects_wrong_checkpoint_step(self):
         with tempfile.TemporaryDirectory() as directory:
